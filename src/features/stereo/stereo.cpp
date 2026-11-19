@@ -31,6 +31,7 @@
 #include "core/module.h"
 #include "core/present.h"
 #include "features/stereo/engine.h"
+#include "features/stereo/eyestate.h"
 #include "features/stereo/gpu.h"
 
 namespace tb::stereo {
@@ -56,8 +57,13 @@ struct Params {
   double separation_mm = 32.5;  // per eye
   double convergence_m = 0.0;   // 0 = parallel
   bool swap = false;
-  bool taa_in_sbs = false;  // keep the game's TAA on in sbs mode (it then blends across eyes)
-  bool objvel_in_sbs = false;  // keep object motion vectors in sbs mode (they then smear)
+  // sbs/alternate: keep the game's TAA and object motion vectors as the user set them (each eye
+  // then gets its own history and previous matrices); false = force them off while sbs runs.
+  bool taa_in_sbs = true;
+  bool objvel_in_sbs = true;
+  // dev (stereo.per_eye): 1 all per-eye state, 0 none (shared history / previous view: the old
+  // prototype), 2 all but holding the objects' previous transforms for the second eye.
+  int per_eye = 1;
 };
 std::mutex g_pmu;
 Params g_p;
@@ -118,9 +124,6 @@ thread_local double t_conv_shift = 0;  // NDC x shift added to the post-projecti
 std::atomic<int> g_eye_now{0};  // eye of the frame being rendered: -1 left, +1 right, 0 mono
 std::atomic<uint64_t> g_frames_biased{0};
 std::atomic<uint64_t> g_render_frames{0};
-
-double g_prev_w2c[2][16];  // per-eye copy of the TAA object's previous world-to-clip
-bool g_have_prev[2] = {false, false};
 
 // Signed offset (metres, along view right) for an eye (-1 left, +1 right).
 double eye_offset(const Params& p, int eye) {
@@ -234,25 +237,24 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
     t_conv_shift = off * m00 / p.convergence_m;
   }
   g_eye_now = eye;
-  // Per-eye temporal state: the TAA object (RendererX86+0x140) keeps last frame's unjittered
-  // world-to-clip at +0x60 and builds camera motion vectors (motion blur, TAA reprojection) from
-  // it. When eyes alternate, "last frame" is the other eye, so the eye offset reads as camera
-  // velocity and smears the image. Give each eye its own previous matrix.
-  uint8_t* taa = nullptr;
+  // Per-eye temporal state (eyestate.cpp): TAA history and ping-pong index, the previous camera
+  // matrices behind camera/object motion vectors, the jitter phase. Without it, "last frame" for
+  // one eye is the other eye and the eye offset reads as motion.
   bool per_eye = eye != 0 && (p.mode == Mode::Sbs || p.mode == Mode::Alternate);
   if (per_eye) {
-    taa = at<uint8_t*>(r, kRendererTaa);
-    int i = eye < 0 ? 0 : 1;
-    if (taa && g_have_prev[i]) memcpy(taa + kTaaPrevWorldToClip, g_prev_w2c[i], sizeof g_prev_w2c[i]);
+    EyeOpts o;
+    o.taa_history = p.per_eye != 0;
+    o.view_prev = p.per_eye != 0;
+    o.same_jitter = p.per_eye != 0 && p.mode == Mode::Sbs;
+    o.another_eye_follows = p.per_eye == 1 && p.mode == Mode::Sbs && eye < 0;
+    // The left eye is rendered first in every sbs update; in alternate mode every frame is its
+    // own update.
+    eyestate_enter(r, view, eye, p.mode == Mode::Alternate || eye < 0, o);
   }
   t_in_frame = true;
   o_renderFrame(r, view, a3, a4);
   t_in_frame = false;
-  if (per_eye && taa) {
-    int i = eye < 0 ? 0 : 1;
-    memcpy(g_prev_w2c[i], taa + kTaaPrevWorldToClip, sizeof g_prev_w2c[i]);
-    g_have_prev[i] = true;
-  }
+  if (per_eye) eyestate_leave(r, view, eye);
   if (off != 0) g_frames_biased++;
 }
 
@@ -335,6 +337,8 @@ void taa_force_off(bool off) {
   }
 }
 
+bool g_was_sbs = false;
+
 // One game update = one ModeSwitch::render. In sbs mode (and only while the world is being
 // rendered) it runs twice: left eye, then right eye, from the same simulated state; the first
 // Present is swallowed after its back buffer is stashed, the second is composed and presented.
@@ -345,8 +349,15 @@ void __fastcall hk_modeSwitchRender(void* self) {
   g_pan_rad = rate != 0 ? g_pan_rad + rate * M_PI / 180.0 : 0;
   bool world = present_frame() - g_last_render_present.load() < 8;
   bool sbs = p.mode == Mode::Sbs && world;
-  taa_force_off(sbs && !p.taa_in_sbs);
-  objvel_force_off(sbs && !p.objvel_in_sbs);
+  // Without per-eye state (signature mismatch) TAA and object velocity would blend / smear across
+  // eyes, so they are switched off while sbs runs, as they are when the user asks for it.
+  taa_force_off(sbs && (!p.taa_in_sbs || !eyestate_history_available()));
+  objvel_force_off(sbs && (!p.objvel_in_sbs || !eyestate_available()));
+  if (sbs != g_was_sbs) {
+    eyestate_reset();
+    g_was_sbs = sbs;
+  }
+  eyestate_update(sbs && p.per_eye != 0);  // DLSS: one history, two eyes -> reset while sbs runs
   if (!sbs) {
     o_modeSwitchRender(self);
   } else {
@@ -463,15 +474,15 @@ bool check_sigs() {
 
 std::string status_json() {
   Params p = params();
-  char b[512];
+  char b[1024];
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,\"main_view\":\"%p\","
            "\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,\"present\":%llu,"
-           "\"taa_forced_off\":%s,\"gpu\":\"%s\"}",
+           "\"taa_forced_off\":%s,\"taa_game\":%u,\"objvel_forced_off\":%s,\"eyestate\":%s,\"gpu\":\"%s\"}",
            mode_name(p.mode), p.separation_mm, p.convergence_m, p.swap ? "true" : "false", g_main_view, g_applied,
            (unsigned long long)g_frames_biased.load(), (unsigned long long)g_render_frames.load(),
            (unsigned long long)g_sbs_updates.load(), (unsigned long long)present_frame(), g_taa_forced ? "true" : "false",
-           gpu_status().c_str());
+           *reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable)), g_objvel_forced ? "true" : "false", eyestate_status_json().c_str(), gpu_status().c_str());
   return b;
 }
 
@@ -489,6 +500,7 @@ void register_feature() {
     else if (id == "stereo.test_pan") g_pan_rate = atof(v.c_str());
     else if (id == "stereo.taa") g_p.taa_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.object_velocity") g_p.objvel_in_sbs = (v == "1" || v == "true");
+    else if (id == "stereo.per_eye") g_p.per_eye = (v == "0" || v == "false") ? 0 : v == "2" ? 2 : 1;
     else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
   });
   // quiver lab call awr tweak list [SUBSTR] | tweak NAME [VALUE]: the engine's tweakable registry.
@@ -563,6 +575,10 @@ void register_feature() {
       g_shot_files.clear();
       return json_str("capturing " + std::to_string(g_shots_left) + " frames to " + g_shot_dir);
     }
+    if (sub == "probe") {
+      eyestate_probe(a.size() > 1 ? atoi(a[1].c_str()) : 4);
+      return json_str("probing the next eye renders into torchbearer.log");
+    }
     if (sub == "files") {
       std::lock_guard lk(g_cmu);
       std::string r = "[";
@@ -570,7 +586,7 @@ void register_feature() {
       return r + "]";
     }
     ok = false;
-    return json_str("usage: stereo [status|census N|shots N TAG [SKIP]|files]");
+    return json_str("usage: stereo [status|census N|shots N TAG [SKIP]|files|probe N]");
   });
 }
 
@@ -592,6 +608,7 @@ void start() {
     TB_LOG("stereo: hooks failed; feature disabled");
     return;
   }
+  eyestate_start();  // optional: without it sbs falls back to TAA / object velocity off
   present_on(on_present);
   present_filter(present_gate);
   g_hooked = true;
