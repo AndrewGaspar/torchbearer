@@ -681,13 +681,13 @@ apply = "live"
 [option."stereo.convergence"]
 type = "float"
 label = "Screen distance"
-help = "Distance of the screen plane in metres: nearer things come out of the screen, farther ones sit behind it (0 = everything behind). 3 to 5 m suits the third-person camera."
+help = "Distance of the screen plane in metres: nearer things come out of the screen, farther ones sit behind it. Parallel puts distant things at the screen and everything else in front of it, HUD included."
 min = 0
 max = 50
 step = 0.5
 unit = "m"
 special = [{ value = 0, label = "Parallel" }]
-default = 0
+default = 4
 apply = "live"
 
 [option."stereo.swap_eyes"]
@@ -752,8 +752,8 @@ apply = "live"
 [option."stereo.skip_shadows"]
 type = "bool"
 label = "Share shadow maps between eyes"
-help = "The second eye reuses the shadow maps the first eye rendered in the same update instead of rendering them again (eye-independent work; about 10 % faster). One-frame eye rendering only."
-default = true
+help = "Experimental: the second eye reuses the first eye's shadow maps (about 10 % faster), but loses the flashlight's lit spot. One-frame eye rendering only."
+default = false
 level = "advanced"
 apply = "live"
 

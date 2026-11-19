@@ -20,7 +20,7 @@ specified, not built. **Both eyes now render inside one engine frame** by defaul
 view`, section 6): `renderFrame` twice inside one `ModeSwitch::render`, beginFrame/endFrame, HUD and
 Present once per update, the HUD duplicated into both halves, render-side state that a render
 advances rewound for the second eye (separation-0 halves 0.036/255 apart), and optionally the
-shadow maps and sky probe reused for the second eye (+10 % fps, `skip_shadows`/`skip_probe`). What
+sky probe reused for the second eye (`skip_probe`; shadow-map reuse, +10 % fps, is opt-in until the flashlight issue in section 6 is solved). What
 is not done: per-eye DLSS, HUD depth and a half-SBS (squeezed) output. Convergence in full SBS
 is a per-eye image shift in the compositor (section 6, "Convergence as image shift"), which TAA
 cannot undo.
@@ -756,6 +756,21 @@ view-dependent.
 - ~~Lab: 1920x1080 display, `output = full`, windowed: engine shrinks to 160x240~~ (fixed in
   window.cpp: the engine always stays at the game's resolution; docs/stereo-output.md).
 - One crash in forest-night ~10 s in-world (r17, view path, no skips), not reproduced in r18/r19.
+- **Shadow reuse (`skip_shadows`) is off by default** (lead's integration test, awr-wide,
+  level 15, 3840x1080 borderless, all other defaults):
+  - Skipping the whole shadow pass for the second eye made the game exit (clean, no exception,
+    nothing in vkd3d.log) ~9 s in-world, as control returns after the opening cinematic and the
+    flashlight comes on: 3 of 3 runs. Bisected live: frame path alive, view path without skips
+    alive, probe reuse alone alive, shadow reuse alone exits.
+  - Guard added: the second eye skips only if every light in its shadow list was in the first
+    eye's (the frusta differ; an eye-2-only light was lit with shadow state nobody prepared).
+    With it: no exit in 50 s runs and a walk through the yard; fallbacks 157-247 against
+    3850-5437 reuses (live, `stereo status` `shadow_fallbacks`).
+  - Even with the guard, the second eye loses the flashlight's lit spot on a near wall: same
+    position, reuse on / off / on, right-eye crops show the spot only with reuse off (live
+    captures, run r15). So the per-light shadow render also prepares lighting state the second
+    eye needs (a cookie or per-render light constants; not identified). Until that is found the
+    reuse stays opt-in; the probe reuse stays on.
 
 ### Convergence as image shift (full SBS)
 

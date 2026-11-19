@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <vector>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -53,7 +55,7 @@ bool sig_ok(const Sig& s) {
 }
 
 std::atomic<int> g_slot{-1};
-std::atomic<bool> g_skip_shadows{true}, g_skip_probe{true}, g_flare_rewind{true};
+std::atomic<bool> g_skip_shadows{false}, g_skip_probe{true}, g_flare_rewind{true};
 std::atomic<uint64_t> g_n_shadow_skip{0}, g_n_probe_skip{0}, g_n_flare_rewind{0}, g_n_flare_first{0};
 
 // --- flares ------------------------------------------------------------------------------------
@@ -128,10 +130,35 @@ void __fastcall hk_flareRender(void* self, void* ctx) {
   g_n_flare_rewind++;
 }
 
+// The pass: shadow manager begin (RendererX86+0xf0 vtbl+0x18), then each light in `lights`
+// ({void** data, size_t count}) renders its shadow (vtbl+0x40), then an optional end (+0x28)
+// (static). The second eye may reuse the first eye's shadows only if it sees no light the first
+// eye did not render: the eyes' frusta differ slightly, and a light visible only to the second
+// eye would be lit with shadow state nobody prepared this frame. Skipping unconditionally
+// crashed the game (clean exit, no exception) ~9 s into level 15 when the player's flashlight
+// came on after the opening cinematic (live, 3 of 3 runs; probe reuse alone: no exit).
+std::vector<void*> g_eye1_lights;
+std::atomic<uint64_t> g_n_shadow_fallback{0};
+
+struct LightList {
+  void** data;
+  size_t count;
+};
+
 void __fastcall hk_shadowPass(void* r, void* lights, void* objs) {
-  if (g_slot.load(std::memory_order_relaxed) == 1 && g_skip_shadows.load(std::memory_order_relaxed)) {
-    g_n_shadow_skip++;
-    return;  // the first eye's shadow maps (and the lights' shadow matrices) are still current
+  int slot = g_slot.load(std::memory_order_relaxed);
+  auto* ll = static_cast<LightList*>(lights);
+  if (slot == 0) {
+    g_eye1_lights.assign(ll && ll->data ? ll->data : nullptr, ll && ll->data ? ll->data + ll->count : nullptr);
+  } else if (slot == 1 && g_skip_shadows.load(std::memory_order_relaxed)) {
+    bool subset = ll != nullptr;
+    for (size_t i = 0; subset && ll->data && i < ll->count; i++)
+      subset = std::find(g_eye1_lights.begin(), g_eye1_lights.end(), ll->data[i]) != g_eye1_lights.end();
+    if (subset) {
+      g_n_shadow_skip++;
+      return;  // the first eye's shadow maps (and the lights' shadow matrices) are still current
+    }
+    g_n_shadow_fallback++;
   }
   o_shadowPass(r, lights, objs);
 }
@@ -242,10 +269,10 @@ void pass2_eye(int slot, void* renderer) {
 std::string pass2_status() {
   char b[320];
   snprintf(b, sizeof b,
-           "skip_shadows=%d skip_probe=%d flare_rewind=%d rewind=%d shadow_skips=%llu probe_skips=%llu "
+           "skip_shadows=%d skip_probe=%d flare_rewind=%d rewind=%d shadow_skips=%llu shadow_fallbacks=%llu probe_skips=%llu "
            "flare_first=%llu flare_rewinds=%llu rewinds=%llu regions=%d",
            g_skip_shadows.load() ? 1 : 0, g_skip_probe.load() ? 1 : 0, g_flare_rewind.load() ? 1 : 0,
-           g_rewind.load() ? 1 : 0, (unsigned long long)g_n_shadow_skip.load(),
+           g_rewind.load() ? 1 : 0, (unsigned long long)g_n_shadow_skip.load(), (unsigned long long)g_n_shadow_fallback.load(),
            (unsigned long long)g_n_probe_skip.load(), (unsigned long long)g_n_flare_first.load(),
            (unsigned long long)g_n_flare_rewind.load(), (unsigned long long)g_n_rewind.load(), g_nregions);
   return b;
