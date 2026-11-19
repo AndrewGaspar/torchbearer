@@ -36,7 +36,11 @@ bool gpu_place_mid(IDXGISwapChain* sc, int stashed_eye);
 // At Present in the view path: nothing to do for full SBS (composed in the frame); for half output
 // the centre crops of the stashed eye and the presented frame (the other eye).
 bool gpu_compose_view(IDXGISwapChain* sc, int stashed_eye);
-uint32_t gpu_eye_width();  // width of one stored eye (0 before the first store)
+uint32_t gpu_eye_width();
+// Convergence for full side-by-side: shift each half's eye image horizontally by this many pixels
+// (> 0 = right) when it is placed; uncovered columns are black. Applied after TAA, so the resolve
+// can't undo it, and before the HUD, which stays at the screen plane.
+void gpu_set_hit(int left_half_px, int right_half_px);  // width of one stored eye (0 before the first store)
 
 // Counters for the status verb.
 std::string gpu_status();

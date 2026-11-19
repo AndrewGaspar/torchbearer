@@ -21,8 +21,9 @@ view`, section 6): `renderFrame` twice inside one `ModeSwitch::render`, beginFra
 Present once per update, the HUD duplicated into both halves, render-side state that a render
 advances rewound for the second eye (separation-0 halves 0.036/255 apart), and optionally the
 shadow maps and sky probe reused for the second eye (+10 % fps, `skip_shadows`/`skip_probe`). What
-is not done: per-eye DLSS, HUD depth, a half-SBS (squeezed) output, and convergence with TAA on
-(section 6, open issues).
+is not done: per-eye DLSS, HUD depth and a half-SBS (squeezed) output. Convergence in full SBS
+is a per-eye image shift in the compositor (section 6, "Convergence as image shift"), which TAA
+cannot undo.
 
 Every address is an RVA (image base 0x140000000), `Game_f_x64_EOS.exe` as shipped on Epic
 (2026-11). "static" = read in Ghidra (`re/scripts/Serve.java`), "live" = observed with the
@@ -747,17 +748,35 @@ view-dependent.
 
 ### Open issues
 
-- **Convergence with TAA on** (both paths; came with per-eye TAA on by default): parallel −
+- ~~Convergence with TAA on~~ (fixed, below): with the post-projection shift, parallel −
   converged at 4 m measured +6.2 px (frame path +5.1, view +6.5) instead of a uniform +18.86 px,
-  i.e. the TAA resolve largely removes the post-projection shift. TAA off: +15.5 px (Zc 4.85 m;
-  grain off). Film grain identical in both eyes (now) biases the disparity tool towards 0 in
-  flat fog, so measure convergence with grain off. Candidate fix: apply convergence as a
-  horizontal shift in the compositor copies (`gpu_place_mid`) instead of in the projection.
+  i.e. the TAA resolve largely removes it. Film grain identical in both eyes biases the
+  disparity tool towards 0 in flat fog, so measure convergence with grain off.
 - The bird flock in forest-night differs between eyes (above).
-- Lab: in a 1920x1080 display with `output = full` and windowed mode the window logic shrinks the
-  engine to 160x240 (r15; `stereo window: resize ...` chain). Measured instead on a 3840x1080
-  display, borderless, as `docs/stereo-output.md` prescribes.
+- ~~Lab: 1920x1080 display, `output = full`, windowed: engine shrinks to 160x240~~ (fixed in
+  window.cpp: the engine always stays at the game's resolution; docs/stereo-output.md).
 - One crash in forest-night ~10 s in-world (r17, view path, no skips), not reproduced in r18/r19.
+
+### Convergence as image shift (full SBS)
+
+In sbs with `output = full`, convergence is no longer put into the projection. Each eye's
+finished image is shifted horizontally when it is copied into its half (`gpu_place_mid`, and
+`gpu_compose` on the frame path): the left eye by `-a`, the right eye by `+b` pixels, where
+`a + b = round(2 * e * m00 / Zc * W/2)` (e = separation per eye, W = eye width), the uncovered
+columns black (a zero-initialised texture). This is the classic horizontal image translation:
+it moves the zero-parallax plane to Zc exactly as the projection shift does for a parallel rig,
+but after TAA, so the resolve cannot pull it back, and before the HUD, which stays at the
+screen plane. The other modes (left/right/alternate, half output) keep the projection shift.
+
+Measured (prologue-road, 32.5 mm, grain off, per-patch parallel − converged, one 3840 frame each):
+
+| | applied | measured median | recovered Zc (4 m set) |
+|---|---|---|---|
+| TAA on, each eye rounded (9/9) | 18 px | +17.98 px (p5..p95 +11.4..+20.5, n 2253) | 4.20 m |
+| TAA off, same | 18 px | +17.99 px (n 2356) | 4.19 m |
+| TAA on, total rounded and split (9/10) | 19 px | **+19.04 px** (n 1277) | **3.96 m** |
+
+The projection shift for comparison: +6.2 px with TAA on (above). Ideal K/Zc = 18.86 px.
 
 ---
 

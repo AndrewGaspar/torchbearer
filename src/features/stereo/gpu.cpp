@@ -4,6 +4,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <vector>
@@ -264,6 +265,33 @@ bool ensure_eyes(const D3D12_RESOURCE_DESC& bb, uint32_t w) {
   return true;
 }
 
+// Zero-filled (committed resources start zeroed) eye-sized texture: the black edge strips of a
+// horizontally shifted eye.
+ID3D12Resource* g_black = nullptr;
+bool ensure_black() {
+  if (g_black) {
+    D3D12_RESOURCE_DESC d = g_black->GetDesc();
+    if (d.Width == g_eye_w && d.Height == g_eye_h && d.Format == g_eye_fmt) return true;
+    g_black->Release();
+    g_black = nullptr;
+  }
+  D3D12_HEAP_PROPERTIES hp{};
+  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC d{};
+  d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  d.Width = g_eye_w;
+  d.Height = g_eye_h;
+  d.DepthOrArraySize = 1;
+  d.MipLevels = 1;
+  d.Format = g_eye_fmt;
+  d.SampleDesc.Count = 1;
+  return SUCCEEDED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                  nullptr, __uuidof(ID3D12Resource), (void**)&g_black));
+}
+
+// Convergence as a horizontal image shift per eye, in pixels (content moves right when > 0).
+std::atomic<int> g_hit[2] = {0, 0};
+
 D3D12_TEXTURE_COPY_LOCATION loc(ID3D12Resource* r) {
   D3D12_TEXTURE_COPY_LOCATION l{};
   l.pResource = r;
@@ -278,7 +306,29 @@ void copy_rect(ID3D12Resource* dst, uint32_t dx, ID3D12Resource* src, uint32_t x
   D3D12_BOX box{x0, 0, 0, x0 + w, h, 1};
   cur()->CopyTextureRegion(&d, dx, 0, 0, &s, &box);
 }
+// Eye texture `src` (w x h) into dst at x0, its content shifted by `shift` columns; the uncovered
+// columns are black.
+void place_eye(ID3D12Resource* dst, uint32_t x0, ID3D12Resource* src, uint32_t w, uint32_t h, int shift) {
+  if (shift == 0 || !ensure_black()) {
+    copy_rect(dst, x0, src, 0, w, h);
+    return;
+  }
+  uint32_t s = uint32_t(shift < 0 ? -shift : shift);
+  if (s >= w) s = w - 1;
+  if (shift > 0) {
+    copy_rect(dst, x0 + s, src, 0, w - s, h);
+    copy_rect(dst, x0, g_black, 0, s, h);
+  } else {
+    copy_rect(dst, x0, src, s, w - s, h);
+    copy_rect(dst, x0 + w - s, g_black, 0, s, h);
+  }
+}
 }  // namespace
+
+void gpu_set_hit(int left_half_px, int right_half_px) {
+  g_hit[0] = left_half_px;
+  g_hit[1] = right_half_px;
+}
 
 bool gpu_store_eye(IDXGISwapChain* sc, int eye) {
   std::lock_guard lk(g_mu);
@@ -330,8 +380,8 @@ bool gpu_compose(IDXGISwapChain* sc) {
   barrier(g_eye[1], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
   barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
   if (k >= 2) {
-    copy_rect(bb, 0, g_eye[0], 0, w, h);
-    copy_rect(bb, w, g_eye[1], 0, w, h);
+    place_eye(bb, 0, g_eye[0], w, h, g_hit[0]);
+    place_eye(bb, w, g_eye[1], w, h, g_hit[1]);
   } else {
     copy_rect(bb, 0, g_eye[0], w / 4, w / 2, h);
     copy_rect(bb, w / 2, g_eye[1], w / 4, w / 2, h);
@@ -443,8 +493,8 @@ bool gpu_place_mid(IDXGISwapChain* sc, int stashed_eye) {
   copy_rect(g_eye[other], 0, bb, 0, w, h);
   barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
   barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-  copy_rect(bb, 0, g_eye[0], 0, w, h);  // left eye -> first half
-  copy_rect(bb, w, g_eye[1], 0, w, h);  // right eye -> second half
+  place_eye(bb, 0, g_eye[0], w, h, g_hit[0]);  // left eye -> first half
+  place_eye(bb, w, g_eye[1], w, h, g_hit[1]);  // right eye -> second half
   if (st != D3D12_RESOURCE_STATE_COPY_DEST) barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, st);
   mid_end();
   bb->Release();
@@ -488,9 +538,9 @@ std::string gpu_status() {
   char b[256];
   snprintf(b, sizeof b,
            "captures=%u failures=%u stored=%u composed=%u compose_fail=%u duplicated=%u eye=%ux%u mid_in_engine_list=%u "
-           "mid_own=%u",
+           "mid_own=%u hit=%d/%d",
            g_captures, g_failures, g_stored, g_composed, g_compose_fail, g_duplicated, g_eye_w, g_eye_h, g_mid_engine,
-           g_mid_own);
+           g_mid_own, g_hit[0].load(), g_hit[1].load());
   return b;
 }
 

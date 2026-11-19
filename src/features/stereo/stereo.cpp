@@ -263,7 +263,25 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
   float fov = at<float>(view, view::kFov), zoom = at<float>(view, view::kZoom);
   if (off != 0 && p.convergence_m > 0 && fov > 0.1f && fov < 3.0f && zoom > 0.01f && zoom < 100.f) {
     double m00 = 1.0 / std::tan(double(fov) * 0.5) / double(zoom ? zoom : 1.0f);
-    t_conv_shift = off * m00 / p.convergence_m;
+    double ndc = off * m00 / p.convergence_m;
+    // Full side-by-side: shift the finished eye images instead (gpu_set_hit). A shift in the
+    // projection is largely undone by the TAA resolve (+5..6.5 px measured for 18.9 expected).
+    if (p.mode == Mode::Sbs && present_width_scale_pending() > 1) {
+      // Copies move whole pixels: round the total (both eyes) and split it, so the screen plane
+      // lands within half a pixel of Zc (rounding each eye lost 0.86 px at 4 m: measured 17.98
+      // for 18.86 px).
+      uint32_t w = gpu_eye_width();
+      int total = int(std::lround(std::fabs(ndc) * (w ? w : 1920)));
+      int a = total / 2, b = total - a;
+      int px = eye < 0 ? a : b;
+      static int hit[2];
+      hit[eye < 0 ? 0 : 1] = ndc < 0 ? -px : px;
+      gpu_set_hit(hit[0], hit[1]);
+    } else {
+      t_conv_shift = ndc;
+    }
+  } else if (p.convergence_m <= 0) {
+    gpu_set_hit(0, 0);
   }
   g_eye_now = eye;
   // Per-eye temporal state (eyestate.cpp): TAA history and ping-pong index, the previous camera

@@ -681,7 +681,7 @@ apply = "live"
 [option."stereo.convergence"]
 type = "float"
 label = "Screen distance"
-help = "Distance of the zero-parallax plane in metres: nearer things pop out of the screen, farther ones sit behind it. 0 = parallel eyes (everything behind the screen). 3 to 5 m suits the third-person camera."
+help = "Distance of the screen plane in metres: nearer things come out of the screen, farther ones sit behind it (0 = everything behind). 3 to 5 m suits the third-person camera."
 min = 0
 max = 50
 step = 0.5
