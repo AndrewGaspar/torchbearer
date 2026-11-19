@@ -11,10 +11,13 @@ the screen plane where configured). **Same-update dual rendering works**: in `mo
 game's render pass runs twice per game update (left eye, right eye), the first Present is swallowed
 after its back buffer is stashed, and the second is composed into a **3840x1080 swapchain with
 each eye a 1:1, unscaled 1920x1080 render at the engine's own 16:9 frustum**. Temporal state that
-crosses eyes (TAA history, camera and object motion vectors) is handled for the prototype by giving
-each eye its own previous-frame camera matrix and switching off TAA and object velocity while sbs
-runs. What is not done: window sizing for a real 3840-wide display, per-eye TAA/DLSS history,
-HUD depth, and a half-SBS (squeezed) output.
+would cross eyes is kept **per eye** (section 5): TAA history pair and ping-pong index, previous
+camera matrices (camera and object motion vectors), the TAA jitter phase (one per update, same for
+both eyes) and the objects' previous transforms, so TAA and object motion blur stay on in sbs
+(measured: the disparity field with TAA on matches the TAA-off one, no cross-eye blending). DLSS has
+one feature, so in sbs it is reset every frame (safe, but soft); a DLSS feature per eye is
+specified, not built. What is not done: window sizing for a real 3840-wide display, per-eye DLSS,
+skinned-animation velocity for the second eye, HUD depth, and a half-SBS (squeezed) output.
 
 Every address is an RVA (image base 0x140000000), `Game_f_x64_EOS.exe` as shipped on Epic
 (2026-11). "static" = read in Ghidra (`re/scripts/Serve.java`), "live" = observed with the
@@ -129,7 +132,7 @@ binds the main view three times (`0x506b20`).
   world-to-clip (double[4][4])** to build current-view-to-previous-clip (camera motion vectors),
   then overwrites it with this frame's.
 - History targets `pTAAHistoryRT0/1` and `TAA Mask 0/1` come from the RT pool by name in
-  `renderWorld`.
+  `renderWorld`; the ping-pong index is RendererX86+0x2e8 (section 5 has the details).
 
 ### The tweakable registry
 
@@ -315,11 +318,11 @@ configured 2 × 32.5 mm.
 
 | state | problem when eyes alternate renders | prototype | proper fix |
 |---|---|---|---|
-| TAA history (`pTAAHistoryRT0/1`) | eye N resolves against eye N-1's image | TAA forced off (`0x955636/0x955694`) while sbs runs; `stereo.taa = 1` keeps it | per-eye history pair: swap the pool entries / RT pointers at RendererX86+0x2f0/+0x2f8 per eye |
-| camera motion vectors (TAA+0x60 previous world-to-clip) | the eye offset reads as camera velocity: motion blur smears the whole frame | per-eye copy of TAA+0x60 swapped around each eye's renderFrame (measured: fixes the background) | same, kept |
-| object motion vectors (per-object previous transforms, updated per render) | the eye offset reads as object velocity: the player smears horizontally (captured) | tweakable `TAA:Enable Object Velocity` = 0 while sbs runs | per-eye previous object transforms (find where skinned/rigid objects store last frame's matrices) |
-| DLSS (`0xd75620`, nvngx) | one DLSS feature has one history | not handled (DLSS off in the lab) | one DLSS feature per eye |
-| frame counters (`0xb188d8`, `0xd744f8`) | advance twice per update: jitter sequence and anything keyed on frame parity runs at 2x | none | harmless so far; pin per-update if something depends on it |
+| TAA history (`pTAAHistoryRT0/1`, `TAA Mask 0/1`, index RendererX86+0x2e8) | eye N resolves against eye N-1's image: the disparity collapses (measured, section 5) | **done**: right eye gets its own pool RTs (renamed in the pool allocator) and each eye its own ping-pong index | — |
+| camera motion vectors (TAA+0x60, vector blur +0x60) | the eye offset reads as camera velocity: motion blur smears the whole frame | **done**: per-eye copies swapped around each eye's renderFrame | — |
+| object motion vectors (View+0x88/+0x108 previous camera; object +0xb8 previous world) | the eye offset reads as object velocity: the player smears (captured); the second eye had no object motion at all (measured) | **done**: per-eye previous View matrices; objects keep the previous update's transform for the second eye | skinned animation (vertex buffers double-buffered by frame parity) still zero for the second eye |
+| DLSS (`0xd75620`, one NGX feature at device+0x38a8) | one history for both eyes: the disparity collapses (measured) | **reset every frame** while sbs runs (no cross-eye blending, but no accumulation: soft) | one DLSS feature per eye (section 5) |
+| frame counters (`0xb188d8`, `0xd744f8`) | advance twice per update: jitter sequence and anything keyed on frame parity runs at 2x | jitter: renderFrame is lent a per-update counter (same jitter for both eyes); the rest unchanged | pin per update once beginFrame runs once per update |
 | auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | none visible; the separation-0 control leaves a small residual (mean 0.81/255) | audit each `*_update` in renderWorld; skip on pass 2 |
 | HUD | drawn per eye at zero disparity | fine | draw once / at chosen depth |
 | frame pacing | ModeSwitch::render waits 4.17 ms per call | fine | — |
@@ -348,10 +351,10 @@ frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are w
 2. **Dual render per update**: keep the `ModeSwitch::render` ×2 structure. It reuses every engine
    system unchanged and costs one extra render per update (CPU submit + GPU), which is the
    unavoidable price of true stereo.
-3. **Temporal state per eye** (the real work): TAA history pair and TAA+0x60 per eye, then TAA can
-   stay on; object previous-transforms per eye so object motion blur and TAA reprojection work;
-   DLSS feature per eye if DLSS is to be supported; audit render-side simulations (particles,
-   exposure) to step once per update.
+3. **Temporal state per eye**: done for TAA (history pair, index, jitter), camera and object
+   motion vectors (section 5). Remaining: a DLSS feature per eye, skinned-animation velocity for the
+   second eye, and an audit of render-side simulations (particles, exposure, SSAO and volumetric
+   temporal buffers) to step once per update.
 4. **Pass-2 shortcut**: skip work that is eye-independent on pass 2 (shadow maps, cube probe,
    GPU sims) by recognising those passes in renderWorld. Shadow cascades are fitted to the view
    frustum, so they are nearly eye-independent; reusing them is a large saving.
@@ -366,6 +369,171 @@ frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are w
 - Cinematics/cutscenes use other cameras and may bypass `renderFrame` (Bink videos do: no 3D).
 - The width lie is only on the DXGI side; the back-buffer resource itself reports 3840 (the engine
   did not use it in the tested paths: menu, title, gameplay).
+
+---
+
+## 5. Temporal state per eye
+
+Implemented in `src/features/stereo/eyestate.{h,cpp}`: `eyestate_enter(renderer, view, eye, …)` /
+`eyestate_leave(…)` bracket each eye's `RendererX86::renderFrame` (called from `render_eye`, so it
+does not care whether the two eyes come from two `ModeSwitch::render` calls or two `renderFrame`
+calls in one), and `eyestate_update(dual)` runs once per game update. New RVAs are in `engine.h`
+(`kEyeSigs`, all signature-checked; a mismatch disables the whole module and sbs falls back to TAA
+and object velocity off, as before).
+
+### What carries "last frame", and what each eye now gets
+
+**TAA history (static + live).** `renderWorld` (0x5090b0) requests `pTAAHistoryRT0/1` (output
+resolution, format 0xb) and `TAA Mask 0/1` (format 3) from the RT pool every frame and keeps them in
+RendererX86+0x2f0/+0x2f8 and +0x300/+0x308 for the frame (cleared at its end). They persist because
+the pool allocator (0x4ad760) hands back the free entry whose stored name *contains* the requested
+name (case-insensitive substring, 0x3bb360) with the same size/format. The ping-pong index is
+RendererX86+0x2e8 (int): while TAA is on and DLSS off, renderWorld does `prev = i; i ^= 1;` then
+`0x49a8c0(TAA, …, mask[i])` and the resolve `0x498a80(TAA, color, motion, …, mask[prev], mask[i],
+hist[prev], hist[i])` (code at 0x50aa5d). With two renders per update the index toggles twice, so
+eye R always reads what eye L wrote that same update (and vice versa).
+Per eye: the pool allocator is hooked and, while the right eye renders, those four names (matched
+by the game's literal addresses 0x798858/68/78/88) become `TB R TAAHistory0/1` and `TB R TAAMask0/1`
+(no name is a substring of another, so the pool can never hand one eye the other's target): the
+right eye gets its own persistent pair, created by the engine's own pool on first use (+2 history
+RTs at output resolution, +2 masks; about 37 MB at 1920x1080). The index +0x2e8 is saved/restored
+per eye. Live: the probe (`stereo probe N`) shows each eye's index toggling on its own (L 1→0, R
+1→0, L 0→1, R 0→1 …) and 4 renamed requests per right-eye render.
+
+**Jitter (static + live).** `renderFrame` (0x508970) derives the jitter phase from the render-frame
+counter 0xd744f8 (`counter & 3` for the rotated grid, `counter % samples` for Halton/Hammersley,
+also the DLSS phase), and the renderer's beginFrame (0x5064a0) increments it once per
+`ModeSwitch::render`, so with sbs L always got even phases and R odd ones: each eye's history only
+ever saw half the pattern. Per eye: the counter is replaced by a per-update count for the jitter
+computation only (set in `eyestate_enter`, restored at entry to the hooked `renderWorld`), so both
+eyes of an update use the same jitter and each eye walks the whole sequence, one step per update.
+Everything inside renderWorld (skinning buffers, per-object stamps, GPU ring slots keyed on
+`counter % n`) still sees the engine's real counter. Live: probe `ctr=114/115` at renderFrame
+entry for both eyes of consecutive updates, real counter 2290.. inside renderWorld.
+
+**Camera motion vectors (static + live).** Two objects keep last frame's unjittered world-to-clip
+at +0x60 and overwrite it every render: the TAA object (RendererX86+0x140, `TAA::beginFrame`
+0x498590) and the vector-blur object (RendererX86+0x190, 0x4700f0, same layout). Both are
+saved/restored per eye (the TAA one was already in the prototype; the vector-blur one is new).
+
+**Object motion vectors (static + live).** The velocity builder (0x4cad50, `RenderVelocityCommand`
+0x4c9c90) computes `g_mPreviousLocalToClip = objPrevWorld(object+0xb8, float 4x3) × View+0x108
+(previous world-to-view, double 4x3) × View+0x88 (previous view-to-clip, double 4x4)`, and the
+current one from object+0x88 × View+0x1e8 × View+0x2a8. Live (probe): after renderFrame
+View+0x108 equals the current world-to-view, i.e. the engine copies current → previous at the end of
+each render, so the second eye's "previous camera" was the first eye's (the eye offset read as
+object velocity: the player smear). Per eye: View+0x88..+0x168 is saved/restored per eye like the
+TAA matrices. The objects' own previous world is the other half: `rend::Object::storePrevious`
+(vtable 0x785d48 slot 6, 0x46d510: +0xb8 ← +0x88) is called for every drawn object at the very end
+of renderWorld (0x50b46e). Live: ~330 calls per render in prologue-road, ~140 in forest-night, all
+inside renderFrame (return address 0x50b471), none outside.
+So with two renders per update the second eye found prev == current and drew **no object motion at
+all**. Measured in `awr-forest-night` (birds attacking), objects drawn with a non-zero object motion
+per eye render (status `obj_moving`): without the fix L 25-32, R 0.0-0.2; with it L 18.7-32.4, R
+18.7-33.6 (three alternations each). The fix: while the first eye of an update renders (another
+eye follows), the hook keeps +0xb8..+0xe8 as it was across the call (the rest of storePrevious
+still runs), so both eyes see the previous *update's* transform. Object transforms are world-space
+and eye-independent, so this is exact for rigid objects.
+
+**Not per eye (remaining).** Skinned vertices are computed into two buffers chosen by
+`counter & 1` (0x46d650 current, 0x46d680 previous, stamp check 0x46d6f0, static). With the counter
+advancing per render, the right eye computes the same pose into the other buffer and uses the left
+eye's as "previous": its skinned *animation* velocity is zero (rigid motion and camera are right).
+This resolves itself once beginFrame runs once per update (both eyes on the same counter: the
+second eye reuses the first's buffer, previous = last update's). The SSAO temporal buffer
+(0x5363c0) and the volumetric-light temporal buffer (0x4e3020) are also single-history and still
+blend across eyes (low-frequency effects; not measured separately).
+
+### DLSS
+
+Static: DLSS mode is u32 0xd75620 (renderWorld skips the TAA path when non-zero). One NGX feature
+lives in the D3D12 device object (global 0xda35e0, `rend::DeviceD3D12PC` vtable 0x790f58): handle at
++0x38a8, parameters at +0x38a0, initialised flag +0x38b8, created by 0x4a7080 (NGX CreateFeature on
+a command list kept at +0x38d0) from vtable slot 45 (0x4a6660), which re-creates it when the mode
+(+0x38d8) or render/output size (+0x38c0..+0x38cc) changes, moving the old handle to +0x38b0 for
+release by 0x4a6cd0 (GPU idle 0x4f7be0, then NGX release 0x68ea80). Evaluate is slot 46
+(0x4a67b0 → parameter setup 0x4a5800); its **Reset is always 0** (`mov dword [rsp+0x68],0` at
+0x4a6ad1). Live: DLSS does run in the lab (`game.dlss = quality` → mode 4, a feature handle
+present; nvapi enabled in the instance).
+
+What the mod does: while sbs runs with DLSS on, the immediate of that `mov` is patched to 1
+(`eyestate_update`), so DLSS resets its history on every evaluate: both eyes are upscaled from
+their own frame only, symmetric, no cross-eye blending, but without temporal accumulation (softer:
+sharpness 2.06-2.16 vs 3.5-3.7 for native TAA-off, below). Patched back as soon as sbs stops or DLSS
+is switched off.
+
+What a proper per-eye DLSS needs (not built): swap device+0x38a8 per eye in
+`eyestate_enter/leave` exactly like the TAA index; create the right eye's feature on first use by
+calling 0x4a7080 with +0x38a8 zeroed (it records CreateFeature on the device's command list and
+registers it via 0x502a30), remember for each eye's handle the mode/size key it was created with
+and, when the key changes (0x4a6660 only re-creates the handle that is in +0x38a8 at that moment),
+re-create the stale eye's handle and release the old one the way 0x4a6cd0 does (GPU idle, NGX
+release). Cost: one more DLSS feature (its history buffers) and nothing per frame.
+
+### Measured (lab, `prologue-road`, 3840x1080 sbs, separation 32.5 mm, parallel)
+
+`re/scripts/stereo_taa_battery.sh` + `re/scripts/stereo_taa_analyse.py`; every number is the two
+halves of one presented frame (both eyes from one update), 2 frames per cell. Variants: **off** =
+TAA and object velocity off (the old sbs default; the reference disparity field), **shared** = TAA
+and object velocity on with per-eye state off (`stereo.per_eye = 0`, the old `taa = 1`), **per-eye**
+= the new default, **mb-** = TAA off, object velocity (motion blur) on. Runs r4 (TAA) and r11 (DLSS
+quality, then the off / per-eye repeat with DLSS off).
+
+| | off | shared | per-eye |
+|---|---|---|---|
+| sep 0, static: \|L−R\| mean (/255) | 0.78, 0.56 | 0.87, 0.70 (max 50-64) | 0.80, 0.54 |
+| sep 0, pan 0.5°/update: \|L−R\| mean | 0.91, 0.75 (max 16) | 1.04, 0.97 (max 80-82) | 0.80, 0.74 (max 23-31) |
+| … player box | 0.61, 0.63 | 1.51, 1.36 | 0.69, 0.56 |
+| sep 32.5: disparity median (all patches) | +4.03, +3.99 px | **+0.85, +1.19 px** | +4.05, +4.07 px |
+| … per patch vs off: median, mean \|diff\| | (off vs off: −0.002, 0.27) | −1.52, 4.51 px (p5 −15.8) | **−0.012, 1.24 / 1.20 px** |
+| … sharpness, mean \|∇\| (player box) | 3.66, 3.49 (5.67, 5.55) | 2.84, 2.73 (4.25, 4.15) | 3.61, 3.55 (5.61, 5.51) |
+
+With a shared history the right eye's TAA keeps blending in the left eye's image (and vice
+versa): the disparity field collapses towards zero (median +0.85 px instead of +4.0: the 3D effect
+is mostly gone) and the image is soft. With per-eye state the disparity field matches TAA-off patch
+by patch (median difference −0.01 px; the 1.2 px mean is TAA's own antialiasing moving edges,
+against a 0.27 px floor between two TAA-off frames), the separation-0 controls are at the TAA-off
+level both static and under the pan, and sharpness is back to the TAA-off level. Repeat in r11:
+per-eye vs off per patch −0.001 px median, 1.07 / 0.99 px mean.
+
+DLSS (r11, DLSS quality, same scene): **shared** (no handling) disparity median +0.25 px (far field
++0.15 px vs +2.7 px), per patch vs off −2.4 px median, 5.1 px mean, pan |L−R| 1.21 / 0.90 (max
+77-83); **reset per frame** (what the mod does): disparity +3.87 / +3.68 px, per patch −0.03 px
+median, 1.48 / 1.45 px mean, pan |L−R| 0.79 / 0.69 (max 13-35); sharpness 2.16 / 2.06 (soft: no
+accumulation).
+
+Object velocity on, TAA off (the r11/r17 smear case): player-box sharpness L 5.14 / 5.02 with the
+previous view shared, 5.41 / 5.31 per eye, 5.67 / 5.55 with object velocity off. The crops show the
+smear on the shared variant's head and shoulders; in the per-eye capture the player had moved (idle
+animation), with ordinary motion blur on the moving arm. A moving-objects |L−R| test in
+`awr-forest-night` (birds) was inconclusive: frame-to-frame variation (0.8-2.1/255) is larger than
+any variant difference; the `obj_moving` counts above are the clean measurement there.
+
+Cost (`quiver lab gpu -- stereo_rate.sh`, awr-pass also resident): sbs with per-eye state 68.5 /
+68.2 renders/s, without 68.1 / 68.0: no measurable overhead (a few memcpys per eye; the right
+eye's extra RTs are only memory).
+
+![TAA and DLSS per eye](img/stereo-taa-per-eye.jpg)
+
+*Right eye, player crop, separation 32.5 mm (r4, r11). TAA with one history for both eyes blends
+the left eye's image in (soft, doubled edges, disparity flattened); per-eye history looks like the
+TAA-off frame, antialiased. DLSS with its single history: the same blending; reset per frame: no
+blending, softer.*
+
+![object velocity per eye](img/stereo-object-velocity-per-eye.jpg)
+
+*Right eye, TAA off, object motion blur on (r4): previous camera shared between eyes (the eye
+offset reads as object motion: the head and shoulders smear) vs per eye.*
+
+### Config
+
+`[stereo] taa = 1` and `object_velocity = 1` (new defaults) keep the game's own TAA / object
+velocity settings in sbs, with per-eye state; `0` switches them off while sbs runs (the old
+behaviour). Without per-eye state (signature mismatch) they are switched off regardless. Dev:
+`stereo.per_eye = 0` (shared state, the old prototype), `2` (all but the object-previous hold); the
+lab verb `stereo probe N` logs the view/TAA state around N eye renders; `stereo status` reports
+`eyestate` (swaps, renamed RT requests, jitter count, held object stores, `obj_moving` per eye,
+DLSS mode/handle/reset).
 
 ---
 
@@ -384,8 +552,11 @@ re/scripts/stereo_battery.sh awr                     # captures into the run fol
 python3 re/scripts/stereo_analyse.py <run folder>
 quiver lab gpu -- re/scripts/stereo_rate.sh awr     # renders/s and displayed frames/s per mode
 quiver lab call awr stereo census 2                  # frame-structure trace into torchbearer.log
+re/scripts/stereo_taa_battery.sh awr                 # per-eye temporal state variants (section 5)
+python3 re/scripts/stereo_taa_analyse.py <run folder>
+VARIANTS="dlssshared:1:1:0 dlssreset:1:1:1" re/scripts/stereo_taa_battery.sh awr   # with game.dlss on
 ```
 
-Lab verbs: `stereo status | census N | shots N TAG [SKIP] | files`, `tweak list [SUBSTR] | tweak NAME
+Lab verbs: `stereo status | census N | shots N TAG [SKIP] | files | probe N`, `tweak list [SUBSTR] | tweak NAME
 [VALUE]`, `cfg stereo.<key> <value>`. Ghidra: `re/scripts/Serve.java` (headless query server) and
 `re/scripts/ghq` (client).
