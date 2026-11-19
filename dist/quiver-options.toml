@@ -76,7 +76,7 @@ options = ["stereo.mode", "stereo.output", "stereo.hyprland_tag", "stereo.separa
 
 [[page.group]]
 title = "Temporal effects in 3D"
-options = ["stereo.taa", "stereo.object_velocity"]
+options = ["stereo.taa", "stereo.object_velocity", "stereo.dlss_per_eye"]
 
 [[page.group]]
 title = "3D rendering"
@@ -710,6 +710,14 @@ apply = "live"
 type = "bool"
 label = "Keep TAA in 3D"
 help = "On: the game's TAA stays as set in its options, with a separate history per eye. Off: TAA is switched off while side-by-side runs."
+default = true
+level = "advanced"
+apply = "live"
+
+[option."stereo.dlss_per_eye"]
+type = "bool"
+label = "Separate DLSS per eye in 3D"
+help = "On: each eye has its own DLSS history (sharp). Off: DLSS restarts its history every frame in 3D (no blending between eyes, but softer)."
 default = true
 level = "advanced"
 apply = "live"
