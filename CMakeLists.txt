@@ -51,4 +51,12 @@ add_custom_target(mod ALL
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/torchbearer.ini
     ${CMAKE_SOURCE_DIR}/dist/quiver-mod.toml ${CMAKE_SOURCE_DIR}/dist/quiver-options.toml
     ${CMAKE_BINARY_DIR}/mod/
+  # build/package: a Quiver mod package (`quiver mods "Alan Wake Remastered" install build/package`):
+  # the manifest and options schema at the top, files laid out like the install folder in files/.
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/package/files
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/quiver-mod.toml
+    ${CMAKE_SOURCE_DIR}/dist/quiver-options.toml ${CMAKE_BINARY_DIR}/package/
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:torchbearer> ${CMAKE_BINARY_DIR}/package/files/dxgi.dll
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/torchbearer.ini
+    ${CMAKE_BINARY_DIR}/package/files/
   DEPENDS torchbearer)
