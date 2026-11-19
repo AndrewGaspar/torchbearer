@@ -158,8 +158,10 @@ a game's Vulkan image is in Wine's *client subsurface* (winewayland wayland_surf
 HypXRland crops only a window's main surface — so a tagged Wine-Wayland game would **not** be
 split per eye. Two ways out: run the game on Wine's X11 driver, or teach HypXRland to crop a
 stereo window's covering subsurface (Wine's client surface; requested from the hypxrland session
-2026-11-19). **Interim (0.4): the mod's launch settings disable `winewayland.drv`**, so Wine uses
-its X11 driver (XWayland), the path every lab test ran on. Cost: Wine-Wayland HDR is unavailable
-with the mod. Full resolution under HypXRland
+2026-11-19). 0.4-0.4.1 disabled `winewayland.drv` in the mod's launch settings to force X11;
+**reverted in 0.4.2**: on the user's desktop the XWayland socket `/tmp/.X11-unix/X0` had been
+replaced by a dead one (refused; XWayland itself still listened on `X0_`), so with only the X11
+driver allowed Wine had no display driver and the game hung before its first frame (0 frames,
+no torchbearer.log). Forcing a driver makes the mod depend on desktop state it cannot check. Full resolution under HypXRland
 additionally needs Wine to allow a swapchain larger than the window (win32u/vulkan.c pins the
 Vulkan extent to the client rect; the Wayland driver would then scale it with its viewport).
