@@ -72,7 +72,7 @@ options = ["intro.skip_startup_video", "intro.skip_logo_screens", "intro.skip_ep
 [[page]]
 id = "stereo"
 title = "Stereoscopic 3D"
-options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap_eyes"]
+options = ["stereo.mode", "stereo.output", "stereo.hyprland_tag", "stereo.separation", "stereo.convergence", "stereo.swap_eyes"]
 
 [[page.group]]
 title = "Temporal effects in 3D"
@@ -662,9 +662,18 @@ label = "Output"
 help = "Full makes the window twice as wide as the game's resolution, each eye unscaled (borderless on a 3840x1080 desktop gives 1920x1080 per eye). Half keeps the window size (a prototype that shows the centre of each eye)."
 values = [
   { value = "full", label = "Full side-by-side (2x wide)" },
+  { value = "hsbs", label = "Half side-by-side (HypXRland 3D mode)" },
   { value = "half", label = "Half side-by-side (prototype)", level = "advanced" },
 ]
 default = "half"
+apply = "restart"
+
+[option."stereo.hyprland_tag"]
+type = "bool"
+label = "Declare stereo to Hyprland"
+help = "With Full or Half side-by-side output, tag the game window stereo-sbs or stereo-hsbs over Hyprland's IPC socket so HypXRland shows each half to one eye (needs the matching window rule)."
+default = true
+level = "advanced"
 apply = "restart"
 
 [option."stereo.separation"]

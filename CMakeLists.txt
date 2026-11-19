@@ -26,6 +26,7 @@ add_library(torchbearer SHARED
   src/core/quiver.cpp
   src/core/present.cpp
   src/core/module.cpp
+  src/core/hyprland.cpp
   src/features/features.cpp
   src/features/stereo/stereo.cpp
   src/features/stereo/gpu.cpp
@@ -45,7 +46,7 @@ target_compile_definitions(torchbearer PRIVATE TB_VERSION="${TB_VERSION}" WIN32_
 target_compile_options(torchbearer PRIVATE -Wall -Wno-unknown-pragmas -fno-strict-aliasing)
 target_link_options(torchbearer PRIVATE -static -static-libgcc -static-libstdc++
   -Wl,--enable-stdcall-fixup)
-target_link_libraries(torchbearer PRIVATE minhook dxguid uuid)
+target_link_libraries(torchbearer PRIVATE minhook dxguid uuid ws2_32)
 
 # Everything a mod folder needs: the DLL plus the shipped config and Quiver schema. Re-copied on
 # every build (not only when the DLL relinks), so dist/ edits always reach build/mod.

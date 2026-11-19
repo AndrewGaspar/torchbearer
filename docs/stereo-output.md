@@ -97,3 +97,67 @@ WM_CREATE):
 
 *The gamescope output (3840x1080, downscaled) of run r2: windowed 1920x1080 per eye, the window
 widened to 3840; left eye left, right eye right.*
+
+## HypXRland (the user's compositor) — `output = hsbs` and the window tag
+
+How the glasses are actually driven here: HypXRland (~/code/hypxrland, config
+~/.config/hypr/hyprland-xr.lua) runs the XReal's 3D mode as **one 1920x1080 logical monitor**
+scanned out at 3840x1080 (`monitor … stereo = "sbs"`), and splits a window *declared* stereo per
+eye: it crops the window's **main surface** to the left/right half for each pane and stretches it
+over the window's own box (05-configuration.md §8.5-8.6; `applyStereoContentCrop` in
+src/render/ElementRenderer.cpp). So the game sees a 1920-wide desktop, and `output = full`
+(a 3840 window) does not fit it.
+
+### `output = hsbs` (static + live)
+
+The same machinery as `full`, with the engine at half the window: in borderless the desktop query
+is halved (1920 → 960, window.cpp), the window stays 1920 (2 x 960), the swapchain is 1920 with
+the game seeing 960, and the eyes are copied 1:1 into the halves. Each eye is made **anamorphic**:
+the game keeps its vertical FOV and derives the horizontal one from the aspect (live: 1920x1080 →
+fov 1.3823 rad; 960x1080 → 0.7844 = 2·atan(tan(1.3823/2)·0.8889/1.7778)), so before each render
+the main camera gets twice its aspect and the matching horizontal FOV (`anamorphic_apply`,
+stereo.cpp). Each half then holds the full 16:9 view squeezed 2:1 (captured: same framing as the
+1920-per-eye render, everything half as wide), which the compositor's stretch undoes. Convergence
+shifts are computed in the squeezed eye's pixels (hit −4/+5 at 4 m, half of full's −9/+10).
+
+Known issue: the game's 2D UI lays itself out for the 960x1080 screen it is told about (element
+sizes follow the height, positions the width), so after the 2x stretch menus are twice as wide and
+the pause menu's logo overlaps its items (captured). Fix candidate: let the UI lay out at 16:9 and
+draw it squeezed into each half (needs the UI's screen size; not found yet).
+
+### The window tag (live, on the real HypXRland session)
+
+HypXRland reads a cooperative xdg-toplevel tag (`stereo:sbs` …), but a Wine game cannot set one:
+- GE-Proton 11-12's Wayland driver already sets an xdg tag on every toplevel — hard-coded
+  `proton-game` ("This is a game running through proton"), sent once in
+  `wayland_surface_make_toplevel` (disassembled from the installed winewayland.so); nothing lets an
+  app choose it;
+- under the X11 driver the window is an XWayland window, which has no xdg tag at all.
+
+So the mod uses a **Hyprland window tag** instead, set over the compositor's IPC socket from
+inside Wine (core/hyprland.cpp): Wine's winsock bridges AF_UNIX, and a Windows program connects to
+`Z:\run\user\1000\hypr\<signature>\.socket.sock` like hyprctl (verified: `j/version` reply). In
+a Lua-configured session `dispatch X` means `hl.dispatch(X)`, so the request is
+`dispatch hl.dsp.window.tag({ tag = "+stereo-hsbs", window = "address:0x…" })` (classic
+`dispatch tagwindow +tag address:…` as fallback). Finding our window: the pid cannot be used —
+Wine has wineserver open files, so `Z:\proc\self` is wineserver's (live) — so the window's title
+briefly carries a random marker until the compositor's client list shows it, then is restored.
+`XDG_RUNTIME_DIR` is not in Wine's Windows environment; it is read from `Z:\proc\self\environ`.
+
+Verified end to end with a self-test program (same hyprland.cpp) on the live session under Wine's
+Wayland driver, both via bare `wine` and via GE-Proton's `proton run`: tag applied (visible in
+`j/clients` tags), then cleared. Not verifiable from the agent shell: the X11 driver (no X
+authority there). The user's config maps the tag (hyprland-xr.lua, 2026-11-19: generic
+`stereo-<layout>` → `stereo <layout> always`; mpv's float split into its own rule).
+
+### Open: Wine's Wayland driver vs HypXRland's crop
+
+On this machine GE-Proton picks Wine's **Wayland** driver whenever `WAYLAND_DISPLAY` is set (the
+`proton run` self-test window was not XWayland; Quiver keeps the variable for real launches). There
+a game's Vulkan image is in Wine's *client subsurface* (winewayland wayland_surface.c), and
+HypXRland crops only a window's main surface — so a tagged Wine-Wayland game would **not** be
+split per eye. Two ways out: run the game on Wine's X11 driver (e.g. `winewayland.drv=d` in the
+mod's launch settings; everything in the lab ran X11 under gamescope), or teach HypXRland to crop
+a stereo window's covering subsurface (Wine's client surface). Full resolution under HypXRland
+additionally needs Wine to allow a swapchain larger than the window (win32u/vulkan.c pins the
+Vulkan extent to the client rect; the Wayland driver would then scale it with its viewport).

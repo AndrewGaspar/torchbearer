@@ -26,6 +26,7 @@
 
 #include "core/config.h"
 #include "core/hook.h"
+#include "core/hyprland.h"
 #include "core/lab.h"
 #include "core/log.h"
 #include "core/module.h"
@@ -73,6 +74,9 @@ struct Params {
   // prototype), 2 all but holding the objects' previous transforms for the second eye.
   int per_eye = 1;
   SbsPath path = SbsPath::View;
+  // output = hsbs: each eye is rendered anamorphic (16:9 field of view squeezed into a half-width
+  // image), for compositors that un-squeeze a half side-by-side window (HypXRland `stereo hsbs`).
+  bool anamorphic = false;
 };
 std::mutex g_pmu;
 Params g_p;
@@ -356,6 +360,38 @@ void render_view_sbs(void* r, void* view, void* a3, void* a4, const Params& p) {
   if (census_on()) census("view sbs: right eye rendered, eyes placed=%d (overlay duplication armed)", placed);
 }
 
+// Half side-by-side (output = hsbs): the engine renders one eye at half the window's width
+// (borderless: half the desktop, window.cpp), so its own camera would have a half-width aspect.
+// The game keeps the vertical FOV and derives the horizontal one from the aspect (live: 1920x1080
+// fov 1.3823 rad, 960x1080 fov 0.7844 = 2*atan(tan(1.3823/2) * 0.8889/1.7778)). Here the main
+// camera gets twice its aspect and the matching horizontal FOV before each render, so every eye
+// image holds the full-width view squeezed 2:1, which the compositor stretches back. Applied from
+// the game's own values each update (the game rewrites them; ours are recognised and not
+// compounded).
+float g_ana_orig_fov = 0, g_ana_orig_aspect = 0, g_ana_set_fov = -1, g_ana_set_aspect = -1;
+std::atomic<uint64_t> g_ana_applied{0};
+void anamorphic_apply(void* view) {
+  float& fov = at<float>(view, view::kFov);
+  float& aspect = at<float>(view, view::kAspect);
+  if (!(fov == g_ana_set_fov && aspect == g_ana_set_aspect)) {
+    g_ana_orig_fov = fov;
+    g_ana_orig_aspect = aspect;
+  }
+  if (!(g_ana_orig_fov > 0.05f && g_ana_orig_fov < 3.0f && g_ana_orig_aspect > 0.1f && g_ana_orig_aspect < 10.f))
+    return;
+  float want_aspect = g_ana_orig_aspect * 2.0f;
+  float want_fov = float(2.0 * std::atan(std::tan(double(g_ana_orig_fov) * 0.5) * 2.0));
+  if (fov != want_fov || aspect != want_aspect) {
+    fov = want_fov;
+    aspect = want_aspect;
+    at<uint8_t>(view, view::kDirtyProj) = 0;   // view-to-clip is rebuilt from these
+    at<uint8_t>(view, view::kDirtyWorld) = 0;  // and world-to-clip from that
+  }
+  g_ana_set_fov = want_fov;
+  g_ana_set_aspect = want_aspect;
+  g_ana_applied++;
+}
+
 void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
   if (census_on()) {
     const double* m = &at<double>(view, view::kViewToWorld);
@@ -371,6 +407,7 @@ void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
     TB_LOG("stereo: first renderFrame (view %p)", view);
   }
   Params p = params();
+  if (p.anamorphic) anamorphic_apply(view);
   if (p.mode == Mode::Off && g_applied == 0) {
     g_main_view = view;
     uint64_t t0 = now_us();
@@ -641,6 +678,14 @@ std::string status_json() {
 
 bool g_hooked = false;
 
+// The packed output declares itself to HypXRland: a Hyprland window tag `stereo-<layout>` on the
+// game's window, which the compositor's config maps to `stereo <layout> always` (core/hyprland.cpp,
+// docs/stereo-output.md). Kept whenever the packed output is on: with stereo off or in menus both
+// halves carry the same image, which is still a valid packed frame (2D in the glasses).
+std::string g_tag_layout;
+bool g_tag_on = true;
+void update_window_tag() { hypr_set_window_tag(g_tag_on && !g_tag_layout.empty() ? "stereo-" + g_tag_layout : ""); }
+
 }  // namespace
 
 void register_feature() {
@@ -654,7 +699,17 @@ void register_feature() {
     else if (id == "stereo.taa") g_p.taa_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.object_velocity") g_p.objvel_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.per_eye") g_p.per_eye = (v == "0" || v == "false") ? 0 : v == "2" ? 2 : 1;
-    else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
+    else if (id == "stereo.hyprland_tag") {
+      g_tag_on = v != "0" && v != "false";
+      update_window_tag();
+    } else if (id == "stereo.output") {
+      // full / hsbs: the swapchain (and window) are twice the engine's width, read at swapchain
+      // creation; hsbs additionally squeezes each eye (anamorphic, above). half: legacy crop.
+      present_set_width_scale(v == "full" || v == "hsbs" ? 2 : 1);
+      g_p.anamorphic = v == "hsbs";
+      g_tag_layout = v == "full" ? "sbs" : v == "hsbs" ? "hsbs" : "";
+      update_window_tag();
+    }
     else if (id == "stereo.sbs_path") g_p.path = v == "frame" ? SbsPath::Frame : SbsPath::View;
     else if (id == "stereo.view_kick") g_view_kick = (v == "1" || v == "true");
   });
@@ -716,6 +771,7 @@ void register_feature() {
     std::string sub = a.empty() ? "status" : a[0];
     if (sub == "status") return status_json();
     if (sub == "window") return window_status();
+    if (sub == "hyprland") return hypr_status();
     if (!g_hooked) {
       ok = false;
       return json_str("stereo hooks not installed (see torchbearer.log)");
