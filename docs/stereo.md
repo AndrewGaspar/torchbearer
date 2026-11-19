@@ -14,13 +14,16 @@ each eye a 1:1, unscaled 1920x1080 render at the engine's own 16:9 frustum**. Te
 would cross eyes is kept **per eye** (section 5): TAA history pair and ping-pong index, previous
 camera matrices (camera and object motion vectors), the TAA jitter phase (one per update, same for
 both eyes) and the objects' previous transforms, so TAA and object motion blur stay on in sbs
-(measured: the disparity field with TAA on matches the TAA-off one, no cross-eye blending). DLSS
+(measured: the disparity field with TAA on matches the TAA-off one, no cross-eye blending); so are
+the volumetric-light, SSAO and Taken-shade histories (section 5: a shared volumetric history had
+flattened the fog's disparity by ~45 %). DLSS
 gets a second NGX feature for the right eye, so each eye accumulates its own history (measured:
 disparity field as with TAA off, sharpness as mono DLSS; the old reset-every-frame is the
 fallback). **Both eyes now render inside one engine frame** by default (`sbs_path =
 view`, section 6): `renderFrame` twice inside one `ModeSwitch::render`, beginFrame/endFrame, HUD and
 Present once per update, the HUD duplicated into both halves, render-side state that a render
-advances rewound for the second eye (separation-0 halves 0.036/255 apart), and optionally the
+advances rewound or replayed for the second eye (separation-0 halves 0.001-0.008/255 apart in
+prologue-road, the bird attack in forest-night ~0.01-0.02/255), and optionally the
 sky probe reused for the second eye (`skip_probe`; shadow-map reuse, +10 % fps, is opt-in until the flashlight issue in section 6 is solved). What
 is not done: HUD depth. Convergence in full SBS
 is a per-eye image shift in the compositor (section 6, "Convergence as image shift"), which TAA
@@ -328,10 +331,11 @@ configured 2 × 32.5 mm.
 |---|---|---|---|
 | TAA history (`pTAAHistoryRT0/1`, `TAA Mask 0/1`, index RendererX86+0x2e8) | eye N resolves against eye N-1's image: the disparity collapses (measured, section 5) | **done**: right eye gets its own pool RTs (renamed in the pool allocator) and each eye its own ping-pong index | — |
 | camera motion vectors (TAA+0x60, vector blur +0x60) | the eye offset reads as camera velocity: motion blur smears the whole frame | **done**: per-eye copies swapped around each eye's renderFrame | — |
-| object motion vectors (View+0x88/+0x108 previous camera; object +0xb8 previous world) | the eye offset reads as object velocity: the player smears (captured); the second eye had no object motion at all (measured) | **done**: per-eye previous View matrices; objects keep the previous update's transform for the second eye | skinned animation (vertex buffers double-buffered by frame parity) still zero for the second eye |
+| object motion vectors (View+0x88/+0x108 previous camera; object +0xb8 previous world) | the eye offset reads as object velocity: the player smears (captured); the second eye had no object motion at all (measured) | **done**: per-eye previous View matrices; objects keep the previous update's transform for the second eye; skinned animation right in both eyes on the view path (measured, section 5) | frame path: skinned animation velocity still zero for the second eye |
 | DLSS (`0xd75620`, one NGX feature at device+0x38a8) | one history for both eyes: the disparity collapses (measured) | **done**: a second feature for the right eye, swapped into the device per eye (section 5); reset every frame as the fallback | — |
 | frame counters (`0xb188d8`, `0xd744f8`) | advance twice per update: jitter sequence and anything keyed on frame parity runs at 2x | jitter: renderFrame is lent a per-update counter (same jitter for both eyes); the rest unchanged | pin per update once beginFrame runs once per update |
-| auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | the separation-0 residual (0.81/255) was film grain (random offset per render), the motion-blur/TAA frame-time rings and lens flares | **done in the view path** (section 6): rewound for the second eye, residual 0.036/255 |
+| auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | the separation-0 residual (0.81/255) was film grain (random offset per render), the motion-blur/TAA frame-time rings and lens flares | **done in the view path** (section 6): rewound for the second eye (also the auto-exposure adaptation), rand() replayed, residual 0.001-0.008/255 |
+| SSAO / volumetric light / Taken shade temporal buffers (RendererX86+0x130/+0x170/+0x1b0) | one history for both eyes: shafts and AO blend across eyes (fog disparity flattened ~45 %, measured), the bird flock's shade differs between eyes | **done** (`temporal.cpp`): a second set for the right eye | — |
 | HUD | drawn per eye at zero disparity | fine | **view path**: drawn once, duplicated into both halves (section 6) |
 | frame pacing | ModeSwitch::render waits 4.17 ms per call | fine | — |
 
@@ -359,9 +363,8 @@ frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are w
 2. **Dual render per update**: done both ways; the default is `renderFrame` ×2 inside one
    `ModeSwitch::render` (section 6), the `ModeSwitch::render` ×2 structure is the fallback.
 3. **Temporal state per eye**: done for TAA (history pair, index, jitter), camera and object
-   motion vectors, DLSS (section 5). Remaining: skinned-animation velocity for the
-   second eye, and an audit of render-side simulations (particles, exposure, SSAO and volumetric
-   temporal buffers) to step once per update.
+   motion vectors, DLSS, skinned animation (view path), SSAO / volumetric / shade histories
+   (section 5), and the render-side state a render steps (section 6).
 4. **Pass-2 shortcut**: done for the shadow pass and the sky probe (section 6, ~10 %); render-side
    state the second eye would step again is rewound (flares, grain, frame-time rings).
 5. **HUD**: drawn once and duplicated into both halves at zero disparity (section 6); a chosen
@@ -442,14 +445,100 @@ eye follows), the hook keeps +0xb8..+0xe8 as it was across the call (the rest of
 still runs), so both eyes see the previous *update's* transform. Object transforms are world-space
 and eye-independent, so this is exact for rigid objects.
 
-**Not per eye (remaining).** Skinned vertices are computed into two buffers chosen by
-`counter & 1` (0x46d650 current, 0x46d680 previous, stamp check 0x46d6f0, static). With the counter
-advancing per render, the right eye computes the same pose into the other buffer and uses the left
-eye's as "previous": its skinned *animation* velocity is zero (rigid motion and camera are right).
-This resolves itself once beginFrame runs once per update (both eyes on the same counter: the
-second eye reuses the first's buffer, previous = last update's). The SSAO temporal buffer
-(0x5363c0) and the volumetric-light temporal buffer (0x4e3020) are also single-history and still
-blend across eyes (low-frequency effects; not measured separately).
+**Skinned animation (measured, view path).** Skinned vertices are computed into two buffers chosen
+by `counter & 1` (0x46d650 current, 0x46d680 previous or current when that is null, stamp check
+0x46d6f0 "stale = current missing or stamped before this counter", static); the object-velocity
+command 0x4c9c90 draws skinned velocity from (current, previous). On the frame path the counter
+advances per render, so the right eye skinned the same pose into the other buffer and used the left
+eye's as "previous": zero skinned *animation* velocity. On the view path beginFrame runs once per
+update, so both eyes share the counter value. Live (`stereo.skin_probe = 1`, counters per eye in
+`stereo rand`), awr-forest-night r10, the bird attack and the player walking (`w` held): first eye
+18947 of 33814 stamp checks stale (re-skinned), **second eye 0 of 33914**; velocity draws 5086 /
+5160 with previous == current in **0 / 0** of them (r7, attack only: 65 / 21 of ~2900, meshes
+appearing that frame with no previous buffer yet, same in both eyes). Pixel check, separation 0,
+motion blur and object velocity on, the player walking: halves **0.0013-0.0015/255 apart (max 2-6)**
+on the view path (3 frames); a right eye without skinned velocity would show the limbs sharp in one
+half and blurred in the other. So the second eye reuses the first eye's skinned buffers and both
+eyes get the same, correct animation velocity; nothing to fix on the view path. The frame path
+(`sbs_path = frame`) still re-skins per render (second eye stale 17746 of 32044 checks) and keeps
+the old limitation.
+
+### SSAO, volumetric light and the Taken shade: histories per eye (`temporal.cpp`)
+
+Three screen-space effects keep their own "last frame" outside the TAA pair (static, Ghidra):
+
+| effect (RendererX86 field) | history | per render | in sbs, one history for two eyes |
+|---|---|---|---|
+| `rend::SSAO` (+0x130; render 0x536630 from the main pass 0x5070ef) | +0x10 "Temporal buffer" (half or full res by SSAO quality 0x955674), +0x60 reset flag, +0x64 camera (float 4x3, position at +0x88) | AO, blur, then if "SSAO:Temporal Antialiasing": weight from the camera's linear/angular speed since +0x64 (0.7 still .. 0.3 moving, 0 on a jump/reset), resolve into a pool RT, copy into +0x10, store the camera | each eye blends the other eye's AO; the other eye's camera 65 mm away reads as 3.9 m/s, so the weight drops to 0.3 |
+| `rend::VolumetricLight` (+0x170; 0x4e37a0 from renderWorld 0x50a3f2, temporal part 0x4e7120 while "Volumetric Light:Temporal Blur" 0xdbb3b0) | +0x20 "VolumetricLight Temporal buffer" (half res, format 0xb or 0x16 by device+0x198), +0x29 reset, +0x60 camera (position +0x84) | same scheme, weight 0.65 .. 0.35 | same: light shafts blend across eyes at weight 0.35 |
+| `rend::ShadeEffect` (+0x1b0; 0x4b6950 and its velocity pass 0x4b6720 from 0x50a405, while "Render Shade Effect" 0x955662) | two arrays of half-res buffers indexed `counter % N` (N = 0x9554ac; +0x20/+0x28 buffer 1, +0x40/+0x48 buffer 2), clear-once flags +0x80/+0x88, fade +0x78 | buffer 1 accumulates the shade mask of the Taken (birds, enemies), buffer 2 gets it displaced with a trail ("Shade Effect:Trail Factor" 0.85); the fade steps +1/6 or -1/15 | both eyes share the counter, so the second eye drew into the slot the first had just drawn: one more trail step and the first eye's view of the shade in the second eye's image (**the bird flock**, item below) |
+
+SSAO is **off in the shipped game**: "Render SSAO" (u8 0xd755e0, read at 0x5070e6) is written 0 by
+the tail of every graphics preset (0x242a20; our `apply_graphics` does the same) and the game
+renders HBAO instead (RendererX86+0x138, 0x538160: pool RTs only, no history, no rand). Live: 0 in
+prologue-road, and no SSAO rand call site in any first-eye render in either fixture. The per-eye SSAO set below is
+there for completeness and stays inert unless the debug flag is forced on.
+
+What `temporal.cpp` does (`stereo.temporal_per_eye`, default 1, sbs and alternate): the engine's
+objects keep the left eye's (and mono's) history; around the right eye's renderFrame they are
+switched to a second set and back:
+- SSAO / volumetric: the buffer pointer, the reset flag and the remembered camera. The right eye's
+  buffer is created with the engine's own device call (device vtable +0xc0 = 0x4f5410, the
+  arguments 0x5363c0 / 0x4e3020 use: size from the engine's buffer, format 1 resp. 0xb/0x16 by the
+  same device query 0x4a7040, the same clear colour), re-created when the engine's buffer changes
+  size (the old one destroyed 8 presents later), and starts with reset = 1 (no history).
+- Shade: the three array pointers (our N buffer-1, N buffer-2 RTs created like 0x4b5f20 does, and N
+  clear flags) and the fade. When the set is new (or sbs restarts) both eyes' clear flags are set
+  in the same update before the left eye, so the two start from the same, empty state: buffer 1 is
+  only cleared on a slot's first use, so a fresh right-eye set against the left eye's
+  long-accumulated one can differ wherever the shade is thin. (Live: r9/r10, before this and the
+  exposure rewind of section 6, showed a 0.1-0.5/255 offset outside the dense shade in 3 of 8
+  bird-attack captures; r22, after both, in none of 5. The two causes were not separated.)
+- Cost: one 960x540 volumetric buffer and 2N 960x540 shade buffers (N = 1 live), a few pointer and
+  48-byte copies per eye. Measured (`quiver lab gpu --for awr-temporal -- stereo_rate.sh` with
+  variants all-on / all-off, r23; the lead's instance kept rendering on the GPU, so absolute rates
+  are low): 22.0 renders/s with, 22.1 and 20.9 without (a first all-on window of 14.7 was the
+  switch-over): no measurable difference.
+- If the engine re-creates a buffer while the right eye's is installed (not seen: the re-creates
+  are vtable calls from the device-reset path, outside renderFrame), the swap notices on the way
+  out and starts the right eye over (logged).
+
+Measured, live (`stereo status` → `temporal.volumetric.jump_mm`: the distance between the camera an
+effect remembered and the eye about to render, mean per eye), awr-forest-night r5, player standing:
+
+| | left eye | right eye |
+|---|---|---|
+| one history for both eyes (`temporal_per_eye = 0`), 32.5 mm | 64.83 mm | 64.84 mm |
+| per eye, 32.5 mm | 0.10 mm | 0.15 mm |
+| one history, separation 0 | 0.08 mm | 0.08 mm |
+
+With one history each eye's volumetric pass saw the other eye's camera 2 × 32.5 mm away every
+render (so it took the minimum weight and blended the other eye's shafts); per eye it sees only the
+real camera motion, as at separation 0.
+
+The disparity field (prologue-road r23, 32.5 mm per eye, parallel, TAA per eye; each value one
+3840x1080 frame, the two halves through `stereo_disparity.py`; captures interleaved, 2 rounds).
+Reference: the volumetric temporal blur switched off ("Volumetric Light:Temporal Blur" 0: no
+history, each eye's shafts its own by construction), like TAA-off in the table above:
+
+| | all patches, median | far field (y < 500, trees and lighthouse in fog), median | patches < 1 px | per patch vs reference, mean \|diff\| |
+|---|---|---|---|---|
+| reference: volumetric history off | +6.34, +7.12 px | +3.79, +3.59 px | 367, 430 | (reference vs reference: 1.92 px) |
+| **per eye** (`temporal_per_eye = 1`) | **+7.42, +5.94 px** | **+4.04, +3.40 px** | 320, 468 | **2.07-2.17 px** |
+| one history (`temporal_per_eye = 0`) | +3.84, +3.58 px | +2.06, +1.77 px | 540, 710 | 2.53-2.77 px |
+
+With one history the right eye's fog carries 35 % of the left eye's (and vice versa), a component
+that is the same in both halves: patches in the fog match at 0 and the far field's disparity is
+roughly halved, the TAA collapse above at a smaller scale. Per eye, the field is the reference's.
+The same two variants including the rand() replay (r23, `new` / `old`): medians +6.41 / +6.03
+against +3.88 / +3.73 px, far field +3.90 / +3.62 against +2.07 / +1.86 px. This is also why the view-path battery of
+section 6 (r16) measured +3.94 px at 32.5 mm: it predates the per-eye volumetric history (the
+battery after it is in section 6).
+
+Pixel check at separation 0 (both eyes the same camera, so any difference is state crossing
+eyes): prologue-road r23, interleaved, 3 frames each: all on 0.0007-0.0080/255; one volumetric
+history 0.077-0.089/255 (at separation 0 the second eye still blended the first eye's result of
+the same update: one more blend step); section 6 has the shade effect and the birds.
 
 ### DLSS
 
@@ -733,11 +822,13 @@ see the same render counter, so per-object "once per frame" updates (stamps comp
 eye reuses them, including the skinned vertex buffers double-buffered by counter parity
 (`0x46d650/0x46d680`; section 5): with both eyes on one counter value the second eye uses the
 first eye's buffer and the previous one is last update's, i.e. skinned animation velocity is
-right in both eyes. GPU rings keyed on `counter % n` (auto exposure `0x480340`/`0x480bf0`: a ring of
-1x1 exposure RTs and readback buffers; `0x4b5a60`/`0x4b6950`): the second eye reads the same
-previous slot and writes the same current slot as the first, in GPU order after it, so the result
-is the second eye's (equal to the first's within the luminance difference between the eyes); the
-CPU readback of a slot happens `n` frames later (static). No overwrite hazard: one queue, in order.
+right in both eyes (measured, section 5). GPU rings keyed on `counter % n` (`0x4b5a60`): the
+second eye reads the same previous slot and writes the same current slot as the first, in GPU
+order after it, so the result is the second eye's; the CPU readback of a slot happens `n` frames
+later (static). No overwrite hazard: one queue, in order. Two exceptions, both stepped per render
+on the CPU and handled in pass2/temporal.cpp: the auto exposure (`0x480bf0` swaps its pair of
+adapted-exposure textures every render, section 6 below) and the shade effect (`0x4b6950`
+accumulates into the slot: section 5).
 
 ### Second eye: state a render advances (`pass2.cpp`, measured)
 
@@ -758,21 +849,70 @@ mean |L−R| 3.88/255 (r6), 0.95 after the flare fix. Causes found, each verifie
   `0x955620` capacity, `0x955628` float*) and TAA (`0x49a8c0`: `0x955850..0x955860`): every render
   pushes the frame time, so the second eye averaged one more sample. Motion blur off: 0.10 → 0.035.
 
-The generator and both rings are snapshotted when the first eye starts and put back when the second
-starts (`stereo.rewind`); a ring is restored only if its array pointer is unchanged (it is
+- **The CRT `rand()`** (static): imported (IAT RVA `0x72de28`, ~140 call sites); per render it
+  draws the tonemap noise offset `g_vTonemapNoiseOffset` (`0x52ec80`, 2 draws, the dither/noise in
+  every frame), the volumetric lights' jitter (`0x4e51a0`, 2 per light) and, when SSAO is forced on,
+  its noise offset (`0x536630`). Live (`stereo rand`): prologue-road and forest-night first eyes
+  draw at `0x52f7dc`, `0x52f7f1`, `0x4e62a5`, `0x4e62d0` only. **Replayed** (`stereo.rand_replay`):
+  the IAT slot is pointed at a hook that, on the game thread during the first eye, records each
+  value per call site (return address) and, during the second eye, hands each call site the first
+  eye's values in order without touching the generator (a site the first eye used less often falls
+  through to the real `rand()`: live 2-10 such calls per few thousand, volumetric lights only the
+  second eye sees). So the generator advances once per update, by exactly the first eye's draws;
+  other threads (their own CRT state) are untouched (live: none draw during eye renders).
+- **Auto exposure** (`rend::` exposure object, RendererX86+0x198, static): on the GPU path (the
+  default, "Auto-exposure:Use System Memory" 0) `0x480bf0` adapts into texture A of the pair at
+  +0x28 data + (counter % +0xc0)·16, reading B (the last adapted value), then **swaps the two
+  pointers** (`0x4813f0`); the CPU path (`0x480340`) adapts the float +0xb4 (reset flag +0xb0) by
+  pow(rate, frame time). Either way the second eye adapted again from the first eye's result: a
+  second adaptation step per update, visible while the exposure moves (after the bird attack's
+  darkness: the right eye up to ~0.5/255 brighter over the whole frame, r9/r10, 3 of 8 captures).
+  The pair array and +0xb0..+0xb8 are rewound like the rings (signature-checked: `0x509382`,
+  `0x480751`, `0x4808ef`, `0x4813f0`); after it (with the shade resync of section 5, the two were
+  not separated) 0 of 5 bird-attack captures showed the offset (r22).
+
+The generator, both rings and the exposure state are snapshotted when the first eye starts and put
+back when the second starts (`stereo.rewind`); a ring is restored only if its array pointer is unchanged (it is
 allocated lazily on first use, which can happen during the first eye: live crash when the whole
 header was rewound right after motion blur was switched on). Result (r7, grain and motion blur on,
 TAA off): 0.052-0.111/255 (max 3) with, 0.56/255 without. Remaining residual: the volumetric light
 shafts (temporal buffer `0x4e3020`, single history across eyes, section 5). With master's per-eye
 TAA: **0.036-0.038/255** (max 6, r16 battery) and 0.001-0.012/255 in `awr-forest-night` (r18/r19).
-Not bit-identical, and not yet explained: a flock of birds attacking in `awr-forest-night` (r19,
-during the scripted attack, radial blur): 0.19-0.22/255 with no second-eye skips, the difference
-confined to the birds (and 2.5/255 once in r18 during the attack with the flashlight burst); some
-per-render state of that effect (swarm/particle step) is not rewound yet.
 
-Exposure (`0x480340`) needs no rewind in this path: it adapts from the previous slot to the
-current one in each eye with the same frame time, so both eyes compute the same exposure (the
-frame path instead adapted twice per update).
+With the rand() replay, the exposure rewind and the per-eye volumetric and shade histories
+(section 5), prologue-road r23, separation 0, interleaved, 3 frames per variant:
+
+| variant | \|L−R\| mean (/255) | max | pixels > 2 |
+|---|---|---|---|
+| all on (defaults) | **0.0007, 0.0008, 0.0080** | 6-10 | ≤ 0.03 % |
+| `rand_replay = 0` | 0.075-0.079 | 6-7 | ≤ 0.005 % |
+| `temporal_per_eye = 0` | 0.077-0.089 | 7-13 | 0.08-0.33 % |
+| `rewind = 0` (grain, rings, exposure) | 0.48-0.50 | 8-9 | 7.4-8.6 % |
+
+The battery's own separation-0 frames (r23): 0.0027 / 0.0048/255 (max 7), disparity ±0.02 px.
+
+**The bird flock** (`awr-forest-night`, the scripted attack: ~20 Taken birds per render). The
+earlier residual (0.19-0.22/255 confined to the birds, r19) was the Taken shade effect, not the
+swarm: the birds' positions and poses were identical in both halves; what differed was the smoky
+dark shade around and behind them, i.e. `rend::ShadeEffect`'s trailing buffer, which the second
+eye drew into on top of the first eye's (section 5). Live A/B, separation 0, interleaved during
+the attack (5 frames each, r22): shade per eye 0.0084, 0.0160, 0.0178, 0.0194/255 (max 10-14,
+≤ 0.05 % of pixels > 2) and once 0.116/255; one shade history 0.0126-1.51/255, median 0.14 (max
+up to 40, up to 22 % of pixels > 2; r9: up to 1.2/255 with max 203-255). The 0.116 frame's
+difference is confined to the lamp glows the birds were crossing: lens flares/glows take their
+visibility from an occlusion query per flare that both eyes issue, so with a bird passing in front
+of a lamp the two eyes can read different results (the flare state itself is rewound); not
+addressed. The birds' object motion (rigid and skinned) was already per eye (section 5).
+
+![shade effect per eye](img/stereo-shade-per-eye.jpg)
+
+*awr-forest-night r22, the bird attack, separation 0: the left eye, then |L−R| ×20 with one shade
+history (the trails of the shade differ between the halves) and per eye (another frame of the
+same attack; what is left is a lamp glow behind a bird). Captures ~15 updates apart.*
+
+The skinned characters (the player walking, the birds' wings) are identical in both halves: the
+second eye reuses the first eye's skinned buffers (section 5).
+
 
 ### Second eye: work reused instead of redone (`skip_shadows`, `skip_probe`, default on)
 
@@ -830,6 +970,23 @@ The scaling is now essentially exact because both eyes of a pair are one frame a
 are taken minutes apart only between pairs. The player measured 29.07 px at 32.5 mm (r16, median of
 the patches ≥ 20 px), as in section 2 (29.4 px).
 
+The same battery after the per-eye volumetric / SSAO / shade histories, the rand() replay and the
+exposure rewind (instance awr-temporal run r23, prologue-road, 3840x1080, view path, probe reuse
+on, TAA per eye; another fixture launch than r16, so the camera pose differs slightly):
+
+| | r23 | r16 (above) |
+|---|---|---|
+| sep 0: \|L−R\| mean, disparity | **0.0027 / 0.0048 /255** (max 7), ±0.02 px (p5..p95) | 0.036 / 0.038 (max 6), ±0.04 px |
+| 16.25 / 32.5 / 65 mm: median of all patches | +2.78 / +6.56 / +13.48 px | +1.79 / +3.94 / +7.63 px |
+| per-patch ratio 32.5/16.25, 65/16.25, 65/32.5 | 1.998, 3.981, 1.989 | 1.999, 3.984, 1.996 |
+| field at 32.5 mm, 20-60 / 10-20 / 5-10 / 1-5 px | 205 / 623 / 607 / 692 | 190 / 525 / 415 / 915 |
+| pan 0.5°/update, far field: sbs halves vs alternate | +2.09..+2.13 px vs +10.09 px | +3.29..+3.62 vs +10.2 / +11.1 px |
+| convergence 4 m: parallel − converged, recovered Zc | +19.00 px, **3.97 m** (expected 18.86 px) | 3.96 m (image shift, below) |
+
+The scaling and convergence are unchanged; the medians are higher because the fog no longer
+carries the other eye's shafts (patches move out of 1-5 px into 5-20 px; section 5 has the
+controlled comparison, interleaved in one run with the volumetric history off as the reference).
+
 ![view path, both eyes in one frame](img/stereo-view-sbs.jpg)
 
 *3840x1080 view-path frame (downscaled), r16, prologue-road, 32.5 mm, TAA per eye: both eyes from
@@ -860,7 +1017,15 @@ view-dependent.
   converged at 4 m measured +6.2 px (frame path +5.1, view +6.5) instead of a uniform +18.86 px,
   i.e. the TAA resolve largely removes it. Film grain identical in both eyes biases the
   disparity tool towards 0 in flat fog, so measure convergence with grain off.
-- The bird flock in forest-night differs between eyes (above).
+- ~~The bird flock in forest-night differs between eyes~~ (fixed: the Taken shade effect's
+  history, section 5). Left: lamp glows/flares partly hidden by the birds differ now and then
+  (occlusion queries, above).
+- The game exits (cleanly, nothing logged) ~17-21 s into `awr-forest-night` as control returns
+  after the opening cinematic, in sbs, instance awr-temporal: master 6662552 in 2 of 3 runs (r16,
+  r17), this branch's builds in 5 of 8 (r9-r12, r19-r22) and 1 of 2 with `temporal_per_eye = 0`,
+  while another instance shared the GPU (7.6-7.8 of 8 GB in use). The same moment as the shadow
+  reuse exit below and probably the r17 crash in the next item. Not caused by the per-eye work;
+  not investigated further here.
 - ~~Lab: 1920x1080 display, `output = full`, windowed: engine shrinks to 160x240~~ (fixed in
   window.cpp: the engine always stays at the game's resolution; docs/stereo-output.md).
 - One crash in forest-night ~10 s in-world (r17, view path, no skips), not reproduced in r18/r19.
@@ -926,6 +1091,6 @@ re/scripts/stereo_dlss_battery.sh awr                # per-eye DLSS vs reset vs 
 python3 re/scripts/stereo_taa_analyse.py <run folder> --variants ref,dq,dqr,dp,dpr [--eye-width 960]
 ```
 
-Lab verbs: `stereo status | census N [cl] | shots N TAG [SKIP] | files | probe N | peek r|img|ADDR [+OFF|*]...`, `tweak list [SUBSTR] | tweak NAME
+Lab verbs: `stereo status | census N [cl] | shots N TAG [SKIP] | files | probe N | rand | peek r|img|ADDR [+OFF|*]...` (`rand`: the first eye's rand() call sites, second-eye misses, and the skinned-buffer counters while `stereo.skin_probe = 1`), `tweak list [SUBSTR] | tweak NAME
 [VALUE]`, `cfg stereo.<key> <value>`. Ghidra: `re/scripts/Serve.java` (headless query server) and
 `re/scripts/ghq` (client).

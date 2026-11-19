@@ -37,6 +37,7 @@
 #include "features/stereo/eyestate.h"
 #include "features/stereo/gpu.h"
 #include "features/stereo/pass2.h"
+#include "features/stereo/temporal.h"
 #include "features/stereo/window.h"
 
 namespace tb::stereo {
@@ -302,12 +303,16 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
     // The left eye is rendered first in every sbs update; in alternate mode every frame is its
     // own update.
     eyestate_enter(r, view, eye, p.mode == Mode::Alternate || eye < 0, o);
+    temporal_enter(r, view, eye);  // SSAO / volumetric-light history (temporal.cpp)
   }
   t_in_frame = true;
   o_renderFrame(r, view, a3, a4);
   g_render_frames++;  // one scene render (one eye)
   t_in_frame = false;
-  if (per_eye) eyestate_leave(r, view, eye);
+  if (per_eye) {
+    temporal_leave(r, eye);
+    eyestate_leave(r, view, eye);
+  }
   if (off != 0) g_frames_biased++;
 }
 
@@ -582,6 +587,7 @@ void __fastcall hk_modeSwitchRender(void* self) {
   objvel_force_off(sbs && (!p.objvel_in_sbs || !eyestate_available()));
   if (sbs != g_was_sbs) {
     eyestate_reset();
+    temporal_reset();
     g_was_sbs = sbs;
   }
   eyestate_update(sbs && p.per_eye != 0);  // DLSS: one history, two eyes -> reset while sbs runs
@@ -738,19 +744,19 @@ bool check_sigs() {
 
 std::string status_json() {
   Params p = params();
-  char b[2048];
+  char b[4096];
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"sbs_path\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,"
            "\"main_view\":\"%p\",\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,"
            "\"present\":%llu,\"taa_forced_off\":%s,\"taa_game\":%u,\"objvel_forced_off\":%s,\"eyestate\":%s,"
-           "\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\",\"kicks\":%llu,\"timed_updates\":%llu,\"us_update\":%llu,"
+           "\"temporal\":%s,\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\",\"kicks\":%llu,\"timed_updates\":%llu,\"us_update\":%llu,"
            "\"us_eye1\":%llu,\"us_eye2\":%llu,\"us_endframe\":%llu}",
            mode_name(p.mode), p.path == SbsPath::View ? "view" : "frame", p.separation_mm, p.convergence_m,
            p.swap ? "true" : "false", g_main_view, g_applied, (unsigned long long)g_frames_biased.load(),
            (unsigned long long)g_render_frames.load(), (unsigned long long)g_sbs_updates.load(),
            (unsigned long long)present_frame(), g_taa_forced ? "true" : "false",
            *reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable)), g_objvel_forced ? "true" : "false",
-           eyestate_status_json().c_str(), gpu_status().c_str(), cmdlist_status().c_str(), pass2_status().c_str(),
+           eyestate_status_json().c_str(), temporal_status().c_str(), gpu_status().c_str(), cmdlist_status().c_str(), pass2_status().c_str(),
            (unsigned long long)g_kicks.load(), (unsigned long long)g_n_timed.load(),
            (unsigned long long)g_us_update.load(), (unsigned long long)g_us_eye[0].load(),
            (unsigned long long)g_us_eye[1].load(), (unsigned long long)g_us_end.load());
@@ -804,6 +810,7 @@ void register_feature() {
   // buffer in command lists when sbs_path = view is used).
   resize_on([](IDXGISwapChain* sc, unsigned, unsigned) { cmdlist_on_swapchain(sc); });
   pass2_register();
+  temporal_register();
   // quiver lab call awr tweak list [SUBSTR] | tweak NAME [VALUE]: the engine's tweakable registry.
   lab_verb("tweak", [](const std::vector<std::string>& a, bool& ok) -> std::string {
     if (a.empty()) {
@@ -907,6 +914,7 @@ void register_feature() {
                game_image().contains(v) ? (unsigned long long)(v - game_image().base) : 0ull);
       return json_str(b);
     }
+    if (sub == "rand") return json_str(pass2_rand_sites());
     if (sub == "files") {
       std::lock_guard lk(g_cmu);
       std::string r = "[";
@@ -938,6 +946,7 @@ void start() {
   }
   eyestate_start();  // optional: without it sbs falls back to TAA / object velocity off
   pass2_start();
+  temporal_start();  // optional: without it SSAO / volumetric history stays shared
   present_on(on_present);
   present_filter(present_gate);
   window_start();
