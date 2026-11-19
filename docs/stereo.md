@@ -342,10 +342,9 @@ frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are w
 1. **Output**: a 3840x1080 swapchain created by the mod (done: `present_set_width_scale(2)`), the
    engine left at 1920x1080 internal resolution, each eye copied 1:1 into its half. The per-eye
    frustum is then exactly the engine's own 16:9 projection: no FOV or aspect change, unlike
-   Ishimura's anamorphic route. Remaining: the **window** must be 3840x1080 on the glasses (the game
-   sizes its window from its own resolution setting; hook `CreateWindowExW`/`SetWindowPos` or the
-   engine's window-size path so the window is 2x wide while the engine keeps 1920x1080) and the
-   mouse/cursor mapping for menus over a 2x-wide window.
+   Ishimura's anamorphic route. The window is made 3840x1080 (2x the engine's size) with the
+   engine kept at one eye, menus usable with the mouse over either half: done, see
+   [stereo-output.md](stereo-output.md).
 2. **Dual render per update**: keep the `ModeSwitch::render` ×2 structure. It reuses every engine
    system unchanged and costs one extra render per update (CPU submit + GPU), which is the
    unavoidable price of true stereo.

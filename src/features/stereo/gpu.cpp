@@ -227,7 +227,7 @@ namespace {
 ID3D12Resource* g_eye[2] = {};
 uint32_t g_eye_w = 0, g_eye_h = 0;
 DXGI_FORMAT g_eye_fmt = DXGI_FORMAT_UNKNOWN;
-unsigned g_stored = 0, g_composed = 0, g_compose_fail = 0;
+unsigned g_stored = 0, g_composed = 0, g_compose_fail = 0, g_duplicated = 0;
 
 bool ensure_eyes(const D3D12_RESOURCE_DESC& bb, uint32_t w) {
   if (g_eye[0] && g_eye_w == w && g_eye_h == bb.Height && g_eye_fmt == bb.Format) return true;
@@ -338,10 +338,37 @@ bool gpu_compose(IDXGISwapChain* sc) {
   return true;
 }
 
+bool gpu_duplicate(IDXGISwapChain* sc) {
+  std::lock_guard lk(g_mu);
+  if (!ensure(sc)) return false;
+  ID3D12Resource* bb = back_buffer(sc);
+  if (!bb) return false;
+  D3D12_RESOURCE_DESC d = bb->GetDesc();
+  unsigned k = present_width_scale(sc);
+  uint32_t w = uint32_t(d.Width) / k, h = d.Height;
+  if (k < 2 || !ensure_eyes(d, w)) {
+    bb->Release();
+    return false;
+  }
+  // Through an eye texture: a resource can't be copy source and destination at once.
+  begin();
+  barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(g_eye[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(g_eye[1], 0, bb, 0, w, h);
+  barrier(g_eye[1], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  for (unsigned i = 1; i < k; i++) copy_rect(bb, w * i, g_eye[1], 0, w, h);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+  submit();
+  bb->Release();
+  g_duplicated++;
+  return true;
+}
+
 std::string gpu_status() {
-  char b[192];
-  snprintf(b, sizeof b, "captures=%u failures=%u stored=%u composed=%u compose_fail=%u eye=%ux%u", g_captures,
-           g_failures, g_stored, g_composed, g_compose_fail, g_eye_w, g_eye_h);
+  char b[224];
+  snprintf(b, sizeof b, "captures=%u failures=%u stored=%u composed=%u compose_fail=%u duplicated=%u eye=%ux%u",
+           g_captures, g_failures, g_stored, g_composed, g_compose_fail, g_duplicated, g_eye_w, g_eye_h);
   return b;
 }
 

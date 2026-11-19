@@ -22,6 +22,10 @@ bool gpu_store_eye(IDXGISwapChain* sc, int eye);
 // Queued on the game's queue; does not block.
 bool gpu_compose(IDXGISwapChain* sc);
 
+// Full-SBS swapchain without a stereo pair: copy the engine's image (left half) into the right
+// half too. Queued on the game's queue; does not block.
+bool gpu_duplicate(IDXGISwapChain* sc);
+
 // Counters for the status verb.
 std::string gpu_status();
 

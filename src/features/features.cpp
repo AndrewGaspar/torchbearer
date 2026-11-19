@@ -1,5 +1,7 @@
 #include "features/features.h"
 
+#include "core/hook.h"
+
 #include "core/config.h"
 #include "core/lab.h"
 #include "features/levels.h"
@@ -24,9 +26,11 @@ void features_register() {
 }
 
 void features_start() {
+  hook_batch_begin();
   settings_start();
   levels_start();
   stereo::start();
+  hook_batch_end();
 }
 
 }  // namespace tb

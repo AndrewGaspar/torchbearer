@@ -32,6 +32,7 @@
 #include "core/present.h"
 #include "features/stereo/engine.h"
 #include "features/stereo/gpu.h"
+#include "features/stereo/window.h"
 
 namespace tb::stereo {
 namespace {
@@ -444,6 +445,10 @@ bool present_gate(IDXGISwapChain* sc, uint64_t frame) {
     return true;
   }
   int eye = g_eye_now.load();
+  // Full-SBS output without a stereo pair this frame (mode off/left/right/alternate, menus,
+  // videos): show the engine's single image to both eyes (2D in the glasses) rather than one
+  // eye and an undefined half.
+  if (present_width_scale(sc) > 1) gpu_duplicate(sc);
   capture_if_armed(sc, frame, eye < 0 ? "L" : eye > 0 ? "R" : "M");
   return true;
 }
@@ -544,6 +549,7 @@ void register_feature() {
   lab_verb("stereo", [](const std::vector<std::string>& a, bool& ok) -> std::string {
     std::string sub = a.empty() ? "status" : a[0];
     if (sub == "status") return status_json();
+    if (sub == "window") return window_status();
     if (!g_hooked) {
       ok = false;
       return json_str("stereo hooks not installed (see torchbearer.log)");
@@ -594,6 +600,7 @@ void start() {
   }
   present_on(on_present);
   present_filter(present_gate);
+  window_start();
   g_hooked = true;
   TB_LOG("stereo: hooks installed");
 }

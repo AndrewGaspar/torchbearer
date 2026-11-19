@@ -70,6 +70,15 @@ title = "Startup"
 options = ["intro.skip_startup_video", "intro.skip_logo_screens", "intro.skip_epilepsy_warning"]
 
 [[page]]
+id = "stereo"
+title = "Stereoscopic 3D"
+options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap_eyes"]
+
+[[page.group]]
+title = "Temporal effects in 3D"
+options = ["stereo.taa", "stereo.object_velocity"]
+
+[[page]]
 id = "diagnostics"
 title = "Diagnostics"
 options = ["log.verbose"]
@@ -625,6 +634,79 @@ type = "bool"
 label = "Verbose log"
 help = "Writes more detail to torchbearer.log."
 level = "debug"
+apply = "live"
+
+# ---------------------------------------------------------------- stereo (docs/stereo.md)
+
+[option."stereo.mode"]
+type = "enum"
+label = "3D mode"
+help = "Side-by-side renders the scene twice per game update, once per eye, at about half the frame rate. For XReal glasses in 3D mode, also set Output to Full and Window mode to Borderless."
+values = [
+  { value = "off", label = "Off" },
+  { value = "sbs", label = "Side-by-side (both eyes per frame)" },
+  { value = "alternate", label = "Alternate eyes per frame (frame-sequential)", level = "debug" },
+  { value = "left", label = "Left eye only", level = "debug" },
+  { value = "right", label = "Right eye only", level = "debug" },
+]
+default = "off"
+apply = "live"
+
+[option."stereo.output"]
+type = "enum"
+label = "Output"
+help = "Full makes the window twice as wide as the game's resolution, each eye unscaled (borderless on a 3840x1080 desktop gives 1920x1080 per eye). Half keeps the window size (a prototype that shows the centre of each eye)."
+values = [
+  { value = "full", label = "Full side-by-side (2x wide)" },
+  { value = "half", label = "Half side-by-side (prototype)", level = "advanced" },
+]
+default = "half"
+apply = "restart"
+
+[option."stereo.separation"]
+type = "float"
+label = "Eye separation"
+help = "Offset of each eye from the game camera, in millimetres (32.5 = a 65 mm interocular distance at the game's scale). Larger is deeper."
+min = 0
+max = 100
+step = 0.5
+unit = "mm"
+default = 32.5
+apply = "live"
+
+[option."stereo.convergence"]
+type = "float"
+label = "Screen distance"
+help = "Distance of the zero-parallax plane in metres: nearer things pop out of the screen, farther ones sit behind it. 0 = parallel eyes (everything behind the screen). 3 to 5 m suits the third-person camera."
+min = 0
+max = 50
+step = 0.5
+unit = "m"
+special = [{ value = 0, label = "Parallel" }]
+default = 0
+apply = "live"
+
+[option."stereo.swap_eyes"]
+type = "bool"
+label = "Swap eyes"
+help = "Cross-eyed viewing, or a display that expects the right eye on the left."
+default = false
+apply = "live"
+
+[option."stereo.taa"]
+type = "bool"
+label = "Keep TAA in 3D"
+help = "The game's TAA has one history for both eyes, so it is switched off while side-by-side runs unless this is on (then the eyes blend into each other)."
+default = false
+level = "advanced"
+apply = "live"
+
+[option."stereo.object_velocity"]
+type = "bool"
+label = "Keep object motion vectors in 3D"
+help = "Off while side-by-side runs: with it on, the eye offset reads as motion and moving objects smear."
+default = false
+level = "advanced"
 apply = "live"
 
 [option."intro.skip_startup_video"]
