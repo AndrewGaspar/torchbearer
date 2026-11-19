@@ -26,11 +26,12 @@ ap = argparse.ArgumentParser()
 ap.add_argument("run")
 ap.add_argument("--player", default="1000,470,1450,1080", help="player box in eye coordinates")
 ap.add_argument("--proj00", type=float, default=1.2088)
+ap.add_argument("--eye-width", type=int, default=1920, help="960 for output = hsbs at 1920x1080")
 ap.add_argument("--variants", default="off,shared,pereye,mbshared,mbpereye",
                 help="tags in order; the first is the reference disparity field")
 args = ap.parse_args()
 run = args.run
-W = 1920
+W = args.eye_width
 PB = [int(v) for v in args.player.split(",")]
 tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stereo_disparity.py")
 VARIANTS = args.variants.split(",")

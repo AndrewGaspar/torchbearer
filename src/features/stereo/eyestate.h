@@ -36,8 +36,8 @@ void eyestate_leave(void* renderer, void* view, int eye);
 // from whatever the engine has.
 void eyestate_reset();
 
-// Once per game update: `dual` = this update renders more than one eye (sbs). With DLSS on, its
-// single history would blend the eyes; while dual, DLSS is told to reset every frame (see .cpp).
+// Once per game update: `dual` = this update renders more than one eye (sbs). With DLSS on, the
+// right eye then gets its own DLSS feature (dlss.cpp; fallback: DLSS reset every frame).
 void eyestate_update(bool dual);
 
 // Debug: log the view's previous/current camera matrices around the next N eye renders.
