@@ -27,6 +27,12 @@ constexpr uintptr_t kRvaModeSwitchRender = 0x262cb0;
 // Game-level renderer (global at kRvaGameRenderer) beginFrame / endFrame.
 constexpr uintptr_t kRvaBeginFrame = 0x2aca30;
 constexpr uintptr_t kRvaEndFrame = 0x2acb10;
+// The engine's D3D12 device (rend::DeviceD3D12PC, global pointer kRvaDevice below) and its "kick" (vtable +0x378,
+// RVA 0x4f6280): translates the pending render commands into the D3D12 lists, closes them and
+// submits them (0x4f62b0 -> 0x5034c0 -> ExecuteCommandLists), then opens a fresh list. renderWorld
+// calls it once per render, from the main pass 0x506b20 around the shadow pass. (static, live)
+constexpr size_t kDeviceKickSlot = 0x378 / 8;
+constexpr uintptr_t kRvaDeviceKick = 0x4f6280;
 
 struct Sig {
   uintptr_t rva;
@@ -49,6 +55,8 @@ inline constexpr Sig kSigs[] = {
      {0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0xff, 0x05, 0x9c, 0xbe, 0x86, 0x00, 0x48, 0x8b, 0xd9, 0xc6}},
     {kRvaEndFrame, "Renderer::endFrame",
      {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81}},
+    {kRvaDeviceKick, "DeviceD3D12PC kick",
+     {0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xe8, 0xe2, 0xd2, 0xfc, 0xff, 0x48, 0x8b}},
 };
 
 // --- rend::View (0xcb0 bytes; PerspectiveView 0xcc8) -------------------------------------------

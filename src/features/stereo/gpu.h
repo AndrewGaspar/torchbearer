@@ -26,6 +26,18 @@ bool gpu_compose(IDXGISwapChain* sc);
 // half too. Queued on the game's queue; does not block.
 bool gpu_duplicate(IDXGISwapChain* sc);
 
+// sbs_path = view (both eyes inside one engine frame): copy the back buffer's first eye-width
+// columns into eye slot `eye` in the middle of the engine's frame (right after the first eye's
+// renderFrame); after the second eye, put both eyes in their halves (full SBS only).
+// The back buffer is transitioned from and back to its current state (cmdlist_bb_state). Queued.
+bool gpu_stash_mid(IDXGISwapChain* sc, int eye);
+// After the second eye: the engine's image (the second eye) to its half, the stashed eye to its own.
+bool gpu_place_mid(IDXGISwapChain* sc, int stashed_eye);
+// At Present in the view path: nothing to do for full SBS (composed in the frame); for half output
+// the centre crops of the stashed eye and the presented frame (the other eye).
+bool gpu_compose_view(IDXGISwapChain* sc, int stashed_eye);
+uint32_t gpu_eye_width();  // width of one stored eye (0 before the first store)
+
 // Counters for the status verb.
 std::string gpu_status();
 

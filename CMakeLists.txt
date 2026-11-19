@@ -29,6 +29,8 @@ add_library(torchbearer SHARED
   src/features/features.cpp
   src/features/stereo/stereo.cpp
   src/features/stereo/gpu.cpp
+  src/features/stereo/cmdlist.cpp
+  src/features/stereo/pass2.cpp
   src/features/stereo/window.cpp
   src/features/stereo/eyestate.cpp
   src/features/intro.cpp

@@ -10,6 +10,7 @@
 
 #include "core/log.h"
 #include "core/present.h"
+#include "features/stereo/cmdlist.h"
 
 namespace tb::stereo {
 namespace {
@@ -32,6 +33,10 @@ struct Ctx {
 
 std::mutex g_mu;
 Ctx g;
+// While set, barrier()/copy_rect() record into this list (one of the engine's open command lists)
+// instead of ours.
+ID3D12GraphicsCommandList* g_rec = nullptr;
+ID3D12GraphicsCommandList* cur() { return g_rec ? g_rec : g.list; }
 unsigned g_captures = 0, g_failures = 0;
 
 bool ensure(IDXGISwapChain* sc) {
@@ -100,7 +105,7 @@ void barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATE
   b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   b.Transition.StateBefore = from;
   b.Transition.StateAfter = to;
-  g.list->ResourceBarrier(1, &b);
+  cur()->ResourceBarrier(1, &b);
 }
 
 ID3D12Resource* back_buffer(IDXGISwapChain* sc) {
@@ -271,7 +276,7 @@ D3D12_TEXTURE_COPY_LOCATION loc(ID3D12Resource* r) {
 void copy_rect(ID3D12Resource* dst, uint32_t dx, ID3D12Resource* src, uint32_t x0, uint32_t w, uint32_t h) {
   D3D12_TEXTURE_COPY_LOCATION d = loc(dst), s = loc(src);
   D3D12_BOX box{x0, 0, 0, x0 + w, h, 1};
-  g.list->CopyTextureRegion(&d, dx, 0, 0, &s, &box);
+  cur()->CopyTextureRegion(&d, dx, 0, 0, &s, &box);
 }
 }  // namespace
 
@@ -365,10 +370,127 @@ bool gpu_duplicate(IDXGISwapChain* sc) {
   return true;
 }
 
+// --- both eyes inside one engine frame (sbs_path = view) --------------------------------------
+// The copies happen in the middle of the engine's frame. The engine records a frame into a pool
+// of command lists and submits whatever is closed at a few points (once inside renderFrame,
+// twice in endFrame; live census), so the list that wrote the eye's final image (the one that
+// bound the back buffer) may still be open when renderFrame returns, and a list of ours submitted
+// then would run before it. So when that list is open the copy is recorded into it, right after
+// the engine's own commands (GPU order = recording order); otherwise into our list, submitted now.
+// The back buffer is in whatever state the engine's lists left it in (tracked from their
+// ResourceBarrier calls by cmdlist.cpp); each copy transitions from and back to that state.
+namespace {
+unsigned g_mid_engine = 0, g_mid_own = 0;
+void mid_begin() {
+  g_rec = cmdlist_bb_list();
+  if (g_rec) {
+    g_mid_engine++;
+  } else {
+    g_mid_own++;
+    begin();
+  }
+}
+void mid_end() {
+  if (!g_rec) submit();
+  g_rec = nullptr;
+}
+}  // namespace
+bool gpu_stash_mid(IDXGISwapChain* sc, int eye) {
+  std::lock_guard lk(g_mu);
+  if (!ensure(sc)) return false;
+  ID3D12Resource* bb = back_buffer(sc);
+  if (!bb) return false;
+  D3D12_RESOURCE_DESC d = bb->GetDesc();
+  unsigned k = present_width_scale(sc);
+  uint32_t w = uint32_t(d.Width) / k;
+  if (!ensure_eyes(d, w)) {
+    bb->Release();
+    return false;
+  }
+  auto st = D3D12_RESOURCE_STATES(cmdlist_bb_state(bb));
+  mid_begin();
+  if (st != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier(bb, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(g_eye[eye], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(g_eye[eye], 0, bb, 0, w, d.Height);
+  barrier(g_eye[eye], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  if (st != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
+  mid_end();
+  bb->Release();
+  g_stored++;
+  return true;
+}
+
+// The second eye (the engine's image, in the first eye-width columns) goes to the second half
+// and the stashed first eye back to the first half, before any overlay is drawn.
+bool gpu_place_mid(IDXGISwapChain* sc, int stashed_eye) {
+  std::lock_guard lk(g_mu);
+  if (!ensure(sc) || !g_eye[0] || !g_eye[1]) return false;
+  ID3D12Resource* bb = back_buffer(sc);
+  if (!bb) return false;
+  D3D12_RESOURCE_DESC d = bb->GetDesc();
+  unsigned k = present_width_scale(sc);
+  uint32_t w = uint32_t(d.Width) / k, h = d.Height;
+  if (k < 2 || w != g_eye_w || h != g_eye_h) {
+    bb->Release();
+    g_compose_fail++;
+    return false;
+  }
+  int other = 1 - stashed_eye;
+  auto st = D3D12_RESOURCE_STATES(cmdlist_bb_state(bb));
+  mid_begin();
+  if (st != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier(bb, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(g_eye[other], 0, bb, 0, w, h);
+  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(bb, 0, g_eye[0], 0, w, h);  // left eye -> first half
+  copy_rect(bb, w, g_eye[1], 0, w, h);  // right eye -> second half
+  if (st != D3D12_RESOURCE_STATE_COPY_DEST) barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, st);
+  mid_end();
+  bb->Release();
+  g_composed++;
+  return true;
+}
+
+bool gpu_compose_view(IDXGISwapChain* sc, int stashed_eye) {
+  std::lock_guard lk(g_mu);
+  if (present_width_scale(sc) >= 2) return true;  // composed in the frame (gpu_place_mid)
+  // Half output: the frame holds the other eye; centre crops of both, as gpu_compose.
+  if (!ensure(sc) || !g_eye[0]) return false;
+  ID3D12Resource* bb = back_buffer(sc);
+  if (!bb) return false;
+  D3D12_RESOURCE_DESC d = bb->GetDesc();
+  uint32_t w = uint32_t(d.Width), h = d.Height;
+  if (w != g_eye_w || h != g_eye_h) {
+    bb->Release();
+    g_compose_fail++;
+    return false;
+  }
+  int other = 1 - stashed_eye;
+  begin();
+  barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(g_eye[other], 0, bb, 0, w, h);
+  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(bb, 0, g_eye[0], w / 4, w / 2, h);
+  copy_rect(bb, w / 2, g_eye[1], w / 4, w / 2, h);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+  submit();
+  bb->Release();
+  g_composed++;
+  return true;
+}
+
+uint32_t gpu_eye_width() { return g_eye_w; }
+
 std::string gpu_status() {
-  char b[224];
-  snprintf(b, sizeof b, "captures=%u failures=%u stored=%u composed=%u compose_fail=%u duplicated=%u eye=%ux%u",
-           g_captures, g_failures, g_stored, g_composed, g_compose_fail, g_duplicated, g_eye_w, g_eye_h);
+  char b[256];
+  snprintf(b, sizeof b,
+           "captures=%u failures=%u stored=%u composed=%u compose_fail=%u duplicated=%u eye=%ux%u mid_in_engine_list=%u "
+           "mid_own=%u",
+           g_captures, g_failures, g_stored, g_composed, g_compose_fail, g_duplicated, g_eye_w, g_eye_h, g_mid_engine,
+           g_mid_own);
   return b;
 }
 
