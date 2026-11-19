@@ -28,6 +28,8 @@ add_library(torchbearer SHARED
   src/core/module.cpp
   src/features/features.cpp
   src/features/intro.cpp
+  src/features/settings.cpp
+  src/features/settings_keys.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 target_include_directories(torchbearer PRIVATE src third_party)
