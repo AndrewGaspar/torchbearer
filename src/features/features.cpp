@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "core/lab.h"
+#include "features/levels.h"
 #include "features/settings.h"
 
 namespace tb {
@@ -17,8 +18,12 @@ void features_register() {
     return json_str(cfg_str(a[0]));
   });
   settings_register();
+  levels_register();
 }
 
-void features_start() { settings_start(); }
+void features_start() {
+  settings_start();
+  levels_start();
+}
 
 }  // namespace tb
