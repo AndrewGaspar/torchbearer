@@ -61,7 +61,9 @@ ModeSwitch::render enter
     setViewToWorld x6 cube faces (static PerspectiveView @0x140dc44f0, ret 0x5124b7)
     setViewToWorld CustomView @0x140e0b480 (ret 0x52e57a) = main camera pose
     setPostProjection x4 (0x5093e2 zero, 0x498602 identity, 0x498a1a / 0x509417 jitter)
-  ExecuteCommandLists n=14                        <- the frame's scene work, after renderFrame
+    ExecuteCommandLists n=14..15                  <- the scene's command lists, submitted at the
+                                                     end of renderFrame (inside it: the sbs census
+                                                     marks it IN-RENDERFRAME)
   Renderer::endFrame
     ExecuteCommandLists n=8, n=1
     Present
@@ -69,11 +71,12 @@ ModeSwitch::render enter
 ```
 
 So there is **no separate render thread consuming a frame packet**: the game thread records D3D12
-command lists during `renderFrame` (about 0.5 ms of CPU in the prologue scene) and submits them
-before `endFrame` returns. (`rend::CommandBufferExecuteThread` exists in RTTI; with the options
-seen here all `ExecuteCommandLists` calls come from the game thread, through `0x503184`.) Debug
+command lists during `renderFrame` (about 5 ms wall time per call in the prologue scene,
+recording plus submission) and submits the scene's lists at the end of `renderFrame`, the
+HUD/overlay lists and the frame's end in `endFrame`. (`rend::CommandBufferExecuteThread` exists
+in RTTI; with the options seen here all `ExecuteCommandLists` calls come from the game thread, through `0x503184`.) Debug
 render options registered in `0x2b0580`: "Multi Thread Rendering" (u8 `0x955632`), "Split Command
-Buffers" (`0x955635`), "Late Shadow Pass" (`0x d755d6`), "Combined Post Pass" (`0x95566a`), "VSync
+Buffers" (`0x955635`), "Late Shadow Pass" (`0xd755d6`), "Combined Post Pass" (`0x95566a`), "VSync
 Enabled" (`0x95566c`), "DLSS Mode".
 
 This structure is what makes same-update stereo cheap: **simulation and rendering are separate
@@ -175,7 +178,7 @@ and is identical in both eyes (zero disparity, i.e. at screen depth).
 Scene: fixture **`prologue-road`** (Continue Game → the prologue road, the player standing, camera
 behind him, lighthouse and trees in fog). 1920x1080, `m00 = 1.2088`,
 `K = 2e*m00*(W/2) = 75.43 px*m` at 32.5 mm per eye. Tool: `re/scripts/stereo_disparity.py`
-(48→32 px patches, SSD over integer shifts + parabolic sub-pixel, confidence-gated).
+(32 px patches on a 24 px grid, SSD over integer shifts + parabolic sub-pixel, confidence-gated).
 
 Mono-frame bias (separate left / right captures, run r10, TAA settled 60 frames after each change):
 
@@ -188,10 +191,87 @@ Mono-frame bias (separate left / right captures, run r10, TAA settled 60 frames 
 
 Near over far is 29.4 / 2.08 ≈ 14: not a pan. Disparity scales with separation (per-patch ratios,
 patches > 3 px): 16.25 → 32.5 mm ×1.963 (requested 2), 16.25 → 65 mm ×3.890 (requested 4), 32.5 → 65
-×1.961. These separate-capture pairs carry animation between captures (idle motion, fog), which is
-why the medians sit 2-3 % low; the same-update battery below removes that.
+×1.961. Each eye here is a separate capture ~100 frames after the other, so idle animation and fog
+motion between the captures add scatter and pull the medians 2-3 % low. The same-update battery
+below removes that between the two eyes of a pair (not between pairs taken at different settings).
 
-SBS_BATTERY_PLACEHOLDER
+### Same-update battery (sbs, full SBS 3840x1080)
+
+Every pair below is **the two halves of one presented 3840x1080 frame**, so both eyes come from
+the same game update; no animation or camera drift between the eyes. Run r16, fixture
+`prologue-road`, `re/scripts/stereo_battery.sh` + `re/scripts/stereo_analyse.py` (captures in the
+lab run folder runs/r16). TAA and object velocity off (forced by sbs), per-eye camera motion vectors.
+
+Control, **separation 0 in sbs** (two renders of the same update with the same camera):
+disparity median **+0.009 px** (p5..p95 -0.23..+1.29, 2583 patches); pixel |L-R| mean 0.81/255,
+max 14. The halves are not bit-identical: something rendered per pass differs slightly (film
+grain/noise or a render-side simulation stepping per pass; the same measure on two consecutive
+mono frames is 1.51/255). Bounding that is on the follow-up list.
+
+Separation (per eye) | median of all patches | p95
+---|---|---
+16.25 mm | +2.62 px | +18.5 px
+32.5 mm | +4.64 px | +34.3 px
+65 mm | +8.96 px | +61.6 px
+
+Field at 32.5 mm: 423 patches at 20-60 px (1.3-3.8 m: the player, the pole), 364 at 10-20 px
+(3.8-7.5 m: the road), 435 at 5-10 px, 769 at 1-5 px (15-75 m: trees in the fog). Per-patch
+scaling between captures (separate frames ~100 updates apart, so near moving things add scatter;
+by disparity bin 2-5 / 5-10 / 10-20 / 20-60 px): 16.25 → 32.5 mm ×2.00 / 1.89 / 1.95 / 1.84
+(requested 2), 16.25 → 65 mm ×3.85 / 3.37 / 3.58 / 3.05 (requested 4). The far bins, where nothing
+moves, reproduce the request; the near bins are pulled down by the player's idle motion between
+the separate captures. (The cleaner scaling check is the mono-frame table above, ×1.96 / ×3.89.)
+
+**Convergence** 4 m vs parallel, both at 32.5 mm, joined per patch: parallel − converged =
+**+19.34 px** median (expected a uniform K/Zc = 18.86 px), recovered **Zc = 3.90 m** for 4.00
+configured (-2.5 %). With convergence, patches nearer than 4 m stay positive (median +4.34 px,
+n=451) and farther ones cross to negative (median -10.17 px, n=1528); with parallel eyes 100 %
+of patches are positive. A pan cannot change sign with depth.
+
+**Same update vs frame-sequential, the measurement this design exists for.** A synthetic camera
+yaw of 0.5 deg per game update (`stereo.test_pan`, applied to the main view once per
+`ModeSwitch::render`) stands in for a player turning at 30-70 deg/s:
+
+pair | far field (y < 500, trees in fog), median | p5..p95
+---|---|---
+sbs, halves of one frame (2 frames) | **+1.73 / +1.76 px** | -1.7..+8.8
+alternate (frame-sequential), L(n) vs R(n+1) | **+12.69 / +12.35 px** | -3.8..+35.9
+static sbs (no pan), for reference | +1.8..+2.1 px |
+
+The frame-sequential pairs carry the camera motion between the two eyes: +10.6 px of false
+disparity on the far field, which is what 0.5 deg is at the image centre
+(960 × 1.2088 × tan 0.5° = 10.1 px). The same-update pairs carry none: their far-field disparity
+is the static value. This is the Ishimura problem (`docs/49`, `19-stereo-motion`), removed by
+construction rather than compensated.
+
+![full SBS, both eyes from one update](img/stereo-sbs-full-3840.jpg)
+
+*3840x1080 composite (downscaled), run r17: left eye in the left half, right eye in the right half,
+each a 1:1 copy of the engine's 1920x1080 render. The HUD hint is drawn in both at zero disparity.*
+
+![eye switch read as motion](img/stereo-eye-switch-motion-blur.jpg)
+
+*Left: first sbs build (r11), the player smeared by motion blur because the eye offset read as
+velocity (camera and object motion vectors from the other eye's previous frame). Right: with
+per-eye previous world-to-clip and object velocity off (r17).*
+
+### Census of an sbs update (live, r17)
+
+```
+setViewToWorld MAIN x4                      <- one ModeSwitch::update
+ModeSwitch::render enter
+  beginFrame; renderFrame(MAIN)             <- left eye: CustomView copy at (-3101.670, -931.870)
+    ExecuteCommandLists n=15 IN-RENDERFRAME
+  endFrame: ExecuteCommandLists n=8, n=1; Present   <- swallowed (back buffer index stays 1)
+  [mod] ExecuteCommandLists n=1             <- stash copy, queued after the engine's lists
+  beginFrame; renderFrame(MAIN)             <- right eye: (-3101.696, -931.810)
+    ExecuteCommandLists n=15 IN-RENDERFRAME
+  endFrame: ExecuteCommandLists n=8, n=1; Present   <- composed and presented
+ModeSwitch::render leave
+```
+
+The two eye positions differ by 0.065 m along the camera's right axis (-0.391, 0, 0.920): the
+configured 2 × 32.5 mm.
 
 ---
 
@@ -202,12 +282,12 @@ SBS_BATTERY_PLACEHOLDER
 1. **Re-run the frame's render call per eye** (implemented). `ModeSwitch::render` `0x262cb0` is the
    whole render+present of one game update and the simulation (`ModeSwitch::update` `0x263600`) is
    a separate call. The hook runs it twice: pass 1 with the left eye, pass 2 with the right eye.
-2. Call `renderFrame` twice inside one `ModeSwitch::render`. Rejected for now: both recordings are
-   submitted together after renderFrame returns (live: `ExecuteCommandLists n=14` after
-   renderFrame), into the same RT-pool targets and the same final target, so the first eye's
-   output would need copying out mid-command-stream from inside the engine's own command list.
-   Possible later (the engine's open command list is reachable from its device object) but more
-   invasive, and it would draw the HUD once (good) instead of per eye.
+2. Call `renderFrame` twice inside one `ModeSwitch::render`. Feasible and the natural next step:
+   the scene's command lists are submitted before `renderFrame` returns (live), so a copy queued
+   right after the first call is ordered correctly, and the HUD, `beginFrame`/`endFrame` and the
+   swallowed Present would all run once. Needs: where the scene's final image lands before the HUD
+   is drawn over it (the back buffer or `pColorUpsampleRT`), and the HUD composited into both
+   halves. Not done in this spike; (1) was enough to prove same-update pairs.
 3. Hold the simulation every other frame (time-frozen alternate frames). Not needed: (1) gets the
    same guarantee without touching the simulation.
 
@@ -224,7 +304,9 @@ SBS_BATTERY_PLACEHOLDER
   `GetDesc`/`GetDesc1` keep reporting 1920. Live: the engine keeps rendering at its own resolution
   into the left 1920x1080 of the 3840 buffer (captured), so the compositor is two 1:1
   `CopyTextureRegion`s: each eye is exactly the engine's 1920x1080 render with its own 16:9
-  frustum, unscaled. No projection change is needed at all.
+  frustum, unscaled. No projection change is needed at all. (The lab's 1920x1080 gamescope display
+  shows only the left 1920 columns of the 3840 buffer, so `quiver lab shot` sees the left eye; the
+  mod's own `stereo shots` read back the whole buffer.)
 - Half SBS (`output = half`, 1920 swapchain): the prototype shows the centre half of each eye (a
   crop, not a squeeze); a proper half-SBS needs a 2:1 filtered squeeze (a small pixel/compute
   shader pass) and was not done.
@@ -238,11 +320,20 @@ SBS_BATTERY_PLACEHOLDER
 | object motion vectors (per-object previous transforms, updated per render) | the eye offset reads as object velocity: the player smears horizontally (captured) | tweakable `TAA:Enable Object Velocity` = 0 while sbs runs | per-eye previous object transforms (find where skinned/rigid objects store last frame's matrices) |
 | DLSS (`0xd75620`, nvngx) | one DLSS feature has one history | not handled (DLSS off in the lab) | one DLSS feature per eye |
 | frame counters (`0xb188d8`, `0xd744f8`) | advance twice per update: jitter sequence and anything keyed on frame parity runs at 2x | none | harmless so far; pin per-update if something depends on it |
-| auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | none observed in the prologue | audit each `*_update` in renderWorld; skip on pass 2 |
+| auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | none visible; the separation-0 control leaves a small residual (mean 0.81/255) | audit each `*_update` in renderWorld; skip on pass 2 |
 | HUD | drawn per eye at zero disparity | fine | draw once / at chosen depth |
 | frame pacing | ModeSwitch::render waits 4.17 ms per call | fine | — |
 
-PERF_PLACEHOLDER
+### Cost (measured, run r17, `quiver lab gpu -- re/scripts/stereo_rate.sh awr`, GPU to itself)
+
+mode | renders/s | displayed frames/s
+---|---|---
+off (mono) | 140.8 | 140.8
+sbs | 140.8-145.5 | 70.2-72.6
+
+Exactly two renders per displayed frame and no other overhead visible at this precision (the
+compositor is 3-4 copies on the copy path). On the user's 8 GB laptop GPU this means half the mono
+frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are where it comes back.
 
 ---
 
@@ -283,12 +374,16 @@ PERF_PLACEHOLDER
 
 ```sh
 scripts/build
-cp -r build/mod /tmp/modfull && sed -i 's/^output = half/output = full/' /tmp/modfull/torchbearer.ini
+cp -r build/mod /tmp/modfull
+sed -i 's/^output = half/output = full/; s/^start_level =$/start_level = continue/; s/^skip_videos = 0/skip_videos = 1/' \
+    /tmp/modfull/torchbearer.ini                     # 3840 swapchain; boot straight to the checkpoint
 quiver lab fixture install awr prologue-road        # game stopped
 quiver lab launch awr --mod /tmp/modfull --wait frame
-re/scripts/awr_to_world.sh awr                       # warning -> title -> Continue -> in-world
+quiver lab wait awr in-world                         # ~11 s with the levels feature (docs/levels.md)
+# (without [dev] start_level: re/scripts/awr_to_world.sh awr steps warning -> title -> Continue)
 re/scripts/stereo_battery.sh awr                     # captures into the run folder
 python3 re/scripts/stereo_analyse.py <run folder>
+quiver lab gpu -- re/scripts/stereo_rate.sh awr     # renders/s and displayed frames/s per mode
 quiver lab call awr stereo census 2                  # frame-structure trace into torchbearer.log
 ```
 
