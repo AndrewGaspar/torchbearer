@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "core/camera.h"
 #include "core/config.h"
 #include "core/hook.h"
 #include "core/hyprland.h"
@@ -188,6 +189,10 @@ void apply_offset(void* view, double off) {
 
 // --- hooks -------------------------------------------------------------------------------------
 void __fastcall hk_setViewToWorld(void* view, const double* m) {
+  // Camera filters (core/camera.h, e.g. first person) rewrite the game's transform first; from here
+  // on it is "the game's" transform, and the eye offset below is applied on top of it.
+  double filtered[12];
+  if (camera_filter_run(view, m, filtered)) m = filtered;
   if (census_on()) {
     census("setViewToWorld ret=%#llx view=%p vt=%#llx pos=(%.3f %.3f %.3f) fwd=(%.3f %.3f %.3f) right=(%.3f %.3f %.3f)%s",
            (unsigned long long)rva(__builtin_return_address(0)), view,
@@ -484,6 +489,7 @@ void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
   }
   g_last_render_present = present_frame();
   g_renderer = r;
+  camera_prerender_run(view);  // core/camera.h (first-person FOV, ...): before both eyes
   if (g_render_frames.load() == 0) {
     TB_LOG("stereo: first renderFrame (view %p)", view);
   }
@@ -971,6 +977,7 @@ void start() {
                           sizeof kSigGameAspect) == 0;
   if (!g_ui_aspect_ok) TB_LOG("stereo: Game::aspect signature mismatch; the UI aspect is not refreshed per frame");
   g_hooked = true;
+  camera_set_hooked(true);
   TB_LOG("stereo: hooks installed");
 }
 

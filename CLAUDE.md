@@ -13,7 +13,9 @@ surface `torchbearer`).
   config (`torchbearer.ini`, ids `section.key`, polled every 250 ms, also fed by the Quiver SDK;
   features subscribe with `cfg_listen`), hooks (MinHook `hook_fn`, `hook_vtable`), lab channel
   (`lab_state`, `lab_verb` → `quiver lab call awr <verb> …`), Quiver SDK glue, Present/Resize
-  listeners (`present_on`, `resize_on`), `game_image()` for RVAs.
+  listeners (`present_on`, `resize_on`), `game_image()` for RVAs, main-camera filters
+  (`camera_filter_add`, `camera_prerender_add`: run from stereo's `setViewToWorld` / `renderFrame`
+  hooks, before the eye offset; first person uses them).
 - `src/features/` — one file (or folder) per feature; register listeners/verbs in
   `features_register()`, install hooks in `features_start()` (`src/features/features.cpp`).
 - `dist/` — `torchbearer.ini` (shipped defaults), `quiver-mod.toml`, `quiver-options.toml`.
