@@ -109,7 +109,7 @@ apply = "live"
 [option."game.vsync"]
 type = "bool"
 label = "VSync"
-default = "0"
+default = false
 apply = "live"
 
 [option."game.dlss"]
@@ -143,7 +143,7 @@ apply = "live"
 type = "bool"
 label = "HDR"
 help = "Only on an HDR display (the game greys it out otherwise)."
-default = "0"
+default = false
 level = "advanced"
 apply = "live"
 
@@ -183,19 +183,19 @@ apply = "live"
 [option."game.motion_blur"]
 type = "bool"
 label = "Motion blur"
-default = "1"
+default = true
 apply = "live"
 
 [option."game.film_grain"]
 type = "bool"
 label = "Film grain"
-default = "1"
+default = true
 apply = "live"
 
 [option."game.hud"]
 type = "bool"
 label = "HUD"
-default = "1"
+default = true
 apply = "live"
 
 [option."game.hud_size"]
@@ -226,21 +226,21 @@ apply = "live"
 [option."game.taa"]
 type = "bool"
 label = "Temporal anti-aliasing"
-default = "1"
+default = true
 when = { "game.quality" = "custom" }
 apply = "live"
 
 [option."game.fxaa"]
 type = "bool"
 label = "FXAA"
-default = "0"
+default = false
 when = { "game.quality" = "custom" }
 apply = "live"
 
 [option."game.msaa"]
 type = "bool"
 label = "MSAA"
-default = "1"
+default = true
 when = { "game.quality" = "custom" }
 apply = "live"
 
@@ -352,14 +352,14 @@ apply = "live"
 type = "bool"
 label = "English speech"
 help = "English voices with another language's text (the game offers it only for some languages)."
-default = "0"
+default = false
 apply = "live"
 latency = "from the next line of dialogue"
 
 [option."game.subtitles"]
 type = "bool"
 label = "Subtitles"
-default = "0"
+default = false
 apply = "live"
 
 [option."game.subtitle_size"]
@@ -402,13 +402,13 @@ apply = "live"
 [option."game.invert_y"]
 type = "bool"
 label = "Invert vertical look"
-default = "0"
+default = false
 apply = "live"
 
 [option."game.invert_x"]
 type = "bool"
 label = "Invert horizontal look"
-default = "0"
+default = false
 apply = "live"
 
 [option."game.mouse_sensitivity_x"]
@@ -435,7 +435,7 @@ apply = "live"
 type = "bool"
 label = "Direct aiming"
 help = "Aim where the mouse points, without the remaster's aim smoothing."
-default = "0"
+default = false
 apply = "live"
 
 [option."game.modern_camera"]
@@ -463,7 +463,7 @@ apply = "live"
 [option."game.vibration"]
 type = "bool"
 label = "Vibration"
-default = "1"
+default = true
 level = "advanced"
 apply = "live"
 
@@ -489,14 +489,14 @@ apply = "live"
 [option."game.swap_sticks"]
 type = "bool"
 label = "Swap sticks"
-default = "0"
+default = false
 level = "advanced"
 apply = "live"
 
 [option."game.swap_triggers"]
 type = "bool"
 label = "Swap triggers"
-default = "0"
+default = false
 level = "advanced"
 apply = "live"
 
