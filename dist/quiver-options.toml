@@ -696,16 +696,16 @@ apply = "live"
 [option."stereo.taa"]
 type = "bool"
 label = "Keep TAA in 3D"
-help = "The game's TAA has one history for both eyes, so it is switched off while side-by-side runs unless this is on (then the eyes blend into each other)."
-default = false
+help = "On: the game's TAA stays as set in its options, with a separate history per eye. Off: TAA is switched off while side-by-side runs."
+default = true
 level = "advanced"
 apply = "live"
 
 [option."stereo.object_velocity"]
 type = "bool"
 label = "Keep object motion vectors in 3D"
-help = "Off while side-by-side runs: with it on, the eye offset reads as motion and moving objects smear."
-default = false
+help = "On: motion blur and TAA reprojection of moving objects stay, with per-eye previous transforms. Off: switched off while side-by-side runs."
+default = true
 level = "advanced"
 apply = "live"
 
