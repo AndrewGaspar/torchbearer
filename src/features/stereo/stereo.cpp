@@ -571,7 +571,11 @@ void __fastcall hk_modeSwitchRender(void* self) {
   double rate = g_pan_rate.load();
   g_pan_rad = rate != 0 ? g_pan_rad + rate * M_PI / 180.0 : 0;
   bool world = present_frame() - g_last_render_present.load() < 8;
-  bool sbs = p.mode == Mode::Sbs && world;
+  // Side-by-side needs a packed output (output = full | hsbs: a 2x-wide swapchain); without one
+  // there is nowhere to put the second eye, so the game renders one (mono) image.
+  IDXGISwapChain* psc = g_sc.load();
+  bool packed = psc && present_width_scale(psc) > 1;
+  bool sbs = p.mode == Mode::Sbs && world && packed;
   // Without per-eye state (signature mismatch) TAA and object velocity would blend / smear across
   // eyes, so they are switched off while sbs runs, as they are when the user asks for it.
   taa_force_off(sbs && (!p.taa_in_sbs || !eyestate_history_available()));
@@ -789,6 +793,7 @@ void register_feature() {
       present_set_width_scale(v == "full" || v == "hsbs" ? 2 : 1);
       g_p.anamorphic = v == "hsbs";
       g_ana_on = g_p.anamorphic;
+      window_set_stretched(g_p.anamorphic);
       g_tag_layout = v == "full" ? "sbs" : v == "hsbs" ? "hsbs" : "";
       update_window_tag();
     }

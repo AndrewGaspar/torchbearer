@@ -85,13 +85,32 @@ WM_CREATE):
 - Mouse-look in gameplay (relative mode) still turns the camera.
 - `mode = off` with `output = full`: identical halves.
 
+## Under HypXRland (output = hsbs): mouse, display modes (0.4.9; live)
+
+- **Mouse.** HypXRland draws the desktop cursor into both eyes at the same position, and each eye
+  shows its half of the window stretched over the whole window. So the cursor at window x is at
+  x/2 in the eye, in both eyes: in hsbs absolute mouse positions reach the game as x/2 (not
+  `x mod W`, which is right only for a raw 3840 desktop where each eye is its own half), the
+  normalised cursor getter is left alone, and the game's cursor warp (`Mouse::warp` `0x3b7160`,
+  `+0x20 · nx`) gets the doubled width for the call. Live (lab, hsbs, pause menu): hovering at
+  window x 615 selects "Options"/"Statistics", which sit at ~576-600 in the stretched view.
+- **Display modes.** In hsbs the window must be the desktop, so exclusive fullscreen and windowed
+  are run as borderless: at boot (the desktop query, Game+0xdc set to 2 in memory) and in
+  `Game::setDisplay` (`0x1d0e40`, also what the settings feature calls). Live, before: fullscreen
+  at 1920x1080 made a 3840-wide window on a 1920 desktop; after: engine 960x1080, window
+  1920x1080. The player's setting (Quiver option, resolution.xml) is left as chosen. Under Wine,
+  exclusive fullscreen is a borderless window anyway. `output = full` keeps the modes as they are.
+- **`output = half` removed.** The centre-crop prototype is gone; the default is `none` (normal
+  window, `half` still accepted). Side-by-side now only runs with a packed output (full/hsbs);
+  with `none`, 3D mode renders a normal mono image.
+
 ## Not done
 
 - Exclusive fullscreen (mode 0) with a 2x swapchain is untested: DXGI would need a 3840-wide
   display mode. Use borderless.
-- Half SBS (`output = half`) still crops the centre of each eye; a proper 2:1 squeeze needs a
-  shader pass.
-- The OS cursor is drawn by the desktop over one eye only (it is not part of the rendered image).
+- (done: hsbs replaces the half-output crop.)
+- On a raw 3840 desktop (output = full, no stereo compositor) the OS cursor is drawn over one eye
+  only. Under HypXRland it is drawn into both eyes (at screen depth).
 
 ![3840x1080 window, both eyes](img/stereo-window-3840.jpg)
 

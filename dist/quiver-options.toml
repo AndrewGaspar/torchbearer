@@ -659,13 +659,13 @@ apply = "live"
 [option."stereo.output"]
 type = "enum"
 label = "Output"
-help = "How the two eyes reach the display. For XReal glasses under HypXRland pick Half side-by-side; Full side-by-side is for glasses driven as a plain 3840x1080 desktop."
+help = "How the two eyes reach the display. For XReal glasses under HypXRland pick Half side-by-side; Full side-by-side is for glasses driven as a plain 3840x1080 desktop. None renders a normal image even with 3D mode on."
 values = [
   { value = "hsbs", label = "Half side-by-side (HypXRland 3D mode)" },
   { value = "full", label = "Full side-by-side (3840-wide window)" },
-  { value = "half", label = "None: normal window (stereo shows centre crops)" },
+  { value = "none", label = "None: normal window (no 3D)" },
 ]
-default = "half"
+default = "none"
 apply = "restart"
 
 [option."stereo.hyprland_tag"]

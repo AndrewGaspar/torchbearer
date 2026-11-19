@@ -36,6 +36,7 @@ constexpr uintptr_t kRvaWindowCreate = 0x3b4b60;  // WindowX86::create(this, tit
 constexpr uintptr_t kRvaWindowResize = 0x3b50b0;  // WindowX86::resize(this, w, h, mode, monitor, flags)
 constexpr uintptr_t kRvaWndProc = 0x3b39e0;       // the AppWindowClass window procedure
 constexpr uintptr_t kRvaCursorNorm = 0x3b6b10;    // Mouse::cursor(this, float out[2]) in 0..1
+constexpr uintptr_t kRvaCursorWarp = 0x3b7160;    // Mouse::warp(this, const float nxy[2])
 constexpr uintptr_t kRvaWindowGlobal = 0xd0ad38;  // WindowX86* (set on WM_CREATE)
 // Borderless (mode 2) takes its resolution from the monitor, not from the player's setting: the
 // boot code in Game::Game (call at 0x1ce7aa, "Desktop dimensions") and Game::setDisplay (0x1d0e40,
@@ -46,6 +47,7 @@ constexpr uintptr_t kRvaWindowGlobal = 0xd0ad38;  // WindowX86* (set on WM_CREAT
 constexpr uintptr_t kRvaMonitorMode = 0x3b4590;
 constexpr uintptr_t kRvaRetBoot = 0x1ce7af;        // after the call in Game::Game
 constexpr uintptr_t kRvaRetSetDisplay = 0x1d0e90;  // after the call in Game::setDisplay (mode 2 only)
+constexpr uintptr_t kRvaSetDisplay = 0x1d0e40;     // Game::setDisplay
 constexpr uintptr_t kRvaGamePtr = 0xb05dd0;        // Game* (docs/settings.md)
 constexpr size_t kGameDisplayMode = 0xdc;          // 0 fullscreen, 1 windowed, 2 borderless
 constexpr size_t kWinHwnd = 0x18, kWinW = 0x20, kWinH = 0x24, kWinMode = 0x30, kWinInput = 0x10;
@@ -65,6 +67,10 @@ constexpr Sig kWinSigs[] = {
      {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8d}},
     {kRvaMonitorMode, "MonitorModes::get",
      {0x48, 0x83, 0x3d, 0x80, 0x67, 0x95, 0x00, 0x00, 0x74, 0x37, 0x85, 0xc9, 0x78, 0x33, 0x49, 0x63}},
+    {kRvaSetDisplay, "Game::setDisplay",
+     {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48}},
+    {kRvaCursorWarp, "Mouse::warp",
+     {0x40, 0x53, 0x56, 0x57, 0x48, 0x83, 0xec, 0x40, 0x48, 0x8b, 0xf9, 0x0f, 0x29, 0x74, 0x24, 0x30}},
     {kRvaCursorNorm, "Mouse::cursor",
      {0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8b, 0xd9, 0x48, 0x8b, 0xfa}},
 };
@@ -80,6 +86,7 @@ using MonitorMode_t = uint64_t(__fastcall*)(int, int*, int);
 MonitorMode_t o_monitorMode;
 
 std::atomic<bool> g_active{false};
+std::atomic<bool> g_stretched{false};  // output = hsbs: map x -> x/2 (see window.h)
 std::atomic<int> g_widened{0}, g_sizes{0}, g_mouse{0};
 int g_last_real_w = 0, g_last_engine_w = 0, g_last_h = 0;
 
@@ -201,7 +208,11 @@ LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       void* win = window_obj();
       int ew = win ? at<int>(win, kWinW) : 0;
       int x = short(LOWORD(lp)), y = short(HIWORD(lp));
-      if (ew > 0 && x >= 0) x %= ew;
+      if (g_stretched) {
+        x /= 2;  // the eye is the window's half stretched over the whole window
+      } else if (ew > 0 && x >= 0) {
+        x %= ew;  // each eye in its own half, 1:1
+      }
       lp = MAKELPARAM(x, y);
       g_mouse++;
     }
@@ -211,11 +222,28 @@ LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 float* __fastcall hk_cursor(void* mouse, float* out) {
   float* r = o_cursor(mouse, out);
-  if (active() && out && out[0] >= 0.f && out[0] <= 1.f) {
+  if (active() && !g_stretched && out && out[0] >= 0.f && out[0] <= 1.f) {
     float x = out[0] * 2.f;
     out[0] = x - std::floor(x);  // position within the eye the cursor is over
   }
   return r;
+}
+
+// Mouse::warp(this, const float nxy[2]) (0x3b7160): SetCursorPos(window +0x20 * nx + origin, …).
+// With the engine at one eye's width that lands in the first half; in hsbs (stretched) the
+// target is the whole window, so the width it reads is doubled for the call.
+using Warp_t = void(__fastcall*)(void*, float*);
+Warp_t o_warp;
+void __fastcall hk_warp(void* mouse, float* nxy) {
+  void* win = window_obj();
+  if (!active() || !g_stretched || !win) {
+    o_warp(mouse, nxy);
+    return;
+  }
+  int w = at<int>(win, kWinW);
+  at<int>(win, kWinW) = w * 2;
+  o_warp(mouse, nxy);
+  at<int>(win, kWinW) = w;
 }
 
 uint64_t __fastcall hk_monitorMode(int idx, int* out, int monitor) {
@@ -227,6 +255,12 @@ uint64_t __fastcall hk_monitorMode(int idx, int* out, int monitor) {
     borderless = true;
   } else if (ret == kRvaRetBoot) {
     auto* game = *reinterpret_cast<uint8_t**>(game_image().at(kRvaGamePtr));
+    // hsbs: the eyes are the window's halves stretched over the desktop, so the window must be the
+    // desktop; fullscreen and windowed are run as borderless (see hk_setDisplay).
+    if (game && g_stretched && at<int>(game, kGameDisplayMode) != 2) {
+      TB_LOG("stereo window: hsbs: display mode %d run as borderless", at<int>(game, kGameDisplayMode));
+      at<int>(game, kGameDisplayMode) = 2;
+    }
     borderless = game && at<int>(game, kGameDisplayMode) == 2;
     if (!game) TB_LOG("stereo window: boot desktop query before the Game pointer is set; left alone");
   }
@@ -238,6 +272,21 @@ uint64_t __fastcall hk_monitorMode(int idx, int* out, int monitor) {
     out[0] /= 2;
   }
   return r;
+}
+
+// Game::setDisplay(game, w, h, mode, ?, monitor, ?) (0x1d0e40), also what the settings feature
+// calls: in hsbs (stretched) any mode is applied as borderless, the only shape that fits a
+// compositor which stretches each half of the window over the desktop (exclusive fullscreen under
+// Wine is a borderless window anyway). Live, before: fullscreen at 1920x1080 made a 3840-wide
+// window on a 1920 desktop. The player's own setting (Quiver option / resolution.xml) is untouched.
+using SetDisplay_t = void(__fastcall*)(void*, int, int, int, int, int, uint8_t);
+SetDisplay_t o_setDisplay;
+void __fastcall hk_setDisplay(void* game, int w, int h, int mode, int a5, int monitor, uint8_t a7) {
+  if (active() && g_stretched && mode != 2) {
+    TB_LOG("stereo window: hsbs: display mode %d applied as borderless", mode);
+    mode = 2;
+  }
+  o_setDisplay(game, w, h, mode, a5, monitor, a7);
 }
 
 bool check_sigs() {
@@ -261,6 +310,8 @@ void window_start() {
             hook_fn((void*)img.at(kRvaWindowResize), (void*)hk_resize, (void**)&o_resize, "WindowX86::resize") &&
             hook_fn((void*)img.at(kRvaWndProc), (void*)hk_wndproc, (void**)&o_wndproc, "WindowX86 wndproc") &&
             hook_fn((void*)img.at(kRvaCursorNorm), (void*)hk_cursor, (void**)&o_cursor, "Mouse::cursor") &&
+            hook_fn((void*)img.at(kRvaCursorWarp), (void*)hk_warp, (void**)&o_warp, "Mouse::warp") &&
+            hook_fn((void*)img.at(kRvaSetDisplay), (void*)hk_setDisplay, (void**)&o_setDisplay, "Game::setDisplay") &&
             hook_fn((void*)img.at(kRvaMonitorMode), (void*)hk_monitorMode, (void**)&o_monitorMode,
                     "MonitorModes::get");
   if (!ok) {
@@ -281,6 +332,8 @@ void window_start() {
     if (active() && g_rewiden.exchange(false)) widen(window_obj());
   });
 }
+
+void window_set_stretched(bool stretched) { g_stretched = stretched; }
 
 std::string window_status() {
   char b[256];

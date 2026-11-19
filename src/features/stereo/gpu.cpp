@@ -354,11 +354,9 @@ bool gpu_store_eye(IDXGISwapChain* sc, int eye) {
   return true;
 }
 
-// Full SBS (back buffer = 2 eyes wide): left eye stash -> [0, w), the frame just rendered (the right
-// eye, drawn by the engine into [0, w)) -> [w, 2w). Both 1:1 copies: each eye keeps the engine's
-// own 16:9 frustum and resolution. Half SBS (back buffer = 1 eye wide) would need a 2:1 filtered
-// squeeze (a shader pass); this prototype instead shows the centre half of each eye (a crop, so
-// geometry is right but each half shows only the middle 50% of the eye's field of view).
+// Packed output (back buffer = 2 eyes wide): left eye stash -> [0, w), the frame just rendered (the
+// right eye, drawn by the engine into [0, w)) -> [w, 2w). Both 1:1 copies of the engine's eye
+// (output = hsbs makes that eye anamorphic). Side-by-side only runs with a packed output.
 bool gpu_compose(IDXGISwapChain* sc) {
   std::lock_guard lk(g_mu);
   if (!ensure(sc) || !g_eye[0]) return false;
@@ -367,7 +365,7 @@ bool gpu_compose(IDXGISwapChain* sc) {
   D3D12_RESOURCE_DESC d = bb->GetDesc();
   unsigned k = present_width_scale(sc);
   uint32_t w = uint32_t(d.Width) / k, h = d.Height;
-  if (w != g_eye_w || h != g_eye_h) {
+  if (k < 2 || w != g_eye_w || h != g_eye_h) {
     bb->Release();
     g_compose_fail++;
     return false;
@@ -379,13 +377,8 @@ bool gpu_compose(IDXGISwapChain* sc) {
   copy_rect(g_eye[1], 0, bb, 0, w, h);
   barrier(g_eye[1], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
   barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-  if (k >= 2) {
-    place_eye(bb, 0, g_eye[0], w, h, g_hit[0]);
-    place_eye(bb, w, g_eye[1], w, h, g_hit[1]);
-  } else {
-    copy_rect(bb, 0, g_eye[0], w / 4, w / 2, h);
-    copy_rect(bb, w / 2, g_eye[1], w / 4, w / 2, h);
-  }
+  place_eye(bb, 0, g_eye[0], w, h, g_hit[0]);
+  place_eye(bb, w, g_eye[1], w, h, g_hit[1]);
   barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
   submit();
   bb->Release();
@@ -502,34 +495,9 @@ bool gpu_place_mid(IDXGISwapChain* sc, int stashed_eye) {
   return true;
 }
 
-bool gpu_compose_view(IDXGISwapChain* sc, int stashed_eye) {
-  std::lock_guard lk(g_mu);
-  if (present_width_scale(sc) >= 2) return true;  // composed in the frame (gpu_place_mid)
-  // Half output: the frame holds the other eye; centre crops of both, as gpu_compose.
-  if (!ensure(sc) || !g_eye[0]) return false;
-  ID3D12Resource* bb = back_buffer(sc);
-  if (!bb) return false;
-  D3D12_RESOURCE_DESC d = bb->GetDesc();
-  uint32_t w = uint32_t(d.Width), h = d.Height;
-  if (w != g_eye_w || h != g_eye_h) {
-    bb->Release();
-    g_compose_fail++;
-    return false;
-  }
-  int other = 1 - stashed_eye;
-  begin();
-  barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-  copy_rect(g_eye[other], 0, bb, 0, w, h);
-  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-  copy_rect(bb, 0, g_eye[0], w / 4, w / 2, h);
-  copy_rect(bb, w / 2, g_eye[1], w / 4, w / 2, h);
-  barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-  submit();
-  bb->Release();
-  g_composed++;
-  return true;
+bool gpu_compose_view(IDXGISwapChain* sc, int /*stashed_eye*/) {
+  // The view path composes in the frame (gpu_place_mid); side-by-side requires a packed output.
+  return present_width_scale(sc) >= 2;
 }
 
 uint32_t gpu_eye_width() { return g_eye_w; }
