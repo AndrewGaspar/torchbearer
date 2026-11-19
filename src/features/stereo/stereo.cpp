@@ -794,13 +794,19 @@ void register_feature() {
       g_tag_on = v != "0" && v != "false";
       update_window_tag();
     } else if (id == "stereo.output") {
-      // full / hsbs: the swapchain (and window) are twice the engine's width, read at swapchain
-      // creation; hsbs additionally squeezes each eye (anamorphic, above). half: legacy crop.
-      present_set_width_scale(v == "full" || v == "hsbs" ? 2 : 1);
+      // Packed outputs (2x-wide swapchain, read at swapchain creation):
+      //   full: window 2x wide, each eye 1:1 (a plain 3840x1080 desktop);
+      //   hsbs: window = desktop, each eye squeezed 2:1 (HypXRland 3D mode, any Proton);
+      //   sbs:  window = desktop, each eye 1:1 at full width (HypXRland 3D mode, with a Proton
+      //         that lets the swapchain be larger than the window: GE-Proton11-12-hypxr,
+      //         PROTON_ENABLE_WAYLAND=1, WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1).
+      bool packed = v == "full" || v == "hsbs" || v == "sbs";
+      present_set_width_scale(packed ? 2 : 1);
       g_p.anamorphic = v == "hsbs";
       g_ana_on = g_p.anamorphic;
-      window_set_stretched(g_p.anamorphic);
-      g_tag_layout = v == "full" ? "sbs" : v == "hsbs" ? "hsbs" : "";
+      window_set_stretched(v == "hsbs");
+      window_set_keep(v == "sbs");
+      g_tag_layout = v == "full" || v == "sbs" ? "sbs" : v == "hsbs" ? "hsbs" : "";
       update_window_tag();
     }
     else if (id == "stereo.sbs_path") g_p.path = v == "frame" ? SbsPath::Frame : SbsPath::View;

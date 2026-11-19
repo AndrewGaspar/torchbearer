@@ -15,6 +15,9 @@ void window_start();
 //               window stretched over the whole window in that eye, so the cursor at x is at x/2
 //               in the eye, in both eyes.
 void window_set_stretched(bool stretched);
+// output = sbs (full side-by-side under HypXRland, larger-swapchain Proton): keep the window at the
+// desktop's size, the engine at its normal width, coordinates untranslated; still borderless.
+void window_set_keep(bool keep);
 std::string window_status();
 
 }  // namespace tb::stereo

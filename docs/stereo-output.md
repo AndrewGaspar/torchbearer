@@ -104,6 +104,22 @@ WM_CREATE):
   window, `half` still accepted). Side-by-side now only runs with a packed output (full/hsbs);
   with `none`, 3D mode renders a normal mono image.
 
+## Full resolution under HypXRland: `output = sbs` (0.5.3)
+
+HypXRland's `sbs` layout is a 2x-wide buffer in a 1x window box. A Wine game can deliver that only
+when Wine lets its Vulkan swapchain be larger than the window and the Wayland driver scales it into
+the box (its client subsurface's `wp_viewport`): the user's Proton fork, branch `custom-ge11`,
+`WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1` (win32u raises maxImageExtent on Wayland surfaces;
+vkd3d-proton then creates the swapchain at the DXGI buffer size instead of shrinking it), with
+`PROTON_ENABLE_WAYLAND=1`, and HypXRland's covering-subsurface crop. The mod side: the window keeps
+the desktop's size (no widening, no WM_SIZE/mouse translation, no desktop halving; fullscreen and
+windowed still run as borderless), the engine renders a normal 16:9 eye at the window's width, the
+swapchain is 2x wide, the window is tagged `stereo-sbs` and Quiver is told `sbs`. Lab (X11, so the
+last step can't happen there): fullscreen run as borderless, swapchain 1920 -> 3840, eye textures
+1920x1080, composed 3840x1080 frame with both full-resolution eyes and the HUD in each.
+Without the larger-swapchain Proton on Wine-Wayland, vkd3d-proton shrinks the 3840 image into the
+window, which is a (filtered) half side-by-side; on X11 it is not usable — use `hsbs` there.
+
 ## Not done
 
 - Exclusive fullscreen (mode 0) with a 2x swapchain is untested: DXGI would need a 3840-wide

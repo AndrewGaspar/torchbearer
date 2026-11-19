@@ -87,6 +87,13 @@ MonitorMode_t o_monitorMode;
 
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_stretched{false};  // output = hsbs: map x -> x/2 (see window.h)
+// output = sbs (full side-by-side under HypXRland): the window stays the desktop's size and the
+// engine renders a normal 1920-wide eye; the 2x-wide swapchain reaches the compositor through
+// Wine's Wayland viewport (GE-Proton11-12-hypxr, WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1), which
+// shows each half 1:1 over the window box. No widening, no WM_SIZE or mouse translation, no
+// desktop halving; only the borderless coercion stays.
+std::atomic<bool> g_keep{false};
+bool split() { return g_stretched.load() || g_keep.load(); }  // a compositor splits the window
 std::atomic<int> g_widened{0}, g_sizes{0}, g_mouse{0};
 int g_last_real_w = 0, g_last_engine_w = 0, g_last_h = 0;
 
@@ -170,6 +177,7 @@ void widen(void* win) {
 }
 
 void __fastcall hk_create(void* win, const char* title, int w, int h, int mode, int monitor, uint8_t flags) {
+  if (active() && g_keep) return o_create(win, title, w, h, mode, monitor, flags);
   if (active()) {
     set_engine_size(w, h);
     TB_LOG("stereo window: create %dx%d mode %d monitor %d -> engine %dx%d", w, h, mode, monitor, g_engine_w.load(),
@@ -179,6 +187,7 @@ void __fastcall hk_create(void* win, const char* title, int w, int h, int mode, 
   if (active()) widen(win);
 }
 void __fastcall hk_resize(void* win, int w, int h, int mode, int monitor, uint8_t flags) {
+  if (active() && g_keep) return o_resize(win, w, h, mode, monitor, flags);
   if (active()) {
     set_engine_size(w, h);
     TB_LOG("stereo window: resize %dx%d mode %d monitor %d (from %#llx) -> engine %dx%d", w, h, mode, monitor,
@@ -196,7 +205,7 @@ bool absolute_mouse() {
 }
 
 LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-  if (active()) {
+  if (active() && !g_keep) {
     if (msg == WM_SIZE) {
       int real = LOWORD(lp), h = HIWORD(lp);
       int ew = engine_w(real);
@@ -222,7 +231,7 @@ LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 float* __fastcall hk_cursor(void* mouse, float* out) {
   float* r = o_cursor(mouse, out);
-  if (active() && !g_stretched && out && out[0] >= 0.f && out[0] <= 1.f) {
+  if (active() && !g_stretched && !g_keep && out && out[0] >= 0.f && out[0] <= 1.f) {
     float x = out[0] * 2.f;
     out[0] = x - std::floor(x);  // position within the eye the cursor is over
   }
@@ -257,14 +266,14 @@ uint64_t __fastcall hk_monitorMode(int idx, int* out, int monitor) {
     auto* game = *reinterpret_cast<uint8_t**>(game_image().at(kRvaGamePtr));
     // hsbs: the eyes are the window's halves stretched over the desktop, so the window must be the
     // desktop; fullscreen and windowed are run as borderless (see hk_setDisplay).
-    if (game && g_stretched && at<int>(game, kGameDisplayMode) != 2) {
-      TB_LOG("stereo window: hsbs: display mode %d run as borderless", at<int>(game, kGameDisplayMode));
+    if (game && split() && at<int>(game, kGameDisplayMode) != 2) {
+      TB_LOG("stereo window: compositor split: display mode %d run as borderless", at<int>(game, kGameDisplayMode));
       at<int>(game, kGameDisplayMode) = 2;
     }
     borderless = game && at<int>(game, kGameDisplayMode) == 2;
     if (!game) TB_LOG("stereo window: boot desktop query before the Game pointer is set; left alone");
   }
-  if (borderless && out[0] > 1) {
+  if (borderless && out[0] > 1 && !g_keep) {
     static int logged_w = 0;
     if (logged_w != out[0]) TB_LOG("stereo window: borderless at %dx%d desktop -> engine resolution %dx%d", out[0], out[1], out[0] / 2,
            out[1]);
@@ -282,8 +291,8 @@ uint64_t __fastcall hk_monitorMode(int idx, int* out, int monitor) {
 using SetDisplay_t = void(__fastcall*)(void*, int, int, int, int, int, uint8_t);
 SetDisplay_t o_setDisplay;
 void __fastcall hk_setDisplay(void* game, int w, int h, int mode, int a5, int monitor, uint8_t a7) {
-  if (active() && g_stretched && mode != 2) {
-    TB_LOG("stereo window: hsbs: display mode %d applied as borderless", mode);
+  if (active() && split() && mode != 2) {
+    TB_LOG("stereo window: compositor split: display mode %d applied as borderless", mode);
     mode = 2;
   }
   o_setDisplay(game, w, h, mode, a5, monitor, a7);
@@ -321,19 +330,20 @@ void window_start() {
   // output = full is read at start-up (the swapchain is created with it), and so is this.
   g_active = present_width_scale_pending() > 1;
   void* win = window_obj();
-  TB_LOG("stereo window: hooks installed, %s; window object %p at start", active() ? "active (2x-wide swapchain: output full or hsbs)" : "inactive",
+  TB_LOG("stereo window: hooks installed, %s; window object %p at start", active() ? (g_keep ? "active (output sbs: window kept at desktop size)" : "active (output full or hsbs)") : "inactive",
          win);
-  if (active() && win) {  // the window may already exist
+  if (active() && !g_keep && win) {  // the window may already exist
     set_engine_size(at<int>(win, kWinW), at<int>(win, kWinH));
     g_rewiden = true;  // on the game thread, once the hooks are enabled
   }
   // Re-widen on the game thread (its window) when something collapsed the window.
   present_on([](IDXGISwapChain*, uint64_t) {
-    if (active() && g_rewiden.exchange(false)) widen(window_obj());
+    if (active() && !g_keep && g_rewiden.exchange(false)) widen(window_obj());
   });
 }
 
 void window_set_stretched(bool stretched) { g_stretched = stretched; }
+void window_set_keep(bool keep) { g_keep = keep; }
 
 std::string window_status() {
   char b[256];
