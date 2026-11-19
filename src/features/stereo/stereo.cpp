@@ -27,6 +27,7 @@
 #include "core/config.h"
 #include "core/hook.h"
 #include "core/hyprland.h"
+#include "core/quiver.h"
 #include "core/lab.h"
 #include "core/log.h"
 #include "core/module.h"
@@ -684,7 +685,11 @@ bool g_hooked = false;
 // halves carry the same image, which is still a valid packed frame (2D in the glasses).
 std::string g_tag_layout;
 bool g_tag_on = true;
-void update_window_tag() { hypr_set_window_tag(g_tag_on && !g_tag_layout.empty() ? "stereo-" + g_tag_layout : ""); }
+void update_window_tag() {
+  hypr_set_window_tag(g_tag_on && !g_tag_layout.empty() ? "stereo-" + g_tag_layout : "");
+  // Quiver's Sight HUD/panel: the packing, whether or not stereo rendering is on.
+  quiver_stereo_layout(g_tag_layout.empty() ? "mono" : g_tag_layout.c_str());
+}
 
 }  // namespace
 

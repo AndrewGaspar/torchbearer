@@ -13,5 +13,8 @@ void quiver_text(const std::string& metric, const std::string& text);
 
 // Option ids the mod applies live (sent as `set` while the game runs).
 void quiver_live(const char* id);
+// The packing of the presented image ("sbs", "hsbs", "mono"), so Quiver's Sight HUD/panel draws
+// once per eye (mod protocol 3, quiver_set_stereo_layout). Any thread; kept until the SDK is open.
+void quiver_stereo_layout(const char* layout);
 
 }  // namespace tb

@@ -1,7 +1,7 @@
 /* quiver_mod.h - Quiver mod SDK: live options and metrics for mods running inside a game.
  *
- * Protocol 2 (design: Quiver's design/MOD-CONFIG.md section 5 and design/SIGHT-HUD.md
- * sections 3.6 and 3.14). Single header, C89/C99/C++, Windows only (MinGW and MSVC),
+ * Protocol 3 (design: Quiver's design/MOD-CONFIG.md section 5, design/SIGHT-HUD.md
+ * sections 3.6 and 3.14, and design/SIGHT.md section 15 for the stereo layout). Single header, C89/C99/C++, Windows only (MinGW and MSVC),
  * kernel32 only: no CRT calls, no allocation on the hot path, no locks on the hot path.
  *
  * Use it in exactly one .c/.cpp file of your DLL:
@@ -43,8 +43,8 @@
 extern "C" {
 #endif
 
-#define QUIVER_MOD_PROTOCOL 2
-#define QUIVER_MOD_SDK "quiver_mod.h 2.0"
+#define QUIVER_MOD_PROTOCOL 3
+#define QUIVER_MOD_SDK "quiver_mod.h 3.0"
 
 typedef struct quiver_mod quiver_mod; /* opaque */
 
@@ -103,6 +103,26 @@ void quiver_log(quiver_mod *m, int level, const char *text);
 void quiver_poll(quiver_mod *m);
 /* Say bye and stop the SDK thread (waits up to a second). The handle is gone after. */
 void quiver_close(quiver_mod *m);
+
+/* ---- Stereo (protocol 3; Quiver's design/SIGHT.md section 15) ---------------------- */
+
+/* How the frames your game presents pack two eyes, so Quiver's in-game HUD and Sight panel
+ * are drawn once per eye (same place in both: zero disparity) instead of across the seam,
+ * and clicks in the panel land in the eye the pointer is over. `layout` is HypXRland's
+ * `stereo:<layout>` grammar, with or without the prefix:
+ *   "sbs"  the frame is 2x wide, each half an eye at 1:1 (left eye left)
+ *   "hsbs" the frame is the window's width, each half an eye squeezed 2:1 horizontally
+ *   "tab"  the frame is 2x tall, each half an eye at 1:1 (left eye on top)
+ *   "htab" the frame is the window's height, each half an eye squeezed 2:1 vertically
+ *   "mono" not packed (also "off")
+ * NULL or "auto" withdraws your word, and the game's `sight.stereo` setting applies again.
+ * Say what the presented image is, not whether stereo rendering is on: with packed output
+ * on and stereo off (both halves the same) it is still "sbs"/"hsbs". Call it at start-up
+ * and whenever the packing changes; any thread, cheap (no pipe I/O: the SDK thread sends
+ * the latest value, and sends it again after a reconnect). While your connection is up your
+ * word wins over the setting. Returns 1 if `layout` is one of the above, else 0 (nothing
+ * changes). Under a Quiver older than protocol 3 it is kept but never sent. */
+int quiver_set_stereo_layout(quiver_mod *m, const char *layout);
 
 /* ---- Metrics (SIGHT-HUD) ----------------------------------------------------------- */
 
@@ -256,6 +276,9 @@ struct quiver_mod {
     volatile LONG connected;
     volatile LONG decl_dirty, opts_dirty;
     int caps_metrics, caps_options;
+    int proto; /* the protocol Quiver's welcome agreed on */
+    /* quiver_set_stereo_layout: -1 never said, 0 withdrawn, else 1 + QV_STEREO_* index */
+    volatile LONG stereo, stereo_dirty;
     quiver_on_values on_values;
     void *values_user;
     quiver_on_action on_action;
@@ -702,7 +725,7 @@ static int qv_send(quiver_mod *m, qv_buf *b) {
 static void qv_hello(quiver_mod *m, qv_buf *b) {
     b->len = 0;
     b->over = 0;
-    qv_puts(b, "{\"t\":\"hello\",\"proto\":2,\"sdk\":\"" QUIVER_MOD_SDK "\",\"mod\":");
+    qv_puts(b, "{\"t\":\"hello\",\"proto\":3,\"sdk\":\"" QUIVER_MOD_SDK "\",\"mod\":");
     qv_put_str(b, m->surface, 48);
     qv_puts(b, ",\"pid\":");
     qv_put_u64(b, GetCurrentProcessId());
@@ -923,8 +946,10 @@ static int qv_received(quiver_mod *m, const char *body, size_t n) {
     InterlockedIncrement(&m->st_received);
     if (!qv_member_str(body, n, "t", t, sizeof t)) return 1;
     if (qv_streq(t, "welcome")) {
+        int64_t proto = 0;
         m->caps_metrics = qv_has_cap(body, n, "metrics");
         m->caps_options = qv_has_cap(body, n, "options");
+        m->proto = qv_member_int(body, n, "proto", &proto) ? (int)proto : 0;
         InterlockedExchange(&m->connected, 1);
         m->backoff = 200;
     } else if (qv_streq(t, "metrics_ok")) {
@@ -963,6 +988,20 @@ static int qv_flush(quiver_mod *m, qv_buf *b, int force_m) {
         LeaveCriticalSection(&m->cs);
         qv_puts(b, "]}");
         if (!qv_send(m, b)) return 0;
+    }
+    /* the stereo layout (protocol 3): the latest word only */
+    if (m->stereo_dirty && m->proto >= 3 && InterlockedExchange(&m->stereo_dirty, 0)) {
+        static const char *names[] = {"mono", "sbs", "hsbs", "tab", "htab"};
+        LONG v = m->stereo;
+        b->len = 0; b->over = 0;
+        if (v > 0 && v <= 5) {
+            qv_puts(b, "{\"t\":\"stereo\",\"layout\":\"");
+            qv_puts(b, names[v - 1]);
+            qv_puts(b, "\"}");
+        } else {
+            qv_puts(b, "{\"t\":\"stereo\"}");
+        }
+        if (v >= 0 && !qv_send(m, b)) return 0;
     }
     /* declarations not sent yet, batched and at most 4 a second (Quiver's limit) */
     QueryPerformanceCounter(&now);
@@ -1088,6 +1127,9 @@ static void qv_session(quiver_mod *m) {
     if (!qv_buf_init(&b, 4096, QV_MAX_FRAME)) return;
     m->rx_len = 0;
     m->caps_metrics = m->caps_options = 0;
+    m->proto = 0;
+    /* a stereo layout said before holds for the new connection too */
+    if (m->stereo > 0) InterlockedExchange(&m->stereo_dirty, 1);
     /* Quiver forgets everything per connection: declare again, resend values. */
     nslots = (int)m->nslots;
     for (i = 0; i < nslots; i++) {
@@ -1195,6 +1237,7 @@ quiver_mod *quiver_open(const char *surface, const char *schema_utf8, unsigned f
     m->flags = flags;
     qv_copy(m->surface, surface, qv_strlen(surface));
     m->backoff = 200;
+    m->stereo = -1;
     m->h = INVALID_HANDLE_VALUE;
     QueryPerformanceFrequency(&m->freq);
     InitializeCriticalSection(&m->cs);
@@ -1329,6 +1372,30 @@ void quiver_changed(quiver_mod *m, const char *id, const char *text, int persist
     qv_puts(&b, persist ? "},\"persist\":true}" : "},\"persist\":false}");
     qv_control(m, &b);
     qv_buf_free(&b);
+}
+
+int quiver_set_stereo_layout(quiver_mod *m, const char *layout) {
+    static const char *names[] = {"mono", "sbs", "hsbs", "tab", "htab"};
+    const char *l = layout;
+    LONG v = -1;
+    int i;
+    if (!l || qv_streq(l, "auto")) {
+        v = 0;
+    } else {
+        if (l[0] == 's' && l[1] == 't' && l[2] == 'e' && l[3] == 'r' && l[4] == 'e' && l[5] == 'o' && l[6] == ':') l += 7;
+        if (qv_streq(l, "off")) l = "mono";
+        for (i = 0; i < 5; i++)
+            if (qv_streq(l, names[i])) v = i + 1;
+    }
+    if (v < 0) return 0;
+    if (!QV_LIVE(m)) return 1;
+    /* Withdrawing a word never said says nothing. */
+    if (v == 0 && m->stereo < 0) return 1;
+    if (InterlockedExchange(&m->stereo, v) != v) {
+        InterlockedExchange(&m->stereo_dirty, 1);
+        SetEvent(m->wake_ev);
+    }
+    return 1;
 }
 
 void quiver_log(quiver_mod *m, int level, const char *text) {
