@@ -181,7 +181,20 @@ bool on(const std::string& v) { return v == "1" || v == "true"; }
 //    +0x9c0; 0x532030 draws g_vRandomOffset, the film-grain offset, from it every render);
 //  - the motion-blur frame-time ring (0x470750: globals idx 0x955618, count 0x95561c, capacity
 //    0x955620, float* 0x955628) and the TAA one (0x49a8c0: 0x955850 / 0x955854 / 0x955858 /
-//    0x955860): each render pushes the frame time, so the second eye's average differs.
+//    0x955860): each render pushes the frame time, so the second eye's average differs;
+//  - the auto-exposure value (RendererX86+0x198, 0x480340 from renderWorld at 0x509382): with the
+//    CPU path on (0xda1df0) every render adapts +0xb4 towards the luminance read back from an
+//    older ring slot, by pow(rate, frame time); +0xb0 is its reset flag. Twice per update the
+//    second eye was one adaptation step further: while the exposure moved (after the bird attack's
+//    darkness) the right eye was up to ~0.5/255 brighter over the whole frame (live, r9).
+//    On the GPU path (the default: "Auto-exposure:Use System Memory" 0) 0x480bf0 adapts into
+//    texture A of the pair at +0x28 data + (ctr % +0xc0) * 16, reading B (last adapted value),
+//    then swaps the two pointers: the second eye of an update read the first eye's result and
+//    adapted a second time. The pair array is put back like the rest, so the second eye writes
+//    the same A from the same B.
+constexpr size_t kRendererExposure = 0x198, kExposureState = 0xb0;  // u8 reset, pad, float exposure
+constexpr size_t kExposurePairs = 0x28, kExposurePairCount = 0xc0;
+bool g_exposure_ok = false;
 constexpr size_t kRendererPost = 0x118, kPostRng = 0xa8, kRngSize = 0x9c4;
 constexpr uintptr_t kRvaBlurRing = 0x955618, kRvaTaaRing = 0x955850;  // {int idx, count, cap; float* ring}
 std::atomic<bool> g_rewind{true};
@@ -193,10 +206,11 @@ struct Region {
   void* guard_val = nullptr;
   uint8_t buf[0xa00];
 };
-Region g_regions[5];
+constexpr int kMaxRegions = 8;
+Region g_regions[kMaxRegions];
 int g_nregions = 0;
 void save_region(void* p, size_t n, void** guard = nullptr) {
-  if (!p || n > sizeof g_regions[0].buf || g_nregions >= 5 || IsBadReadPtr(p, n)) return;
+  if (!p || n > sizeof g_regions[0].buf || g_nregions >= kMaxRegions || IsBadReadPtr(p, n)) return;
   auto& r = g_regions[g_nregions++];
   r.p = static_cast<uint8_t*>(p);
   r.n = n;
@@ -225,6 +239,15 @@ void rewind_save(void* renderer) {
   }
   save_ring(kRvaBlurRing);
   save_ring(kRvaTaaRing);
+  if (g_exposure_ok && renderer) {
+    auto* ex = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(renderer) + kRendererExposure);
+    if (ex) {
+      save_region(ex + kExposureState, 8);
+      int n = *reinterpret_cast<int*>(ex + kExposurePairCount);
+      void** pairs = reinterpret_cast<void**>(ex + kExposurePairs);
+      if (*pairs && n > 0 && n <= 8) save_region(*pairs, size_t(n) * 16, pairs);
+    }
+  }
 }
 void rewind_restore() {
   for (int i = 0; i < g_nregions; i++) {
@@ -235,6 +258,154 @@ void rewind_restore() {
   if (g_nregions) g_n_rewind++;
 }
 
+// --- the CRT random generator ------------------------------------------------------------------
+// Render code draws from the CRT's rand() (imported from api-ms-win-crt-utility, IAT slot RVA
+// 0x72de28; static: ~140 call sites, e.g. the SSAO noise offset in 0x536630 and the volumetric
+// light jitter in 0x4e51a0), so the second eye of an update drew different numbers than the first
+// and the generator advanced twice per update. On the game thread, while the first eye renders,
+// every value rand() returns is recorded per call site (return address); while the second eye
+// renders, each call site gets the first eye's values again, in order, without touching the
+// generator (a call site the first eye did not use as often falls through to the real rand()).
+// The generator therefore advances once per update, by exactly the first eye's draws.
+constexpr uintptr_t kRvaRandIat = 0x72de28;
+using Rand_t = int(__cdecl*)();
+Rand_t o_rand;
+std::atomic<bool> g_rand_replay{true};  // stereo.rand_replay
+std::atomic<DWORD> g_game_tid{0};
+struct RandSite {
+  std::vector<int> v;
+  size_t next = 0;
+};
+std::unordered_map<uintptr_t, RandSite> g_rand;  // game thread only
+std::unordered_map<uintptr_t, uint64_t> g_rand_miss_sites;  // second-eye calls with nothing to replay (debug)
+std::atomic<uint64_t> g_n_rand[2], g_n_rand_replayed{0}, g_n_rand_miss{0};
+std::atomic<uint64_t> g_n_rand_other{0};
+std::atomic<uintptr_t> g_rand_other_site{0};
+int __cdecl hk_rand() {
+  int slot = g_slot.load(std::memory_order_relaxed);
+  if (slot >= 0 && GetCurrentThreadId() != g_game_tid.load(std::memory_order_relaxed)) {
+    g_n_rand_other++;  // another thread draws while an eye renders (its own CRT state; not replayed)
+    g_rand_other_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  }
+  if (slot < 0 || GetCurrentThreadId() != g_game_tid.load(std::memory_order_relaxed) ||
+      !g_rand_replay.load(std::memory_order_relaxed))
+    return o_rand();
+  auto site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  g_n_rand[slot ? 1 : 0]++;
+  if (slot == 0) {
+    int v = o_rand();
+    g_rand[site].v.push_back(v);
+    return v;
+  }
+  auto it = g_rand.find(site);
+  if (it != g_rand.end() && it->second.next < it->second.v.size()) {
+    g_n_rand_replayed++;
+    return it->second.v[it->second.next++];
+  }
+  g_n_rand_miss++;
+  g_rand_miss_sites[site]++;
+  return o_rand();
+}
+// Debug (stereo rand): the call sites seen in the last first-eye render, as RVAs with counts.
+std::string rand_sites() {
+  std::string s;
+  for (auto& [a, r] : g_rand) {
+    char b[48];
+    uintptr_t x = game_image().contains(a) ? a - game_image().base : a;
+    snprintf(b, sizeof b, " %#llx:%zu", (unsigned long long)x, r.v.size());
+    s += b;
+  }
+  {
+    char b[96];
+    uintptr_t o = g_rand_other_site.load();
+    snprintf(b, sizeof b, " | other threads during eyes: %llu (last %#llx)", (unsigned long long)g_n_rand_other.load(),
+             (unsigned long long)(game_image().contains(o) ? o - game_image().base : o));
+    s += b;
+  }
+  s += " | second-eye misses:";
+  for (auto& [a, n] : g_rand_miss_sites) {
+    char b[48];
+    uintptr_t x = game_image().contains(a) ? a - game_image().base : a;
+    snprintf(b, sizeof b, " %#llx:%llu", (unsigned long long)x, (unsigned long long)n);
+    s += b;
+  }
+  return s;
+}
+void rand_hook() {
+  auto** slot = reinterpret_cast<void**>(game_image().at(kRvaRandIat));
+  HMODULE crt = GetModuleHandleA("ucrtbase.dll");
+  void* real = crt ? reinterpret_cast<void*>(GetProcAddress(crt, "rand")) : nullptr;
+  if (!real || *slot != real) {
+    TB_LOG("stereo pass2: rand import at RVA %#llx is not ucrtbase!rand (%p vs %p); rand replay disabled",
+           (unsigned long long)kRvaRandIat, *slot, real);
+    return;
+  }
+  DWORD old;
+  if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return;
+  o_rand = reinterpret_cast<Rand_t>(*slot);
+  *slot = reinterpret_cast<void*>(hk_rand);
+  VirtualProtect(slot, sizeof(void*), old, &old);
+  TB_LOG("stereo pass2: rand import hooked (second-eye replay)");
+}
+
+// --- skinned vertex buffers (measurement only) -----------------------------------------------------
+// Skinned meshes are skinned into one of two buffers chosen by the render-frame counter's parity
+// (static: 0x46d650 current = buf[ctr & 1], 0x46d680 previous = buf[1 - (ctr & 1)], or current when
+// that is null; 0x46d6f0 "stale" = current missing or its stamp < ctr). The object-velocity command
+// (0x4c9c90) draws skinned velocity from (current, previous). In the view path both eyes share one
+// counter value, so the second eye should find every mesh fresh (no re-skin) and the previous
+// buffer distinct from the current one. Counted per eye slot (0, 1, 2 = not a view-path eye) while
+// stereo.skin_probe = 1; otherwise both hooks are a plain pass-through.
+using SkinSel_t = void*(__fastcall*)(void*, uint32_t);
+using SkinStale_t = char(__fastcall*)(void*, uint32_t);
+SkinSel_t o_skinPrev;
+SkinStale_t o_skinStale;
+constexpr uintptr_t kRvaSkinCur = 0x46d650, kRvaSkinPrev = 0x46d680, kRvaSkinStale = 0x46d6f0;
+constexpr Sig kSkinSigs[3] = {
+    {kRvaSkinCur, "skin current", {0x8b, 0x05, 0xa2, 0x6e, 0x90, 0x00, 0x25, 0x01, 0x00, 0x00, 0x80, 0x7d, 0x07, 0xff, 0xc8, 0x83}},
+    {kRvaSkinPrev, "skin previous", {0x44, 0x8b, 0x05, 0x71, 0x6e, 0x90, 0x00, 0x41, 0x81, 0xe0, 0x01, 0x00, 0x00, 0x80, 0x7d, 0x0a}},
+    {kRvaSkinStale, "skin stale", {0x4c, 0x63, 0x0d, 0x01, 0x6e, 0x90, 0x00, 0x41, 0x8b, 0xc1, 0x44, 0x8b, 0xc2, 0x48, 0x8b, 0x91}},
+};
+std::atomic<bool> g_skin_probe{false};
+std::atomic<uint64_t> g_skin_check[3], g_skin_stale[3], g_skin_vel[3], g_skin_vel_same[3];
+int skin_slot() {
+  int s = g_slot.load(std::memory_order_relaxed);
+  return s < 0 ? 2 : s;
+}
+char __fastcall hk_skinStale(void* o, uint32_t i) {
+  char r = o_skinStale(o, i);
+  if (g_skin_probe.load(std::memory_order_relaxed)) {
+    int s = skin_slot();
+    g_skin_check[s]++;
+    if (r) g_skin_stale[s]++;
+  }
+  return r;
+}
+void* __fastcall hk_skinPrev(void* o, uint32_t i) {
+  void* r = o_skinPrev(o, i);
+  if (g_skin_probe.load(std::memory_order_relaxed)) {
+    int s = skin_slot();
+    g_skin_vel[s]++;
+    void* cur = reinterpret_cast<SkinSel_t>(game_image().at(kRvaSkinCur))(o, i);
+    if (r == cur) g_skin_vel_same[s]++;  // previous == current: no skinned animation velocity
+  }
+  return r;
+}
+std::string skin_status() {
+  char b[400];
+  snprintf(b, sizeof b,
+           "skin_probe=%d skin_checks=%llu/%llu/%llu skin_stale=%llu/%llu/%llu skin_vel=%llu/%llu/%llu "
+           "skin_vel_prev_eq_cur=%llu/%llu/%llu",
+           g_skin_probe.load() ? 1 : 0, (unsigned long long)g_skin_check[0].load(),
+           (unsigned long long)g_skin_check[1].load(), (unsigned long long)g_skin_check[2].load(),
+           (unsigned long long)g_skin_stale[0].load(), (unsigned long long)g_skin_stale[1].load(),
+           (unsigned long long)g_skin_stale[2].load(), (unsigned long long)g_skin_vel[0].load(),
+           (unsigned long long)g_skin_vel[1].load(), (unsigned long long)g_skin_vel[2].load(),
+           (unsigned long long)g_skin_vel_same[0].load(), (unsigned long long)g_skin_vel_same[1].load(),
+           (unsigned long long)g_skin_vel_same[2].load());
+  return b;
+}
+
 }  // namespace
 
 void pass2_register() {
@@ -243,6 +414,8 @@ void pass2_register() {
     else if (id == "stereo.skip_probe") g_skip_probe = on(v);
     else if (id == "stereo.flare_rewind") g_flare_rewind = on(v);
     else if (id == "stereo.rewind") g_rewind = on(v);
+    else if (id == "stereo.rand_replay") g_rand_replay = on(v);
+    else if (id == "stereo.skin_probe") g_skin_probe = on(v);
   });
 }
 
@@ -254,27 +427,55 @@ void pass2_start() {
     hook_fn((void*)img.at(kRvaShadowPass), (void*)hk_shadowPass, (void**)&o_shadowPass, "RendererX86 shadow pass");
   if (sig_ok(kProbeSig))
     hook_fn((void*)img.at(kRvaSkyProbe), (void*)hk_skyProbe, (void**)&o_skyProbe, "sky cube probe");
+  rand_hook();
+  {
+    // renderWorld: mov rcx,[r14+0x198]; call 0x480340; exposure: movss [rdi+0xb8],xmm0;
+    // cmp byte [rdi+0xb0],0 ... movss xmm1,[rdi+0xb4]
+    static const uint8_t call[] = {0x49, 0x8b, 0x8e, 0x98, 0x01, 0x00, 0x00, 0xe8, 0xb2, 0x6f, 0xf7, 0xff};
+    static const uint8_t reset[] = {0x80, 0xbf, 0xb0, 0x00, 0x00, 0x00, 0x00};
+    static const uint8_t value[] = {0xf3, 0x0f, 0x10, 0x8f, 0xb4, 0x00, 0x00, 0x00};
+    // 0x480bf0: mov rdx,[r13+0x28]; mov rcx,[rdx+r8*8]; mov rax,[rdx+r8*8+8]; (swap the pair)
+    static const uint8_t swap[] = {0x49, 0x8b, 0x55, 0x28, 0x4a, 0x8b, 0x0c, 0xc2, 0x4a, 0x8b, 0x44,
+                                   0xc2, 0x08, 0x4a, 0x89, 0x04, 0xc2, 0x4a, 0x89, 0x4c, 0xc2, 0x08};
+    g_exposure_ok = memcmp(reinterpret_cast<const void*>(img.at(0x509382)), call, sizeof call) == 0 &&
+                    memcmp(reinterpret_cast<const void*>(img.at(0x480751)), reset, sizeof reset) == 0 &&
+                    memcmp(reinterpret_cast<const void*>(img.at(0x4808ef)), value, sizeof value) == 0 &&
+                    memcmp(reinterpret_cast<const void*>(img.at(0x4813f0)), swap, sizeof swap) == 0;
+    if (!g_exposure_ok) TB_LOG("stereo pass2: auto-exposure signature mismatch; its second-eye rewind disabled");
+  }
+  if (sig_ok(kSkinSigs[0]) && sig_ok(kSkinSigs[1]) && sig_ok(kSkinSigs[2])) {
+    hook_fn((void*)img.at(kRvaSkinPrev), (void*)hk_skinPrev, (void**)&o_skinPrev, "skin previous");
+    hook_fn((void*)img.at(kRvaSkinStale), (void*)hk_skinStale, (void**)&o_skinStale, "skin stale");
+  }
 }
 
 void pass2_eye(int slot, void* renderer) {
   if (slot == 0) {
     flare::g_before.clear();
     rewind_save(renderer);
+    g_rand.clear();
+    g_game_tid = GetCurrentThreadId();
   } else if (slot == 1) {
     rewind_restore();
   }
   g_slot = slot;
 }
 
+std::string pass2_rand_sites() { return rand_sites() + " | " + skin_status(); }
+
 std::string pass2_status() {
-  char b[320];
+  char b[480];
   snprintf(b, sizeof b,
            "skip_shadows=%d skip_probe=%d flare_rewind=%d rewind=%d shadow_skips=%llu shadow_fallbacks=%llu probe_skips=%llu "
-           "flare_first=%llu flare_rewinds=%llu rewinds=%llu regions=%d",
+           "flare_first=%llu flare_rewinds=%llu rewinds=%llu regions=%d rand_replay=%d rand_eye1=%llu rand_eye2=%llu "
+           "rand_replayed=%llu rand_miss=%llu",
            g_skip_shadows.load() ? 1 : 0, g_skip_probe.load() ? 1 : 0, g_flare_rewind.load() ? 1 : 0,
            g_rewind.load() ? 1 : 0, (unsigned long long)g_n_shadow_skip.load(), (unsigned long long)g_n_shadow_fallback.load(),
            (unsigned long long)g_n_probe_skip.load(), (unsigned long long)g_n_flare_first.load(),
-           (unsigned long long)g_n_flare_rewind.load(), (unsigned long long)g_n_rewind.load(), g_nregions);
+           (unsigned long long)g_n_flare_rewind.load(), (unsigned long long)g_n_rewind.load(), g_nregions,
+           o_rand && g_rand_replay.load() ? 1 : 0, (unsigned long long)g_n_rand[0].load(),
+           (unsigned long long)g_n_rand[1].load(), (unsigned long long)g_n_rand_replayed.load(),
+           (unsigned long long)g_n_rand_miss.load());
   return b;
 }
 

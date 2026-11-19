@@ -5,7 +5,8 @@
 // depend on the eye is done twice. This module knows which eye of the update is being rendered
 // and, for the second one:
 //  - rewinds render-side state that a render advances (lens flares' visibility average and fade,
-//    the film-grain random generator, the frame-time rings of motion blur and TAA), so the second
+//    the film-grain random generator, the frame-time rings of motion blur and TAA, the
+//    auto-exposure adaptation, the CRT rand() draws by replay), so the second
 //    eye sees what the first saw and the state advances once per update;
 //  - optionally skips eye-independent passes and reuses the first eye's results (shadow maps,
 //    the sky cube probe).
@@ -23,5 +24,7 @@ void pass2_start();     // signature checks and hooks (from start)
 void pass2_eye(int slot, void* renderer = nullptr);
 
 std::string pass2_status();
+// Debug: rand() call sites (RVA:count) recorded during the last first-eye render.
+std::string pass2_rand_sites();
 
 }  // namespace tb::stereo
