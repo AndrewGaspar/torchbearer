@@ -75,6 +75,17 @@ constexpr size_t kFar = 0xcc0;
 constexpr size_t kRendererTaa = 0x140;
 constexpr size_t kTaaPrevWorldToClip = 0x60;
 
+// --- tweakable registry (rend::BaseTweakable) ---------------------------------------------------
+// Tweakable ctor RVA 0x461320(this, name, type) appends `this` to a global array of at most 0x500
+// pointers (count at kRvaTweakCount) under a mutex. Most tweakables are function-local statics, so
+// one exists only once its owning code has run. Layout: +0x00 char* name (r::String, inline
+// buffer at +0x28), +0xa8 u32 type (0 bool, 1 float, 5 list, ...), +0xb0 value (u8 / float),
+// +0xb4 min, +0xb8 max (floats).
+constexpr uintptr_t kRvaTweakArray = 0xd386f0;
+constexpr uintptr_t kRvaTweakCount = 0xd3aef8;
+constexpr size_t kTweakType = 0xa8;
+constexpr size_t kTweakValue = 0xb0;
+
 // vtable RVAs of the View classes (to tell them apart in a census).
 constexpr uintptr_t kRvaVtblPerspectiveView = 0x751bd8;
 constexpr uintptr_t kRvaVtblView = 0x751bb8;

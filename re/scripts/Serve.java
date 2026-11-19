@@ -220,7 +220,12 @@ public class Serve extends GhidraScript {
       if (reqs == null || reqs.length == 0) { Thread.sleep(100); continue; }
       Arrays.sort(reqs);
       for (File rq : reqs) {
-        String body = Files.readString(rq.toPath());
+        String body;
+        try {
+          body = Files.readString(rq.toPath());
+        } catch (IOException e) {
+          continue;  // vanished (client gave up): skip it
+        }
         rq.delete();
         String base = rq.getName().substring(0, rq.getName().length() - 4);
         StringBuilder o = new StringBuilder();

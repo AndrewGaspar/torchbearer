@@ -57,6 +57,7 @@ struct Params {
   double convergence_m = 0.0;   // 0 = parallel
   bool swap = false;
   bool taa_in_sbs = false;  // keep the game's TAA on in sbs mode (it then blends across eyes)
+  bool objvel_in_sbs = false;  // keep object motion vectors in sbs mode (they then smear)
 };
 std::mutex g_pmu;
 Params g_p;
@@ -128,11 +129,27 @@ double eye_offset(const Params& p, int eye) {
   return p.swap ? -e : e;
 }
 
+// Measurement lever (stereo.test_pan, degrees per game update): a synthetic yaw about world up,
+// advanced once per ModeSwitch::render, so camera motion is exactly known. In alternate mode the
+// two eyes of a pair are one update apart and see the pan between them; in sbs they must not.
+double g_pan_rad = 0;
+std::atomic<double> g_pan_rate{0};
+
 void biased(const double* in, double off, double* out) {
   memcpy(out, in, sizeof(double) * 12);
-  out[9] += in[0] * off;  // position += right * off
-  out[10] += in[1] * off;
-  out[11] += in[2] * off;
+  if (g_pan_rad != 0) {  // rotate the basis rows about world Y
+    double c = std::cos(g_pan_rad), sn = std::sin(g_pan_rad);
+    for (int r = 0; r < 3; r++) {
+      double x = in[3 * r], z = in[3 * r + 2];
+      out[3 * r] = c * x + sn * z;
+      out[3 * r + 2] = -sn * x + c * z;
+    }
+    in = out;
+  }
+  double rx = in[0], ry = in[1], rz = in[2];
+  out[9] += rx * off;  // position += right * off
+  out[10] += ry * off;
+  out[11] += rz * off;
 }
 
 // Apply `off` to the main view now, from the game's own transform.
@@ -203,7 +220,7 @@ int pick_eye(const Params& p) {
 
 void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int eye) {
   double off = eye_offset(p, eye);
-  if (off != g_applied || view != g_main_view) {
+  if (off != g_applied || view != g_main_view || g_pan_rad != 0) {
     g_main_view = view;
     apply_offset(view, off);
   }
@@ -268,6 +285,38 @@ constexpr uintptr_t kRvaTaaEnable = 0x955636;   // u8, read by renderFrame (jitt
 constexpr uintptr_t kRvaTaaEnable2 = 0x955694;  // u8, set together with it by the options code
 bool g_taa_forced = false;
 uint8_t g_taa_saved[2];
+
+// Tweakable lookup by name in the engine's registry (engine.h). nullptr if not registered (yet).
+uint8_t* tweak_find(const char* name) {
+  const auto& img = game_image();
+  auto** arr = reinterpret_cast<uint8_t**>(img.at(kRvaTweakArray));
+  int n = *reinterpret_cast<int*>(img.at(kRvaTweakCount));
+  for (int i = 0; i < n && i < 0x500; i++) {
+    const char* nm = arr[i] ? *reinterpret_cast<const char**>(arr[i]) : nullptr;
+    if (nm && strcmp(nm, name) == 0) return arr[i];
+  }
+  return nullptr;
+}
+
+// Object motion vectors: skinned/moving objects keep last frame's transform from the previous
+// *render*, which in sbs is the other eye, so the eye offset reads as object velocity (the player
+// smears horizontally in both eyes; measured). Off while sbs runs.
+bool g_objvel_forced = false;
+uint8_t g_objvel_saved = 1;
+void objvel_force_off(bool off) {
+  uint8_t* t = tweak_find("TAA:Enable Object Velocity");
+  if (!t) return;
+  if (off && !g_objvel_forced) {
+    g_objvel_saved = t[kTweakValue];
+    t[kTweakValue] = 0;
+    g_objvel_forced = true;
+    TB_LOG("stereo: object velocity forced off for sbs (was %u)", g_objvel_saved);
+  } else if (!off && g_objvel_forced) {
+    t[kTweakValue] = g_objvel_saved;
+    g_objvel_forced = false;
+  }
+}
+
 void taa_force_off(bool off) {
   uint8_t* a = reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable));
   uint8_t* b = reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable2));
@@ -292,9 +341,12 @@ void taa_force_off(bool off) {
 void __fastcall hk_modeSwitchRender(void* self) {
   if (census_on()) census("ModeSwitch::render enter ret=%#llx", (unsigned long long)rva(__builtin_return_address(0)));
   Params p = params();
+  double rate = g_pan_rate.load();
+  g_pan_rad = rate != 0 ? g_pan_rad + rate * M_PI / 180.0 : 0;
   bool world = present_frame() - g_last_render_present.load() < 8;
   bool sbs = p.mode == Mode::Sbs && world;
   taa_force_off(sbs && !p.taa_in_sbs);
+  objvel_force_off(sbs && !p.objvel_in_sbs);
   if (!sbs) {
     o_modeSwitchRender(self);
   } else {
@@ -434,8 +486,59 @@ void register_feature() {
     else if (id == "stereo.separation") g_p.separation_mm = atof(v.c_str());
     else if (id == "stereo.convergence") g_p.convergence_m = atof(v.c_str());
     else if (id == "stereo.swap_eyes") g_p.swap = (v == "1" || v == "true");
+    else if (id == "stereo.test_pan") g_pan_rate = atof(v.c_str());
     else if (id == "stereo.taa") g_p.taa_in_sbs = (v == "1" || v == "true");
+    else if (id == "stereo.object_velocity") g_p.objvel_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
+  });
+  // quiver lab call awr tweak list [SUBSTR] | tweak NAME [VALUE]: the engine's tweakable registry.
+  lab_verb("tweak", [](const std::vector<std::string>& a, bool& ok) -> std::string {
+    if (a.empty()) {
+      ok = false;
+      return json_str("usage: tweak list [SUBSTR] | tweak NAME [VALUE]");
+    }
+    auto describe = [](uint8_t* t) {
+      char b[256];
+      unsigned type = *reinterpret_cast<unsigned*>(t + kTweakType);
+      const char* nm = *reinterpret_cast<const char**>(t);
+      if (type == 0) snprintf(b, sizeof b, "%s = %u (bool)", nm, t[kTweakValue]);
+      else if (type == 1)
+        snprintf(b, sizeof b, "%s = %g (float %g..%g)", nm, *reinterpret_cast<float*>(t + kTweakValue),
+                 *reinterpret_cast<float*>(t + kTweakValue + 4), *reinterpret_cast<float*>(t + kTweakValue + 8));
+      else snprintf(b, sizeof b, "%s (type %u, raw %08x)", nm, type, *reinterpret_cast<unsigned*>(t + kTweakValue));
+      return std::string(b);
+    };
+    if (a[0] == "list") {
+      const auto& img = game_image();
+      auto** arr = reinterpret_cast<uint8_t**>(img.at(kRvaTweakArray));
+      int n = *reinterpret_cast<int*>(img.at(kRvaTweakCount));
+      std::string r = "[";
+      bool first = true;
+      for (int i = 0; i < n && i < 0x500; i++) {
+        if (!arr[i]) continue;
+        std::string d = describe(arr[i]);
+        if (a.size() > 1 && d.find(a[1]) == std::string::npos) continue;
+        r += (first ? "" : ",") + json_str(d);
+        first = false;
+      }
+      return r + "]";
+    }
+    uint8_t* t = tweak_find(a[0].c_str());
+    if (!t) {
+      ok = false;
+      return json_str("no tweakable named " + a[0] + " (not registered yet?)");
+    }
+    if (a.size() > 1) {
+      unsigned type = *reinterpret_cast<unsigned*>(t + kTweakType);
+      if (type == 0) t[kTweakValue] = uint8_t(atoi(a[1].c_str()) != 0);
+      else if (type == 1) *reinterpret_cast<float*>(t + kTweakValue) = float(atof(a[1].c_str()));
+      else {
+        ok = false;
+        return json_str("only bool and float tweakables can be set");
+      }
+      TB_LOG("tweak %s set by lab", describe(t).c_str());
+    }
+    return json_str(describe(t));
   });
   // quiver lab call awr stereo [status | census N | shots N TAG [SKIP] | files]
   lab_verb("stereo", [](const std::vector<std::string>& a, bool& ok) -> std::string {
