@@ -1,6 +1,8 @@
 build/
 compile_commands.json
-re/ghidra/
+re/ghidra*/
+.claude/
+re/*.txt
 re/*.exe
 re/*.log
 *.bak

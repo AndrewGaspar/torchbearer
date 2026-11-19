@@ -13,6 +13,11 @@ owner = "quiver"
 reload = "poll"
 
 [[page]]
+id = "startup"
+title = "Startup"
+options = ["intro.skip_startup_video", "intro.skip_logo_screens", "intro.skip_epilepsy_warning"]
+
+[[page]]
 id = "diagnostics"
 title = "Diagnostics"
 options = ["log.verbose"]
@@ -23,3 +28,27 @@ label = "Verbose log"
 help = "Writes more detail to torchbearer.log."
 level = "debug"
 apply = "live"
+
+[option."intro.skip_startup_video"]
+type = "bool"
+label = "Skip the Remedy logo video"
+help = "Boots without the 5-second Remedy video."
+default = true
+level = "basic"
+apply = "restart"
+
+[option."intro.skip_logo_screens"]
+type = "bool"
+label = "Skip the logo screens"
+help = "Boots without the Epic Games logo and the partner logos / rights notice (3 seconds each)."
+default = true
+level = "basic"
+apply = "restart"
+
+[option."intro.skip_epilepsy_warning"]
+type = "bool"
+label = "Skip the photosensitivity warning"
+help = "Boots without the 6-second epilepsy warning screen."
+default = true
+level = "basic"
+apply = "restart"
