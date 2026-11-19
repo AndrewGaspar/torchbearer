@@ -303,6 +303,7 @@ uint8_t* tweak_find(const char* name) {
 bool g_objvel_forced = false;
 uint8_t g_objvel_saved = 1;
 void objvel_force_off(bool off) {
+  if (off == g_objvel_forced) return;  // nothing to change (no registry scan per frame)
   uint8_t* t = tweak_find("TAA:Enable Object Velocity");
   if (!t) return;
   if (off && !g_objvel_forced) {
