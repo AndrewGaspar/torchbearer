@@ -4,8 +4,9 @@
 // state that is stepped per renderWorld call would step twice per update, and work that does not
 // depend on the eye is done twice. This module knows which eye of the update is being rendered
 // and, for the second one:
-//  - rewinds per-object temporal state that a render advances (lens flares' visibility average
-//    and fade), so the second eye sees what the first saw and the state advances once per update;
+//  - rewinds render-side state that a render advances (lens flares' visibility average and fade,
+//    the film-grain random generator, the frame-time rings of motion blur and TAA), so the second
+//    eye sees what the first saw and the state advances once per update;
 //  - optionally skips eye-independent passes and reuses the first eye's results (shadow maps,
 //    the sky cube probe).
 // Outside the view path (slot -1) every hook is a pass-through.
@@ -18,7 +19,8 @@ void pass2_start();     // signature checks and hooks (from start)
 
 // Which eye of this update renderFrame is about to render: 0 = first, 1 = second, -1 = not a
 // view-path sbs update.
-void pass2_eye(int slot);
+// `renderer` is the RendererX86 (renderFrame's this).
+void pass2_eye(int slot, void* renderer = nullptr);
 
 std::string pass2_status();
 

@@ -146,6 +146,68 @@ void __fastcall hk_skyProbe(void* self, void* view) {
 
 bool on(const std::string& v) { return v == "1" || v == "true"; }
 
+// --- rewound memory ------------------------------------------------------------------------------
+// Render-side state that each renderWorld call advances and that the second eye must see exactly
+// as the first eye saw it: snapshotted when the first eye starts, put back when the second starts
+// (the second eye then advances it identically, so it ends as the first eye left it). (static)
+//  - the post-process object's Mersenne Twister (RendererX86+0x118, +0xa8, 624 words + index at
+//    +0x9c0; 0x532030 draws g_vRandomOffset, the film-grain offset, from it every render);
+//  - the motion-blur frame-time ring (0x470750: globals idx 0x955618, count 0x95561c, capacity
+//    0x955620, float* 0x955628) and the TAA one (0x49a8c0: 0x955850 / 0x955854 / 0x955858 /
+//    0x955860): each render pushes the frame time, so the second eye's average differs.
+constexpr size_t kRendererPost = 0x118, kPostRng = 0xa8, kRngSize = 0x9c4;
+constexpr uintptr_t kRvaBlurRing = 0x955618, kRvaTaaRing = 0x955850;  // {int idx, count, cap; float* ring}
+std::atomic<bool> g_rewind{true};
+std::atomic<uint64_t> g_n_rewind{0};
+struct Region {
+  uint8_t* p = nullptr;
+  size_t n = 0;
+  void** guard = nullptr;  // restored only while *guard still equals guard_val
+  void* guard_val = nullptr;
+  uint8_t buf[0xa00];
+};
+Region g_regions[5];
+int g_nregions = 0;
+void save_region(void* p, size_t n, void** guard = nullptr) {
+  if (!p || n > sizeof g_regions[0].buf || g_nregions >= 5 || IsBadReadPtr(p, n)) return;
+  auto& r = g_regions[g_nregions++];
+  r.p = static_cast<uint8_t*>(p);
+  r.n = n;
+  r.guard = guard;
+  r.guard_val = guard ? *guard : nullptr;
+  memcpy(r.buf, p, n);
+}
+// A frame-time ring {int idx, count, capacity; float* ring}: only the index, the count and the
+// samples are put back, and only while the ring is still the one that was saved (it is allocated
+// lazily on first use, which can happen during the first eye: live crash when motion blur was
+// switched on with the whole header rewound).
+void save_ring(uintptr_t rva) {
+  auto* hdr = reinterpret_cast<uint8_t*>(game_image().at(rva));
+  int cap = *reinterpret_cast<int*>(hdr + 8);
+  void** ptr = reinterpret_cast<void**>(hdr + 0x10);
+  if (!*ptr || cap <= 0 || cap > 256) return;
+  save_region(hdr, 8, ptr);
+  save_region(*ptr, sizeof(float) * size_t(cap), ptr);
+}
+void rewind_save(void* renderer) {
+  g_nregions = 0;
+  if (!g_rewind.load(std::memory_order_relaxed)) return;
+  if (renderer && !IsBadReadPtr(static_cast<uint8_t*>(renderer) + kRendererPost, 8)) {
+    auto* post = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(renderer) + kRendererPost);
+    if (post) save_region(post + kPostRng, kRngSize);
+  }
+  save_ring(kRvaBlurRing);
+  save_ring(kRvaTaaRing);
+}
+void rewind_restore() {
+  for (int i = 0; i < g_nregions; i++) {
+    auto& r = g_regions[i];
+    if (r.guard && *r.guard != r.guard_val) continue;
+    memcpy(r.p, r.buf, r.n);
+  }
+  if (g_nregions) g_n_rewind++;
+}
+
 }  // namespace
 
 void pass2_register() {
@@ -153,6 +215,7 @@ void pass2_register() {
     if (id == "stereo.skip_shadows") g_skip_shadows = on(v);
     else if (id == "stereo.skip_probe") g_skip_probe = on(v);
     else if (id == "stereo.flare_rewind") g_flare_rewind = on(v);
+    else if (id == "stereo.rewind") g_rewind = on(v);
   });
 }
 
@@ -166,19 +229,25 @@ void pass2_start() {
     hook_fn((void*)img.at(kRvaSkyProbe), (void*)hk_skyProbe, (void**)&o_skyProbe, "sky cube probe");
 }
 
-void pass2_eye(int slot) {
-  if (slot == 0) flare::g_before.clear();
+void pass2_eye(int slot, void* renderer) {
+  if (slot == 0) {
+    flare::g_before.clear();
+    rewind_save(renderer);
+  } else if (slot == 1) {
+    rewind_restore();
+  }
   g_slot = slot;
 }
 
 std::string pass2_status() {
-  char b[256];
+  char b[320];
   snprintf(b, sizeof b,
-           "skip_shadows=%d skip_probe=%d flare_rewind=%d shadow_skips=%llu probe_skips=%llu flare_first=%llu "
-           "flare_rewinds=%llu",
+           "skip_shadows=%d skip_probe=%d flare_rewind=%d rewind=%d shadow_skips=%llu probe_skips=%llu "
+           "flare_first=%llu flare_rewinds=%llu rewinds=%llu regions=%d",
            g_skip_shadows.load() ? 1 : 0, g_skip_probe.load() ? 1 : 0, g_flare_rewind.load() ? 1 : 0,
-           (unsigned long long)g_n_shadow_skip.load(), (unsigned long long)g_n_probe_skip.load(),
-           (unsigned long long)g_n_flare_first.load(), (unsigned long long)g_n_flare_rewind.load());
+           g_rewind.load() ? 1 : 0, (unsigned long long)g_n_shadow_skip.load(),
+           (unsigned long long)g_n_probe_skip.load(), (unsigned long long)g_n_flare_first.load(),
+           (unsigned long long)g_n_flare_rewind.load(), (unsigned long long)g_n_rewind.load(), g_nregions);
   return b;
 }
 

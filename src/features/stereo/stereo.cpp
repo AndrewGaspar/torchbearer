@@ -212,6 +212,21 @@ void __fastcall hk_setPostProjection(void* view, const double* m) {
   o_setPostProjection(view, m);
 }
 
+// CPU time on the game thread (QueryPerformanceCounter), accumulated for the status verb: whole
+// updates (ModeSwitch::render, including its 240 fps pacing spin), the scene renders of the first
+// and second eye of an update (mono: first), endFrame (submission + Present).
+std::atomic<uint64_t> g_us_update{0}, g_us_eye[2] = {}, g_us_end{0}, g_n_timed{0};
+uint64_t now_us() {
+  static LARGE_INTEGER f = [] {
+    LARGE_INTEGER x;
+    QueryPerformanceFrequency(&x);
+    return x;
+  }();
+  LARGE_INTEGER c;
+  QueryPerformanceCounter(&c);
+  return uint64_t(c.QuadPart * 1000000 / f.QuadPart);
+}
+
 // sbs: which of the two engine frames of this game update is being rendered (0 = not in sbs).
 std::atomic<int> g_pass{0};
 std::atomic<uint64_t> g_last_render_present{0};
@@ -221,7 +236,6 @@ bool g_view_update = false;  // game thread only
 bool g_view_done = false;    // both eyes rendered in this update
 std::atomic<bool> g_view_present{false};  // the next Present is a view-path sbs frame
 std::atomic<IDXGISwapChain*> g_sc{nullptr};  // the game's swapchain (last presented)
-
 int pick_eye(const Params& p) {
   switch (p.mode) {
     case Mode::Sbs: return g_pass == 1 ? -1 : g_pass == 2 ? 1 : 0;
@@ -279,15 +293,36 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
 // The left eye then renders into the same columns, the stash goes into the second half, and
 // everything drawn into the back buffer after this (HUD, overlays) is duplicated into the second
 // half by cmdlist.cpp until Present.
+std::atomic<bool> g_view_kick{true};  // stereo.view_kick
+std::atomic<uint64_t> g_kicks{0};
+void engine_kick() {
+  const auto& img = game_image();
+  void* dev = *reinterpret_cast<void**>(img.at(kRvaDevicePtr));
+  if (!dev) return;
+  void* fn = (*reinterpret_cast<void***>(dev))[kDeviceKickSlot];
+  if (reinterpret_cast<uintptr_t>(fn) != img.at(kRvaDeviceKick)) return;  // not the device we know
+  reinterpret_cast<Void1_t>(fn)(dev);
+  g_kicks++;
+}
+
 void render_view_sbs(void* r, void* view, void* a3, void* a4, const Params& p) {
   g_view_done = true;
   IDXGISwapChain* sc = g_sc.load();
-  pass2_eye(0);
+  pass2_eye(0, r);
+  uint64_t t0 = now_us();
   render_eye(r, view, a3, a4, p, 1);
+  uint64_t t1 = now_us();
+  g_us_eye[0] += t1 - t0;
   bool stashed = sc && gpu_stash_mid(sc, 1);
+  // The engine submits a render's lists in two batches: at its kick inside renderWorld and in
+  // endFrame. Kick now, so the first eye's second batch (lighting, post and the stash copy just
+  // recorded into it) reaches the GPU before the second eye is recorded, not halfway through it.
+  if (g_view_kick.load()) engine_kick();
   if (census_on()) census("view sbs: right eye rendered, stashed=%d", stashed);
-  pass2_eye(1);
+  pass2_eye(1, r);
+  t0 = now_us();
   render_eye(r, view, a3, a4, p, -1);
+  g_us_eye[1] += now_us() - t0;
   pass2_eye(-1);
   bool placed = false;
   if (stashed && present_width_scale(sc) >= 2 && gpu_put_mid(sc, 1)) {
@@ -315,7 +350,9 @@ void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
   Params p = params();
   if (p.mode == Mode::Off && g_applied == 0) {
     g_main_view = view;
+    uint64_t t0 = now_us();
     o_renderFrame(r, view, a3, a4);
+    g_us_eye[0] += now_us() - t0;
     g_render_frames++;
     if (census_on()) census("renderFrame leave");
     return;
@@ -324,7 +361,9 @@ void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
     render_view_sbs(r, view, a3, a4, p);
     return;
   }
+  uint64_t t0 = now_us();
   render_eye(r, view, a3, a4, p, pick_eye(p));
+  g_us_eye[g_pass == 2 ? 1 : 0] += now_us() - t0;
   if (census_on()) census("renderFrame leave");
 }
 
@@ -400,6 +439,7 @@ void __fastcall hk_modeSwitchRender(void* self) {
   IDXGISwapChain* sc = g_sc.load();
   bool view = sbs && p.path == SbsPath::View && sc && cmdlist_install(sc);
   cmdlist_track(view);
+  uint64_t t0 = now_us();
   if (!sbs) {
     o_modeSwitchRender(self);
   } else if (view) {
@@ -417,6 +457,8 @@ void __fastcall hk_modeSwitchRender(void* self) {
     g_pass = 0;
     g_sbs_updates++;
   }
+  g_us_update += now_us() - t0;
+  g_n_timed++;
   if (census_on()) census("ModeSwitch::render leave");
 }
 char __fastcall hk_beginFrame(void* self) {
@@ -426,7 +468,9 @@ char __fastcall hk_beginFrame(void* self) {
 }
 void __fastcall hk_endFrame(void* self) {
   if (census_on()) census("Renderer::endFrame enter ret=%#llx", (unsigned long long)rva(__builtin_return_address(0)));
+  uint64_t t0 = now_us();
   o_endFrame(self);
+  g_us_end += now_us() - t0;
   if (census_on()) census("Renderer::endFrame leave");
 }
 
@@ -544,12 +588,15 @@ std::string status_json() {
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"sbs_path\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,"
            "\"main_view\":\"%p\",\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,"
-           "\"present\":%llu,\"taa_forced_off\":%s,\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\"}",
+           "\"present\":%llu,\"taa_forced_off\":%s,\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\","
+           "\"kicks\":%llu,\"timed_updates\":%llu,\"us_update\":%llu,\"us_eye1\":%llu,\"us_eye2\":%llu,\"us_endframe\":%llu}",
            mode_name(p.mode), p.path == SbsPath::View ? "view" : "frame", p.separation_mm, p.convergence_m,
            p.swap ? "true" : "false", g_main_view, g_applied, (unsigned long long)g_frames_biased.load(),
            (unsigned long long)g_render_frames.load(), (unsigned long long)g_sbs_updates.load(),
            (unsigned long long)present_frame(), g_taa_forced ? "true" : "false", gpu_status().c_str(),
-           cmdlist_status().c_str(), pass2_status().c_str());
+           cmdlist_status().c_str(), pass2_status().c_str(), (unsigned long long)g_kicks.load(), (unsigned long long)g_n_timed.load(),
+           (unsigned long long)g_us_update.load(), (unsigned long long)g_us_eye[0].load(),
+           (unsigned long long)g_us_eye[1].load(), (unsigned long long)g_us_end.load());
   return b;
 }
 
@@ -569,6 +616,7 @@ void register_feature() {
     else if (id == "stereo.object_velocity") g_p.objvel_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
     else if (id == "stereo.sbs_path") g_p.path = v == "frame" ? SbsPath::Frame : SbsPath::View;
+    else if (id == "stereo.view_kick") g_view_kick = (v == "1" || v == "true");
   });
   // Back buffers and their RTVs (bookkeeping only; cmdlist.cpp needs them to recognise the back
   // buffer in command lists when sbs_path = view is used).

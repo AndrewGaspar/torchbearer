@@ -185,6 +185,12 @@ void STDMETHODCALLTYPE hk_rsSetScissorRects(ID3D12GraphicsCommandList* l, UINT n
 
 // Called after the original draw. Returns true if the caller should draw again (state shifted).
 // On true, `restore` gets the list state to put back after the second draw.
+// Hot path (every draw of the frame): nothing to do unless tracing, or duplicating on this thread
+// (the overlay phase only).
+inline bool dup_wanted() {
+  return g_trace.load(std::memory_order_relaxed) ||
+         (g_dx.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_tid.load(std::memory_order_relaxed));
+}
 bool before_dup(ID3D12GraphicsCommandList* l, ListState& restore) {
   std::lock_guard lk(g_mu);
   auto it = g_lists.find(l);
@@ -228,7 +234,7 @@ void unshift(ID3D12GraphicsCommandList* l, const ListState& s) {
 
 void STDMETHODCALLTYPE hk_drawInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, UINT d) {
   o_drawInstanced(l, a, b, c, d);
-  if (!active()) return;
+  if (!dup_wanted()) return;
   ListState s;
   if (!before_dup(l, s)) return;
   shift_and(l, s, g_dx);
@@ -239,7 +245,7 @@ void STDMETHODCALLTYPE hk_drawInstanced(ID3D12GraphicsCommandList* l, UINT a, UI
 
 void STDMETHODCALLTYPE hk_drawIndexedInstanced(ID3D12GraphicsCommandList* l, UINT a, UINT b, UINT c, INT d, UINT e) {
   o_drawIndexedInstanced(l, a, b, c, d, e);
-  if (!active()) return;
+  if (!dup_wanted()) return;
   ListState s;
   if (!before_dup(l, s)) return;
   shift_and(l, s, g_dx);
