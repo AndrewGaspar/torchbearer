@@ -91,17 +91,20 @@ void* window_obj() { return *reinterpret_cast<void**>(game_image().at(kRvaWindow
 
 bool active() { return g_active.load(std::memory_order_relaxed); }
 
-// The engine's size (one eye), as the game last asked for it in create/resize. The real client
-// is 2x that, unless that would not fit the screen: then the request is the real size and the
-// engine gets half (borderless/fullscreen at a 3840x1080 desktop -> 1920x1080 per eye).
+// The engine's size (one eye): what the game last asked for in create/resize, i.e. its own
+// resolution setting (borderless: half the desktop, see hk_monitorMode). The real client is 2x
+// that. It is never halved here: the game copies its window's size back into its resolution on
+// the next resize request, so a window object that disagrees with the resolution setting makes
+// them chase each other (an earlier "halve when 2x doesn't fit" rule shrank a 1920 display's
+// window to 160x240; live, awr-pass).
 std::atomic<int> g_engine_w{0}, g_engine_h{0};
 std::atomic<bool> g_rewiden{false};
+std::atomic<bool> g_wm_refused{false};  // the window manager kept the window smaller than 2x
 
 void set_engine_size(int w, int h) {
-  int screen = GetSystemMetrics(SM_CXSCREEN);
-  int ew = (screen > 0 && 2 * w > screen) ? w / 2 : w;
-  g_engine_w = ew;
+  g_engine_w = w;
   g_engine_h = h;
+  g_wm_refused = false;  // a new request: try again
 }
 
 // What WM_SIZE tells the game for a real client width.
@@ -109,9 +112,10 @@ int engine_w(int real) {
   int ew = g_engine_w.load();
   if (ew > 0 && real == 2 * ew) return ew;
   if (ew > 0 && real == ew) {  // something set the window to the engine's size: widen it again
-    g_rewiden = true;
+    if (!g_wm_refused) g_rewiden = true;
     return ew;
   }
+  if (ew > 0 && g_wm_refused) return ew;  // a window manager constraint, not a player resize
   // Any other size (the player resized the window, maximise, a desktop change): eyes are half.
   ew = real / 2;
   if (ew > 0) g_engine_w = ew;
@@ -143,6 +147,14 @@ void widen(void* win) {
     }
     SetWindowPos(hwnd, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
     g_widened++;
+    RECT got{};
+    GetClientRect(hwnd, &got);
+    if (got.right - got.left != want || got.bottom - got.top != h) {
+      g_wm_refused = true;
+      TB_LOG("stereo window: the window manager kept the client at %ldx%ld (wanted %dx%d); the engine stays at "
+             "%dx%d and the side-by-side image is scaled into the window",
+             got.right - got.left, got.bottom - got.top, want, h, w, h);
+    }
     TB_LOG("stereo window: mode %d, engine %dx%d, window client -> %dx%d (outer %dx%d at %d,%d)", mode, w, h, want,
            h, cx, cy, x, y);
   }
