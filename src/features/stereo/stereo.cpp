@@ -400,6 +400,49 @@ float* __fastcall hk_invres(void* display, float* out) {
   return r;
 }
 
+// Bink videos (main-menu backdrop, cutscenes): the 2D renderer's video quad (command type 5,
+// executed in 0x466af0) fits the video by comparing the video's aspect with the REAL viewport's
+// (the renderer's screen-size globals 0xd745f8/fc, also the shaders' g_vScreenRes, so not something
+// to fake): a 16:9 video on the half-width eye (0.889) was letterboxed to half height, i.e. 32:9
+// after the compositor's stretch (live, in the glasses). The quad is recorded by one function only
+// (0x464c00, from the video draw 0x338b10) with the video's aspect and an aspect bound as its 8th
+// and 9th arguments; in hsbs both are halved, so the fit sees the squeezed eye's own shape and the
+// video fills it.
+constexpr uintptr_t kRvaVideoQuad = 0x464c00;
+constexpr uint8_t kSigVideoQuad[16] = {0x4c, 0x8b, 0xdc, 0x49, 0x89, 0x5b, 0x08, 0x49,
+                                       0x89, 0x73, 0x10, 0x57, 0x48, 0x83, 0xec, 0x70};
+using VideoQuad_t = void(__fastcall*)(void*, void*, void*, void*, void*, uint32_t, uint8_t, float, float, float,
+                                      float, float);
+VideoQuad_t o_videoQuad;
+std::atomic<uint64_t> g_video_quads{0};
+void __fastcall hk_videoQuad(void* ctx, void* uv, void* cb, void* user, void* tex, uint32_t a6, uint8_t a7,
+                             float aspect, float bound, float a10, float a11, float a12) {
+  if (g_ana_on.load(std::memory_order_relaxed)) {
+    aspect *= 0.5f;
+    bound *= 0.5f;
+    g_video_quads++;
+  }
+  o_videoQuad(ctx, uv, cb, user, tex, a6, a7, aspect, bound, a10, a11, a12);
+}
+
+// The 2D context's aspect (+0x70) is written from the getter only at boot (0x2ab8f0) and when some
+// menus open (0x249690, 0x24b4e0). The game boots at its saved resolution (often 1440x900) and only
+// then switches to borderless, so screens that never rewrite it (the title screen) keep the boot
+// value: with the doubled getter 2 x 1.6 = 3.2, text half as wide as it should be (live). In hsbs
+// the mod rewrites it every frame from the game's own getter (Game::aspect, 0x1d23d0), i.e. the
+// value those menus would write.
+constexpr uintptr_t kRvaGameAspect = 0x1d23d0;
+constexpr uintptr_t kRva2DContext = 0xd6b598;
+constexpr uint8_t kSigGameAspect[9] = {0x48, 0x83, 0xec, 0x28, 0xe8, 0x57, 0xe2, 0x00, 0x00};
+bool g_ui_aspect_ok = false;
+void refresh_ui_aspect() {
+  if (!g_ui_aspect_ok || !g_ana_on.load(std::memory_order_relaxed) || !g_aspect_hooked.load()) return;
+  auto* ctx = *reinterpret_cast<uint8_t**>(game_image().at(kRva2DContext));
+  if (!ctx) return;
+  float a = reinterpret_cast<float(__fastcall*)()>(game_image().at(kRvaGameAspect))();
+  if (a > 0.1f && a < 10.f) *reinterpret_cast<float*>(ctx + 0x70) = a;
+}
+
 float g_ana_orig_fov = 0, g_ana_orig_aspect = 0, g_ana_set_fov = -1, g_ana_set_aspect = -1;
 std::atomic<uint64_t> g_ana_applied{0};
 void anamorphic_apply(void* view) {
@@ -612,6 +655,7 @@ std::string g_shot_dir;
 std::vector<std::string> g_shot_files;
 
 void on_present(IDXGISwapChain* sc, uint64_t frame) {
+  refresh_ui_aspect();  // game thread, before the next frame's 2D drawing
   g_sc = sc;
   static bool ecl_hooked = false;
   if (!ecl_hooked) {
@@ -900,6 +944,12 @@ void start() {
   if (!(memcmp(reinterpret_cast<const void*>(img.at(kRvaInvRes)), kSigInvRes, sizeof kSigInvRes) == 0 &&
         hook_fn((void*)img.at(kRvaInvRes), (void*)hk_invres, (void**)&o_invres, "DisplaySettings::invResolution")))
     TB_LOG("stereo: inverse-resolution getter not hooked; pixel-sized UI stays twice as wide in hsbs");
+  if (!(memcmp(reinterpret_cast<const void*>(img.at(kRvaVideoQuad)), kSigVideoQuad, sizeof kSigVideoQuad) == 0 &&
+        hook_fn((void*)img.at(kRvaVideoQuad), (void*)hk_videoQuad, (void**)&o_videoQuad, "Draw2D::videoQuad")))
+    TB_LOG("stereo: video quad not hooked; videos stay letterboxed to half height in hsbs");
+  g_ui_aspect_ok = memcmp(reinterpret_cast<const void*>(img.at(kRvaGameAspect)), kSigGameAspect,
+                          sizeof kSigGameAspect) == 0;
+  if (!g_ui_aspect_ok) TB_LOG("stereo: Game::aspect signature mismatch; the UI aspect is not refreshed per frame");
   g_hooked = true;
   TB_LOG("stereo: hooks installed");
 }

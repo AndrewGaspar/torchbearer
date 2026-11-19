@@ -138,6 +138,22 @@ game itself (the camera-only `anamorphic_apply` now stands down; it remains the 
 getter's signature changes), and stretched captures of the pause menu and the level-15 HUD match
 the full-resolution layout element for element.
 
+**Videos and the title screen (fixed in 0.4.8; static + live).**
+- Bink videos (main-menu backdrop, cutscenes) were letterboxed to half height in hsbs, i.e. 32:9
+  in the glasses (user report). The 2D renderer's video quad (command type 5, executed in
+  `0x466af0`) fits the video by comparing its aspect with the real viewport's (the renderer's
+  screen-size globals `0xd745f8`/`fc`, also the shaders' `g_vScreenRes`): 1.778 vs 0.889 → height
+  × 0.5. The quad is recorded by one function only (`0x464c00`, from the video draw `0x338b10`,
+  which cutscenes call with a hard-coded 16:9); in hsbs its aspect arguments (8th and 9th) are
+  halved, so the fit matches the squeezed eye. Live: the title video fills the eye; the opening
+  cutscene's picture rows (its own scope bars) are identical to a stereo-off capture (64-472 of 540).
+- The title screen's text came out half as wide: the 2D context's aspect (`+0x70`) is set from the
+  getter at boot (when the game is still at its saved 1440x900, 1.6 → doubled 3.2) and only
+  refreshed by some menus, never by the title screen. In hsbs the mod rewrites it each frame from
+  `Game::aspect` (`0x1d23d0`); live: 1.778 at the title, and its text matches stereo-off.
+- Not covered: the 2D executor's type-4 quad also letterboxes against a hard-coded 16:9; no screen
+  seen so far uses it.
+
 ![hsbs pause menu, stretched as in the glasses](img/stereo-hsbs-menu.jpg)
 
 ![HUD: full-resolution eye (top) vs hsbs eye stretched 2x (bottom)](img/stereo-hsbs-hud.jpg)
