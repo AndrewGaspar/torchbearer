@@ -146,8 +146,8 @@ briefly carries a random marker until the compositor's client list shows it, the
 
 Verified end to end with a self-test program (same hyprland.cpp) on the live session under Wine's
 Wayland driver, both via bare `wine` and via GE-Proton's `proton run`: tag applied (visible in
-`j/clients` tags), then cleared. Not verifiable from the agent shell: the X11 driver (no X
-authority there). The user's config maps the tag (hyprland-xr.lua, 2026-11-19: generic
+`j/clients` tags), then cleared; and, once the desktop's `:0` socket was repaired (below), under
+Wine's X11 driver too (`proton run` with `winewayland.drv=d`: an XWayland client, tagged, cleared). The user's config maps the tag (hyprland-xr.lua, 2026-11-19: generic
 `stereo-<layout>` → `stereo <layout> always`; mpv's float split into its own rule).
 
 ### Open: Wine's Wayland driver vs HypXRland's crop
