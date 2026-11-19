@@ -35,6 +35,7 @@ add_library(torchbearer SHARED
   src/features/stereo/window.cpp
   src/features/stereo/eyestate.cpp
   src/features/stereo/temporal.cpp
+  src/features/stereo/dlss.cpp
   src/features/intro.cpp
   src/features/settings.cpp
   src/features/settings_keys.cpp

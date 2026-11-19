@@ -135,7 +135,9 @@ constexpr size_t kObjectPrevWorldEnd = 0xe8;
 // DLSS feature lives in the D3D12 device object (global kRvaDevice, rend::DeviceD3D12PC vtable
 // 0x790f58): handle at +0x38a8, created by 0x4a7080 from vtable slot 45 (0x4a6660, re-creates on
 // mode / resolution change, old handle to +0x38b0 for release), evaluated by slot 46 (0x4a67b0),
-// whose parameter block always passes Reset = 0: `mov dword [rsp+0x68], 0` at 0x4a6ad1.
+// whose parameter block always passes Reset = 0: `mov dword [rsp+0x68], 0` at 0x4a6ad1. The
+// right eye's own feature (dlss.cpp) swaps the device's handle/key per eye; the Reset patch is the
+// fallback.
 constexpr uintptr_t kRvaDlssMode = 0xd75620;
 constexpr uintptr_t kRvaDevice = 0xda35e0;
 constexpr size_t kDeviceDlssHandle = 0x38a8;

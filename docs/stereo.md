@@ -16,15 +16,16 @@ camera matrices (camera and object motion vectors), the TAA jitter phase (one pe
 both eyes) and the objects' previous transforms, so TAA and object motion blur stay on in sbs
 (measured: the disparity field with TAA on matches the TAA-off one, no cross-eye blending); so are
 the volumetric-light, SSAO and Taken-shade histories (section 5: a shared volumetric history had
-flattened the fog's disparity by ~45 %). DLSS has
-one feature, so in sbs it is reset every frame (safe, but soft); a DLSS feature per eye is
-specified, not built. **Both eyes now render inside one engine frame** by default (`sbs_path =
+flattened the fog's disparity by ~45 %). DLSS
+gets a second NGX feature for the right eye, so each eye accumulates its own history (measured:
+disparity field as with TAA off, sharpness as mono DLSS; the old reset-every-frame is the
+fallback). **Both eyes now render inside one engine frame** by default (`sbs_path =
 view`, section 6): `renderFrame` twice inside one `ModeSwitch::render`, beginFrame/endFrame, HUD and
 Present once per update, the HUD duplicated into both halves, render-side state that a render
 advances rewound or replayed for the second eye (separation-0 halves 0.001-0.008/255 apart in
 prologue-road, the bird attack in forest-night ~0.01-0.02/255), and optionally the
 sky probe reused for the second eye (`skip_probe`; shadow-map reuse, +10 % fps, is opt-in until the flashlight issue in section 6 is solved). What
-is not done: per-eye DLSS, HUD depth and a half-SBS (squeezed) output. Convergence in full SBS
+is not done: HUD depth. Convergence in full SBS
 is a per-eye image shift in the compositor (section 6, "Convergence as image shift"), which TAA
 cannot undo.
 
@@ -331,7 +332,7 @@ configured 2 × 32.5 mm.
 | TAA history (`pTAAHistoryRT0/1`, `TAA Mask 0/1`, index RendererX86+0x2e8) | eye N resolves against eye N-1's image: the disparity collapses (measured, section 5) | **done**: right eye gets its own pool RTs (renamed in the pool allocator) and each eye its own ping-pong index | — |
 | camera motion vectors (TAA+0x60, vector blur +0x60) | the eye offset reads as camera velocity: motion blur smears the whole frame | **done**: per-eye copies swapped around each eye's renderFrame | — |
 | object motion vectors (View+0x88/+0x108 previous camera; object +0xb8 previous world) | the eye offset reads as object velocity: the player smears (captured); the second eye had no object motion at all (measured) | **done**: per-eye previous View matrices; objects keep the previous update's transform for the second eye; skinned animation right in both eyes on the view path (measured, section 5) | frame path: skinned animation velocity still zero for the second eye |
-| DLSS (`0xd75620`, one NGX feature at device+0x38a8) | one history for both eyes: the disparity collapses (measured) | **reset every frame** while sbs runs (no cross-eye blending, but no accumulation: soft) | one DLSS feature per eye (section 5) |
+| DLSS (`0xd75620`, one NGX feature at device+0x38a8) | one history for both eyes: the disparity collapses (measured) | **done**: a second feature for the right eye, swapped into the device per eye (section 5); reset every frame as the fallback | — |
 | frame counters (`0xb188d8`, `0xd744f8`) | advance twice per update: jitter sequence and anything keyed on frame parity runs at 2x | jitter: renderFrame is lent a per-update counter (same jitter for both eyes); the rest unchanged | pin per update once beginFrame runs once per update |
 | auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | the separation-0 residual (0.81/255) was film grain (random offset per render), the motion-blur/TAA frame-time rings and lens flares | **done in the view path** (section 6): rewound for the second eye (also the auto-exposure adaptation), rand() replayed, residual 0.001-0.008/255 |
 | SSAO / volumetric light / Taken shade temporal buffers (RendererX86+0x130/+0x170/+0x1b0) | one history for both eyes: shafts and AO blend across eyes (fog disparity flattened ~45 %, measured), the bird flock's shade differs between eyes | **done** (`temporal.cpp`): a second set for the right eye | — |
@@ -362,8 +363,8 @@ frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are w
 2. **Dual render per update**: done both ways; the default is `renderFrame` ×2 inside one
    `ModeSwitch::render` (section 6), the `ModeSwitch::render` ×2 structure is the fallback.
 3. **Temporal state per eye**: done for TAA (history pair, index, jitter), camera and object
-   motion vectors, skinned animation (view path), SSAO / volumetric / shade histories (section 5),
-   and the render-side state a render steps (section 6). Remaining: a DLSS feature per eye.
+   motion vectors, DLSS, skinned animation (view path), SSAO / volumetric / shade histories
+   (section 5), and the render-side state a render steps (section 6).
 4. **Pass-2 shortcut**: done for the shadow pass and the sky probe (section 6, ~10 %); render-side
    state the second eye would step again is rewound (flares, grain, frame-time rings).
 5. **HUD**: drawn once and duplicated into both halves at zero disparity (section 6); a chosen
@@ -551,19 +552,125 @@ release by 0x4a6cd0 (GPU idle 0x4f7be0, then NGX release 0x68ea80). Evaluate is 
 0x4a6ad1). Live: DLSS does run in the lab (`game.dlss = quality` → mode 4, a feature handle
 present; nvapi enabled in the instance).
 
-What the mod does: while sbs runs with DLSS on, the immediate of that `mov` is patched to 1
-(`eyestate_update`), so DLSS resets its history on every evaluate: both eyes are upscaled from
-their own frame only, symmetric, no cross-eye blending, but without temporal accumulation (softer:
-sharpness 2.06-2.16 vs 3.5-3.7 for native TAA-off, below). Patched back as soon as sbs stops or DLSS
-is switched off.
+What the mod does (`src/features/stereo/dlss.cpp`): **one DLSS feature per eye**. Static
+(Ghidra, re-read for this): the feature handle is the only per-feature state. The evaluate's
+parameter helper 0x4a5800 (NGX's `EVALUATE_DLSS_EXT`) sets every input on the shared parameter block
++0x38a0 on every call: color, output (RendererX86+0x270, written in full), depth, motion vectors,
+exposure (the auto-exposure ring, 0x480320), jitter (RendererX86+0x358/+0x35c, the same for both
+eyes of an update since section 5), MV scale (1, 1), sharpness (+0x38bc, from the optimal-settings
+query, eye-independent), Reset (0), render subrect (the render-size globals 0xd745e8/ec). Slot 45 is
+called at the start of **every** `renderWorld` (0x509150 → 0x50d7a0, which also handles the render
+resolution and, when slot 45 reports a change, frees the renderer's size-dependent RTs and calls
+slot 56 / slot 55 three times). Its decision uses the device "slot": handle +0x38a8, key
++0x38c0..+0x38cc (render w/h, output w/h), mode +0x38d8, against the globals (mode 0xd75620, output
+size 0xd74600/04, render size 0xd745e8/ec). The device is created once (0x513e70 → NGX init
+0x4a4900) and NGX shut down only in its destructor (0x4a50c0), so a handle stays valid for the
+process. The game's own DLSS option change only sets +0x3739 (slot 109, 0x4fab30), consumed by
+slot 56; the feature itself is re-created by slot 45 in the next `renderWorld`.
 
-What a proper per-eye DLSS needs (not built): swap device+0x38a8 per eye in
-`eyestate_enter/leave` exactly like the TAA index; create the right eye's feature on first use by
-calling 0x4a7080 with +0x38a8 zeroed (it records CreateFeature on the device's command list and
-registers it via 0x502a30), remember for each eye's handle the mode/size key it was created with
-and, when the key changes (0x4a6660 only re-creates the handle that is in +0x38a8 at that moment),
-re-create the stale eye's handle and release the old one the way 0x4a6cd0 does (GPU idle, NGX
-release). Cost: one more DLSS feature (its history buffers) and nothing per frame.
+So the right eye's feature is a second copy of that slot:
+
+- `eyestate_enter` for the right eye (sbs, both eyes in this update, DLSS on, NGX initialised, the
+  engine has its own feature): the left eye's slot (handle, key, mode) is saved and the right eye's
+  is written into the device; the engine's **own slot 45** is then called once on it, with +0x38b0
+  emptied for the call. On first use (slot all zero) or after a mode/size change it runs the
+  engine's optimal-settings query (0x4a73e0) and CreateFeature (0x4a7080, recorded on the device's
+  own creation list +0x38d0 and submitted with the frame's lists), exactly as for the engine's
+  feature; otherwise it returns 0. The `renderWorld` that follows then finds the slot current, and
+  its evaluate uses the right eye's handle.
+- `eyestate_leave` for the right eye: the right slot is read back (normally unchanged) and the left
+  slot restored, so the engine's own feature and key never see the right eye's.
+- An old right-eye handle (mode or size change, DLSS off, `dlss_per_eye = 0`, sbs off) is never
+  given to the engine's +0x38b0. It is released (NGX ReleaseFeature 0x68ea80) once a fence
+  signalled on the game's queue at that point has completed (its last evaluate was in an earlier,
+  already submitted frame); live, 10-50 ms later, every release returned 1 (success). A first
+  version called the engine's GPU idle 0x4f7be0 between the eyes, as slot 56 does: a 5 s stall
+  on a live DLSS mode change, then an access violation in 0x4f7640 (a command-list wrapper with
+  index −1, reached from 0x4b7370 in the right eye's `renderWorld`; game minidump, run r1). The
+  idle submits the device's queued lists (0x5034c0), apparently including the thread's open one,
+  which the right eye then kept recording into.
+- Fallback, as before: the evaluate's Reset immediate (0x4a6ad5) is patched to 1 while sbs runs with
+  DLSS on and per-eye DLSS is unavailable: signature mismatch (slot 45, ReleaseFeature,
+  CreateFeature prologues), `stereo.dlss_per_eye = 0`, or a failed creation (then until the
+  engine's key changes or sbs restarts; that eye shares the engine's feature meanwhile).
+- With `mode = off` (or menus, or alternate) nothing is swapped and nothing patched: live, `stereo
+  status` `dlss.swaps` constant over ~280 presents, `right` null, `reset` false.
+
+Cost: one more DLSS feature (its internal resources; VRAM not measured, the GPU was shared) and per
+update one call of slot 45 that only compares the key, plus two 28-byte slot copies. Alternate mode still shares one feature (unchanged; it never had per-eye DLSS).
+
+### Measured: per-eye DLSS (lab instance awr-dlss)
+
+`re/scripts/stereo_dlss_battery.sh` (the `stereo_taa_battery.sh` captures per variant: separation 0
+and 32.5 mm static, the same under `test_pan 0.5`, plus a mono capture with `mode = off`); each cell is the two halves of one
+presented frame, 2 frames per cell; disparity per patch with `stereo_taa_analyse.py` against the
+TAA-off variant of the same run (**ref**: `stereo.taa = 0`, DLSS off). **per eye** = this, **reset**
+= `stereo.dlss_per_eye = 0` (the old behaviour). Sharpness = mean |∇| over a static box of
+vegetation/road edge (eye x 100-700, y 500-1000; hsbs x 50-350), whole frame in brackets.
+prologue-road. Full output: run r4 (windowed 1920x1080 per eye, 3840x1080 swapchain). hsbs: run r5
+(borderless 1920x1080 desktop, 960x1080 per eye, anamorphic). The GPU was shared with another
+instance; nothing here is a timing.
+
+full, 1920x1080 per eye (Quality renders 1280x720, Performance 960x540):
+
+| | ref (TAA off) | DLSS Q per eye | DLSS Q reset | DLSS P per eye | DLSS P reset |
+|---|---|---|---|---|---|
+| sep 0, static: \|L−R\| mean (/255) | 0.040-0.042 (max 7) | 0.088-0.090 (max 5) | 0.049-0.064 (max 6) | 0.134-0.135 (max 30) | 0.297-0.314 (max 53) |
+| sep 0, pan: \|L−R\| mean | 0.24-0.28 (max 13) | 0.29-0.32 (max 11) | 0.24-0.30 (max 14) | 0.44-0.47 (max 22) | 0.35-0.42 (max 38) |
+| sep 32.5: per patch vs ref, median / mean \|diff\| | (ref vs ref frame: medians +3.82 / +3.30) | **+0.016 / 1.83, −0.000 / 1.56 px** | −0.000 / 1.98, −0.022 / 1.94 px | **+0.025 / 1.64, +0.019 / 1.61 px** | +0.042 / 2.22, 0.000 / 2.00 px |
+| sharpness, static box (whole) | 3.19-3.27 (3.60-3.67) | **2.45-2.49** (2.43-2.46) | 1.88-1.91 (2.26-2.27) | **3.18-3.28** (3.50-3.56) | 2.61-2.66 (2.78-2.95) |
+| same, mono (`mode = off`) | | 2.42-2.44 (2.44-2.47) | | 3.41-3.42 (3.55) | |
+
+hsbs, 960x1080 per eye (Quality 640x720, Performance 480x540; right-eye feature created for
+output 960x1080, live log):
+
+| | ref (TAA off) | DLSS Q per eye | DLSS Q reset | DLSS P per eye | DLSS P reset |
+|---|---|---|---|---|---|
+| sep 0, static: \|L−R\| mean | 0.048-0.050 (max 5) | 0.079 (max 5) | 0.15 (max 8)* | 0.085-0.107 (max 12) | 0.28-0.29 (max 50) |
+| sep 0, pan: \|L−R\| mean | 0.35-0.37 (max 10) | 0.17-0.19 (max 5) | 0.22-0.24 (max 6) | 0.28-0.30 (max 29) | 0.39-0.41 (max 49) |
+| sep 32.5: per patch vs ref, median / mean \|diff\| | | **−0.019 / 0.80, −0.000 / 0.79 px** | −0.020 / 0.92, −0.044 / 0.93 px | **+0.007 / 0.49, +0.001 / 0.50 px** | −0.013 / 0.96, −0.060 / 0.93 px |
+| sharpness, static box (whole) | 2.87-2.92 (3.67-3.70) | **2.50-2.69** (2.64-2.81) | 1.91-1.96 (2.61-2.63) | **3.31-3.33** (3.70-3.73) | 2.53-2.64 (3.17-3.26) |
+| same, mono | 2.65-2.75 | 2.54-2.81 (2.74-2.95) | | 3.23-3.38 (3.74-3.87) | |
+
+\* second frame 1.33 (max 138): a lens flare differing between the halves in that frame, not DLSS.
+
+Reading it:
+
+- **Disparity** (a): per eye, the field matches the TAA-off one patch by patch (median difference
+  within ±0.03 px; the mean |diff| of 0.5-1.8 px is the upscaler's own antialiasing moving edges and
+  the scene's idle motion between captures, as for TAA in section 5: 0.84-0.91 px in r2). With one
+  shared history (r11, above) it was −2.4 px median.
+- **No cross-eye blending** (b, d): at separation 0 both eyes are equal to within 0.08-0.13/255
+  static and 0.17-0.47/255 under the pan, the same order as the TAA-off reference (0.04 / 0.24-0.37);
+  the shared history measured 1.21 / 0.90 (max 77-83) under the pan in r11. Crops of the pan
+  frames (prologue-road's car and fence) show no ghost or smear on either eye.
+- **Sharpness** (c): per eye equals mono DLSS (Quality 2.45-2.49 vs 2.42-2.44, Performance
+  3.18-3.28 vs 3.41-3.42 in full; the same in hsbs) and is clearly above the reset fallback:
+  +30 % (Quality) / +22 % (Performance) on the static box in full, +31 % / +28 % in hsbs. The
+  whole-frame number moves less (fog and sky dominate it). The game's DLSS Performance measures crisper
+  than Quality, in mono too: 0x4a7080 creates Quality with render preset hint 6 (F) and
+  PerfQuality 2, Performance with hint 13 and PerfQuality 0 (static), i.e. a different model.
+- **Live switching** (f), 5 + 5 + 10 rounds in full and hsbs (`churn`: sbs off/on, DLSS
+  Performance, off, Quality, `dlss_per_eye` 0/1): no crash, no stall (stall watchdog silent), no
+  vkd3d.log output; every right-eye feature created was released (r5: 43 created, 43 released after
+  the final `mode = off`, every NGX ReleaseFeature returned 1 = success); the frame path
+  (`sbs_path = frame`) works the same way (r5, created once, swapped per update).
+- **awr-forest-night** (hsbs, run r15; a scripted bird attack, so nothing is static): DLSS Quality
+  per eye vs the TAA-off field per patch −0.001 / −0.005 and +0.006 / +0.005 px median (mean
+  |diff| 0.34-0.52 px; two pairs of captures), reset −0.017 / −0.024 px; static-box sharpness per
+  eye 3.09-3.43 vs reset 2.98-3.07 (whole frame 3.05-3.19 vs 2.90-2.97); separation 0 |L−R|
+  0.16-0.35/255 per eye, 0.77-0.79 reset, 0.56-0.64 TAA off (the flock differs between the eyes,
+  section 6). This fixture sometimes ends the game: this branch 3 exits in 8 launches (two
+  during loading, before any eye render; one 12 s in-world, a C++ exception thrown from the
+  engine's allocator path, 0x3c2a4a, minidump), master without this change 1 in 3 (in-world after
+  10 s, the same exception and stack; A/B with the same instance, fixture and settings). Not
+  caused by per-eye DLSS; the "crash in forest-night" of section 6's open issues.
+
+![DLSS per eye vs reset](img/stereo-dlss-per-eye.jpg)
+
+*Right eye (left column: mono), static vegetation at the road edge, prologue-road, full output, r4,
+brightened 2.2x: TAA off reference; DLSS Quality mono; DLSS Quality per eye in sbs; reset every
+frame (soft: the grass blades smear); DLSS Performance per eye; reset.*
 
 ### Measured (lab, `prologue-road`, 3840x1080 sbs, separation 32.5 mm, parallel)
 
@@ -572,7 +679,7 @@ halves of one presented frame (both eyes from one update), 2 frames per cell. Va
 TAA and object velocity off (the old sbs default; the reference disparity field), **shared** = TAA
 and object velocity on with per-eye state off (`stereo.per_eye = 0`, the old `taa = 1`), **per-eye**
 = the new default, **mb-** = TAA off, object velocity (motion blur) on. Runs r4 (TAA) and r11 (DLSS
-quality, then the off / per-eye repeat with DLSS off).
+quality, then the off / per-eye repeat with DLSS off; before per-eye DLSS existed).
 
 | | off | shared | per-eye |
 |---|---|---|---|
@@ -593,7 +700,7 @@ per-eye vs off per patch −0.001 px median, 1.07 / 0.99 px mean.
 
 DLSS (r11, DLSS quality, same scene): **shared** (no handling) disparity median +0.25 px (far field
 +0.15 px vs +2.7 px), per patch vs off −2.4 px median, 5.1 px mean, pan |L−R| 1.21 / 0.90 (max
-77-83); **reset per frame** (what the mod does): disparity +3.87 / +3.68 px, per patch −0.03 px
+77-83); **reset per frame** (then the mod's handling, now the fallback): disparity +3.87 / +3.68 px, per patch −0.03 px
 median, 1.48 / 1.45 px mean, pan |L−R| 0.79 / 0.69 (max 13-35); sharpness 2.16 / 2.06 (soft: no
 accumulation).
 
@@ -628,7 +735,8 @@ behaviour). Without per-eye state (signature mismatch) they are switched off reg
 `stereo.per_eye = 0` (shared state, the old prototype), `2` (all but the object-previous hold); the
 lab verb `stereo probe N` logs the view/TAA state around N eye renders; `stereo status` reports
 `eyestate` (swaps, renamed RT requests, jitter count, held object stores, `obj_moving` per eye,
-DLSS mode/handle/reset).
+and `dlss`: mode, left/right handles, the right feature's key, creates/releases/pending, reset).
+`stereo.dlss_per_eye = 0` switches per-eye DLSS off (one feature, reset every frame).
 
 ---
 
@@ -979,6 +1087,8 @@ quiver lab call awr stereo census 2 cl               # ... plus command lists to
 re/scripts/stereo_taa_battery.sh awr                 # per-eye temporal state variants (section 5)
 python3 re/scripts/stereo_taa_analyse.py <run folder>
 VARIANTS="dlssshared:1:1:0 dlssreset:1:1:1" re/scripts/stereo_taa_battery.sh awr   # with game.dlss on
+re/scripts/stereo_dlss_battery.sh awr                # per-eye DLSS vs reset vs TAA off (section 5, DLSS)
+python3 re/scripts/stereo_taa_analyse.py <run folder> --variants ref,dq,dqr,dp,dpr [--eye-width 960]
 ```
 
 Lab verbs: `stereo status | census N [cl] | shots N TAG [SKIP] | files | probe N | rand | peek r|img|ADDR [+OFF|*]...` (`rand`: the first eye's rand() call sites, second-eye misses, and the skinned-buffer counters while `stereo.skin_probe = 1`), `tweak list [SUBSTR] | tweak NAME
