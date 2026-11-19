@@ -6,6 +6,7 @@
 #include "features/levels.h"
 
 #include <windows.h>
+#include <shlobj.h>
 
 #include <atomic>
 #include <cmath>
@@ -32,7 +33,7 @@ namespace {
 
 constexpr uintptr_t RVA_MODESWITCH_UPDATE = 0x263600;  // ModeSwitch::update(this)
 constexpr uintptr_t RVA_MENU_ACTION = 0x24d8f0;        // MenuMode::action(this, cmd, arg)
-constexpr uintptr_t RVA_MENU_ENTER_MAIN = 0x24d200;    // MenuMode: welcome -> main menu
+constexpr uintptr_t RVA_MENU_ENTER_MAIN = 0x24d200;    // MenuMode: title -> main menu
 constexpr uintptr_t RVA_MENU_CONTINUE = 0x257920;      // MenuMode: load the slot's checkpoint
 constexpr uintptr_t RVA_STR_ASSIGN = 0x3bacc0;         // String::operator=(const char*)
 constexpr uintptr_t RVA_STR_FREE = 0x3bac00;           // String::clear/free
@@ -79,7 +80,7 @@ const Sig kSigs[] = {
     {RVA_EULER, "48 8b c4 53 48 81 ec 90 00 00 00 0f 29 70 e8"},
     {0x1402652c0 - 0x140000000, "48 8d 81 bc 00 00 00 c3"},  // Character::transform: this+0xbc
     {0x140184010 - 0x140000000, "48 8b 41 50 c3"},           // players->character: +0x50
-    {0x14017b3a0 - 0x140000000, "0f b6 81 c9 01 00 00 c3"},  // Character in vehicle: +0x1c9
+    {0x14017b3a0 - 0x140000000, "0f b6 81 c9 01 00 00 c3"},  // Character: +0x1c9 player-controlled flag
     {RVA_SET_CONTROLS, "84 d2 74 07 88 0d ?? ?? ?? ?? c3 88 0d ?? ?? ?? ?? c3"},
 };
 
@@ -264,7 +265,7 @@ struct Snapshot {
   int controls_a = -1, controls_b = -1;
   int cam_mode = -1;
   bool video = false;  // VideoMode (ModeSwitch +0x58) active: a Bink cutscene is playing
-  bool in_vehicle = false;
+  bool is_player_char = false;
   std::string world;  // LoadingMode +0x48
 };
 
@@ -297,16 +298,17 @@ Snapshot snap() {
     if (const char* w = rd<const char*>(l, 0x48)) s.world.assign(w, strnlen(w, 128));
   }
   if (void* pm = *G.players) s.player = rd<void*>(pm, 0x50);
-  if (s.player) s.in_vehicle = rd<uint8_t>(s.player, 0x1c9) != 0;
+  if (s.player) s.is_player_char = rd<uint8_t>(s.player, 0x1c9) != 0;
   s.cam_mode = *G.cam_mode;
   s.controls_a = *G.controls_a;
   s.controls_b = *G.controls_b;
   return s;
 }
 
-// MenuMode screens (+0x14), established live: 1 boot, 2 "Press any key to play", 3 attract
-// video, 4 main menu, 5 pause menu (in-game). +0x1c is the screen being switched to (0: none).
-constexpr int MENU_WELCOME = 2, MENU_MAIN = 4;
+// MenuMode screens (+0x14), established live and from MenuMode::update (0x259560): 1 boot,
+// 2 attract video (after 19 s idle on the title), 3 title "Press any key to play", 4 main menu,
+// 5 pause menu (in-game). +0x1c is the screen being switched to (0: none).
+constexpr int MENU_ATTRACT = 2, MENU_TITLE = 3, MENU_MAIN = 4;
 
 bool is_loading(const Snapshot& s) { return s.loading != 0 && s.loading != 0xc && s.loading != -1; }
 
@@ -314,14 +316,34 @@ std::string snap_json(const Snapshot& s) {
   char b[512];
   snprintf(b, sizeof b,
            "{\"mode\":%s,\"prev\":%s,\"menu_kind\":%d,\"menu_page\":%d,\"loading\":%d,"
-           "\"player\":%s,\"camera\":%d,\"video\":%s,\"controls\":[%d,%d],\"in_vehicle\":%s,\"world\":%s}",
+           "\"player\":%s,\"camera\":%d,\"video\":%s,\"controls\":[%d,%d],\"is_player_char\":%s,\"world\":%s}",
            json_str(mode_name(s.cur_vt)).c_str(), json_str(mode_name(s.prev_vt)).c_str(),
            s.menu_kind, s.menu_page, s.loading, s.player ? "true" : "false", s.cam_mode, s.video ? "true" : "false", s.controls_a,
-           s.controls_b, s.in_vehicle ? "true" : "false", json_str(s.world).c_str());
+           s.controls_b, s.is_player_char ? "true" : "false", json_str(s.world).c_str());
   return b;
 }
 
 // ---- actions (game thread) -----------------------------------------------------------------
+
+// `quiver lab fixture install` copies saves read-only; the game can then neither overwrite nor
+// delete its checkpoint (and blocks on its overwrite screen). Clear the attribute on the slot's
+// files (Documents\Remedy\AlanWakeRemastered\savegames\savegame_aw1, see re/levels.md).
+void make_saves_writable() {
+  wchar_t docs[MAX_PATH];
+  if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs))) return;
+  std::wstring dir = std::wstring(docs) + L"\\Remedy\\AlanWakeRemastered\\savegames\\savegame_aw1\\";
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) {
+      SetFileAttributesW((dir + fd.cFileName).c_str(),
+                         fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+      TB_LOG("levels: made save %ls writable", fd.cFileName);
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
 
 // Start a level the way the main menu's episode list does (MenuMode::action "load_episode"),
 // after making sure none of its blocking platform dialogs can come up: an existing checkpoint
@@ -335,6 +357,7 @@ std::string start_level_from_menu(const std::string& world, int diff) {
   bool signed_in = reinterpret_cast<bool (*)(void*)>(vt[0x18 / 8])(plat);
   bool storage = reinterpret_cast<bool (*)(void*)>(vt[0x120 / 8])(plat);
   if (!signed_in || !storage) return "platform not signed in / no storage";
+  make_saves_writable();
   G.save_slot(save, 0, 1);  // what the menu selects before starting an episode
   if (world == "continue") {
     // Main menu "Continue Game": load the checkpoint save (a fixture, or the last run's).
@@ -346,6 +369,7 @@ std::string start_level_from_menu(const std::string& world, int diff) {
   if (G.save_state(save) != 1) {
     TB_LOG("levels: deleting the existing checkpoint save before starting %s", world.c_str());
     G.save_delete(save);
+    if (G.save_state(save) != 1) return "cannot delete the checkpoint save";
   }
   GStr cmd, arg;
   G.str_assign(&cmd, "load_episode");
@@ -374,12 +398,13 @@ void run_pending(const Snapshot& s) {
   const char* how;
   if (s.cur_vt == G.vt_menu && s.player == nullptr) {
     if (s.menu_page != 0) return;  // a screen transition is running
-    if (s.menu_kind == MENU_WELCOME) {
-      // "Press any key to play": what the key press does once the platform user is signed in.
+    if (s.menu_kind == MENU_TITLE || s.menu_kind == MENU_ATTRACT) {
+      // "Press any key to play": what the key press does on the title once the platform user is
+      // signed in (FUN_14024d200: load the profile, switch to the main menu).
       void* plat = *G.platform;
       auto vt = plat ? *reinterpret_cast<void***>(plat) : nullptr;
       if (vt && reinterpret_cast<bool (*)(void*)>(vt[0x18 / 8])(plat)) {
-        TB_LOG("levels: leaving the welcome screen for the main menu");
+        TB_LOG("levels: leaving the title screen for the main menu");
         G.menu_enter_main(*G.menu);
       }
       return;
@@ -436,7 +461,7 @@ void update_state(const Snapshot& s) {
            s.player != nullptr, s.cam_mode, s.video, s.controls_a, s.controls_b, s.world.c_str());
   if (g_last_fp != fp) {
     g_last_fp = fp;
-    TB_LOG("levels: %s", fp);
+    if (lab_active() || cfg_bool("log.verbose")) TB_LOG("levels: %s", fp);  // rare: mode/menu changes
   }
 
   // Player control: gameplay mode, nothing loading, a player, and the player camera (not a
@@ -562,7 +587,6 @@ std::string verb_teleport(const std::vector<std::string>& a, bool& ok) {
   if (!on_game_thread([&] {
         Snapshot s = snap();
         if (!s.player) return void(e = "no player");
-        if (s.in_vehicle) return void(e = "player is in a vehicle");
         auto* p = static_cast<uint8_t*>(s.player);
         float xf[12];
         if (have_yaw) {
