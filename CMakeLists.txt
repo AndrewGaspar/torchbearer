@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(torchbearer LANGUAGES C CXX)
-set(TB_VERSION "0.1" CACHE STRING "version string")
+set(TB_VERSION "0.2")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,8 @@ add_library(torchbearer SHARED
   src/features/stereo/gpu.cpp
   src/features/stereo/cmdlist.cpp
   src/features/stereo/pass2.cpp
+  src/features/stereo/window.cpp
+  src/features/stereo/eyestate.cpp
   src/features/intro.cpp
   src/features/settings.cpp
   src/features/settings_keys.cpp
@@ -53,4 +55,12 @@ add_custom_target(mod ALL
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/torchbearer.ini
     ${CMAKE_SOURCE_DIR}/dist/quiver-mod.toml ${CMAKE_SOURCE_DIR}/dist/quiver-options.toml
     ${CMAKE_BINARY_DIR}/mod/
+  # build/package: a Quiver mod package (`quiver mods "Alan Wake Remastered" install build/package`):
+  # the manifest and options schema at the top, files laid out like the install folder in files/.
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/package/files
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/quiver-mod.toml
+    ${CMAKE_SOURCE_DIR}/dist/quiver-options.toml ${CMAKE_BINARY_DIR}/package/
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:torchbearer> ${CMAKE_BINARY_DIR}/package/files/dxgi.dll
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/torchbearer.ini
+    ${CMAKE_BINARY_DIR}/package/files/
   DEPENDS torchbearer)

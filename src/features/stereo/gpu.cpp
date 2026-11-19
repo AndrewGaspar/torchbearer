@@ -232,7 +232,7 @@ namespace {
 ID3D12Resource* g_eye[2] = {};
 uint32_t g_eye_w = 0, g_eye_h = 0;
 DXGI_FORMAT g_eye_fmt = DXGI_FORMAT_UNKNOWN;
-unsigned g_stored = 0, g_composed = 0, g_compose_fail = 0;
+unsigned g_stored = 0, g_composed = 0, g_compose_fail = 0, g_duplicated = 0;
 
 bool ensure_eyes(const D3D12_RESOURCE_DESC& bb, uint32_t w) {
   if (g_eye[0] && g_eye_w == w && g_eye_h == bb.Height && g_eye_fmt == bb.Format) return true;
@@ -343,6 +343,33 @@ bool gpu_compose(IDXGISwapChain* sc) {
   return true;
 }
 
+bool gpu_duplicate(IDXGISwapChain* sc) {
+  std::lock_guard lk(g_mu);
+  if (!ensure(sc)) return false;
+  ID3D12Resource* bb = back_buffer(sc);
+  if (!bb) return false;
+  D3D12_RESOURCE_DESC d = bb->GetDesc();
+  unsigned k = present_width_scale(sc);
+  uint32_t w = uint32_t(d.Width) / k, h = d.Height;
+  if (k < 2 || !ensure_eyes(d, w)) {
+    bb->Release();
+    return false;
+  }
+  // Through an eye texture: a resource can't be copy source and destination at once.
+  begin();
+  barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(g_eye[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(g_eye[1], 0, bb, 0, w, h);
+  barrier(g_eye[1], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  for (unsigned i = 1; i < k; i++) copy_rect(bb, w * i, g_eye[1], 0, w, h);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+  submit();
+  bb->Release();
+  g_duplicated++;
+  return true;
+}
+
 // --- both eyes inside one engine frame (sbs_path = view) --------------------------------------
 // The copies happen in the middle of the engine's frame. The engine records a frame into a pool
 // of command lists and submits whatever is closed at a few points (once inside renderFrame,
@@ -393,23 +420,31 @@ bool gpu_stash_mid(IDXGISwapChain* sc, int eye) {
   return true;
 }
 
-bool gpu_put_mid(IDXGISwapChain* sc, int eye) {
+// The second eye (the engine's image, in the first eye-width columns) goes to the second half
+// and the stashed first eye back to the first half, before any overlay is drawn.
+bool gpu_place_mid(IDXGISwapChain* sc, int stashed_eye) {
   std::lock_guard lk(g_mu);
-  if (!ensure(sc) || !g_eye[eye]) return false;
+  if (!ensure(sc) || !g_eye[0] || !g_eye[1]) return false;
   ID3D12Resource* bb = back_buffer(sc);
   if (!bb) return false;
   D3D12_RESOURCE_DESC d = bb->GetDesc();
   unsigned k = present_width_scale(sc);
-  uint32_t w = uint32_t(d.Width) / k;
-  if (k < 2 || w != g_eye_w || d.Height != g_eye_h) {
+  uint32_t w = uint32_t(d.Width) / k, h = d.Height;
+  if (k < 2 || w != g_eye_w || h != g_eye_h) {
     bb->Release();
     g_compose_fail++;
     return false;
   }
+  int other = 1 - stashed_eye;
   auto st = D3D12_RESOURCE_STATES(cmdlist_bb_state(bb));
   mid_begin();
-  if (st != D3D12_RESOURCE_STATE_COPY_DEST) barrier(bb, st, D3D12_RESOURCE_STATE_COPY_DEST);
-  copy_rect(bb, w, g_eye[eye], 0, w, d.Height);
+  if (st != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier(bb, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(g_eye[other], 0, bb, 0, w, h);
+  barrier(g_eye[other], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_rect(bb, 0, g_eye[0], 0, w, h);  // left eye -> first half
+  copy_rect(bb, w, g_eye[1], 0, w, h);  // right eye -> second half
   if (st != D3D12_RESOURCE_STATE_COPY_DEST) barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, st);
   mid_end();
   bb->Release();
@@ -419,7 +454,7 @@ bool gpu_put_mid(IDXGISwapChain* sc, int eye) {
 
 bool gpu_compose_view(IDXGISwapChain* sc, int stashed_eye) {
   std::lock_guard lk(g_mu);
-  if (present_width_scale(sc) >= 2) return true;  // composed in the frame (gpu_put_mid)
+  if (present_width_scale(sc) >= 2) return true;  // composed in the frame (gpu_place_mid)
   // Half output: the frame holds the other eye; centre crops of both, as gpu_compose.
   if (!ensure(sc) || !g_eye[0]) return false;
   ID3D12Resource* bb = back_buffer(sc);
@@ -452,8 +487,10 @@ uint32_t gpu_eye_width() { return g_eye_w; }
 std::string gpu_status() {
   char b[256];
   snprintf(b, sizeof b,
-           "captures=%u failures=%u stored=%u composed=%u compose_fail=%u eye=%ux%u mid_in_engine_list=%u mid_own=%u",
-           g_captures, g_failures, g_stored, g_composed, g_compose_fail, g_eye_w, g_eye_h, g_mid_engine, g_mid_own);
+           "captures=%u failures=%u stored=%u composed=%u compose_fail=%u duplicated=%u eye=%ux%u mid_in_engine_list=%u "
+           "mid_own=%u",
+           g_captures, g_failures, g_stored, g_composed, g_compose_fail, g_duplicated, g_eye_w, g_eye_h, g_mid_engine,
+           g_mid_own);
   return b;
 }
 

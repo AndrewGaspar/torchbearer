@@ -12,6 +12,8 @@ namespace tb {
 namespace {
 std::mutex g_mu;
 std::map<void**, void*> g_vt_orig;  // patched slot -> original
+int g_batch = 0;
+int g_queued = 0;
 }  // namespace
 
 bool hook_init() {
@@ -29,13 +31,34 @@ bool hook_fn(void* target, void* detour, void** original, const char* name) {
     TB_LOG("hook %s @%p: create failed: %s", name, target, MH_StatusToString(s));
     return false;
   }
-  s = MH_EnableHook(target);
+  {
+    std::lock_guard lk(g_mu);
+    if (g_batch > 0) {
+      s = MH_QueueEnableHook(target);
+      if (s == MH_OK) g_queued++;
+    } else {
+      s = MH_EnableHook(target);
+    }
+  }
   if (s != MH_OK) {
     TB_LOG("hook %s @%p: enable failed: %s", name, target, MH_StatusToString(s));
     return false;
   }
   TB_LOG("hooked %s @%p", name, target);
   return true;
+}
+
+void hook_batch_begin() {
+  std::lock_guard lk(g_mu);
+  g_batch++;
+}
+
+void hook_batch_end() {
+  std::lock_guard lk(g_mu);
+  if (--g_batch > 0 || g_queued == 0) return;
+  MH_STATUS s = MH_ApplyQueued();
+  TB_LOG("enabled %d queued hooks: %s", g_queued, MH_StatusToString(s));
+  g_queued = 0;
 }
 
 bool hook_enable_all() { return MH_EnableHook(MH_ALL_HOOKS) == MH_OK; }

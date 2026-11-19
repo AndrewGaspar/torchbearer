@@ -240,6 +240,7 @@ void present_filter(PresentFilterFn fn) {
 
 void present_set_width_scale(unsigned scale) { g_width_scale = scale ? scale : 1; }
 unsigned present_width_scale(IDXGISwapChain* sc) { return scale_of(sc); }
+unsigned present_width_scale_pending() { return g_width_scale.load(); }
 
 void* present_queue(IDXGISwapChain* sc) {
   std::lock_guard lk(g_mu);

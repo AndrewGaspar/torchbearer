@@ -32,8 +32,10 @@
 #include "core/present.h"
 #include "features/stereo/cmdlist.h"
 #include "features/stereo/engine.h"
+#include "features/stereo/eyestate.h"
 #include "features/stereo/gpu.h"
 #include "features/stereo/pass2.h"
+#include "features/stereo/window.h"
 
 namespace tb::stereo {
 namespace {
@@ -63,8 +65,13 @@ struct Params {
   double separation_mm = 32.5;  // per eye
   double convergence_m = 0.0;   // 0 = parallel
   bool swap = false;
-  bool taa_in_sbs = false;  // keep the game's TAA on in sbs mode (it then blends across eyes)
-  bool objvel_in_sbs = false;  // keep object motion vectors in sbs mode (they then smear)
+  // sbs/alternate: keep the game's TAA and object motion vectors as the user set them (each eye
+  // then gets its own history and previous matrices); false = force them off while sbs runs.
+  bool taa_in_sbs = true;
+  bool objvel_in_sbs = true;
+  // dev (stereo.per_eye): 1 all per-eye state, 0 none (shared history / previous view: the old
+  // prototype), 2 all but holding the objects' previous transforms for the second eye.
+  int per_eye = 1;
   SbsPath path = SbsPath::View;
 };
 std::mutex g_pmu;
@@ -127,9 +134,6 @@ thread_local double t_conv_shift = 0;  // NDC x shift added to the post-projecti
 std::atomic<int> g_eye_now{0};  // eye of the frame being rendered: -1 left, +1 right, 0 mono
 std::atomic<uint64_t> g_frames_biased{0};
 std::atomic<uint64_t> g_render_frames{0};
-
-double g_prev_w2c[2][16];  // per-eye copy of the TAA object's previous world-to-clip
-bool g_have_prev[2] = {false, false};
 
 // Signed offset (metres, along view right) for an eye (-1 left, +1 right).
 double eye_offset(const Params& p, int eye) {
@@ -262,26 +266,25 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
     t_conv_shift = off * m00 / p.convergence_m;
   }
   g_eye_now = eye;
-  // Per-eye temporal state: the TAA object (RendererX86+0x140) keeps last frame's unjittered
-  // world-to-clip at +0x60 and builds camera motion vectors (motion blur, TAA reprojection) from
-  // it. When eyes alternate, "last frame" is the other eye, so the eye offset reads as camera
-  // velocity and smears the image. Give each eye its own previous matrix.
-  uint8_t* taa = nullptr;
+  // Per-eye temporal state (eyestate.cpp): TAA history and ping-pong index, the previous camera
+  // matrices behind camera/object motion vectors, the jitter phase. Without it, "last frame" for
+  // one eye is the other eye and the eye offset reads as motion.
   bool per_eye = eye != 0 && (p.mode == Mode::Sbs || p.mode == Mode::Alternate);
   if (per_eye) {
-    taa = at<uint8_t*>(r, kRendererTaa);
-    int i = eye < 0 ? 0 : 1;
-    if (taa && g_have_prev[i]) memcpy(taa + kTaaPrevWorldToClip, g_prev_w2c[i], sizeof g_prev_w2c[i]);
+    EyeOpts o;
+    o.taa_history = p.per_eye != 0;
+    o.view_prev = p.per_eye != 0;
+    o.same_jitter = p.per_eye != 0 && p.mode == Mode::Sbs;
+    o.another_eye_follows = p.per_eye == 1 && p.mode == Mode::Sbs && eye < 0;
+    // The left eye is rendered first in every sbs update; in alternate mode every frame is its
+    // own update.
+    eyestate_enter(r, view, eye, p.mode == Mode::Alternate || eye < 0, o);
   }
   t_in_frame = true;
   o_renderFrame(r, view, a3, a4);
   g_render_frames++;  // one scene render (one eye)
   t_in_frame = false;
-  if (per_eye && taa) {
-    int i = eye < 0 ? 0 : 1;
-    memcpy(g_prev_w2c[i], taa + kTaaPrevWorldToClip, sizeof g_prev_w2c[i]);
-    g_have_prev[i] = true;
-  }
+  if (per_eye) eyestate_leave(r, view, eye);
   if (off != 0) g_frames_biased++;
 }
 
@@ -297,7 +300,7 @@ std::atomic<bool> g_view_kick{true};  // stereo.view_kick
 std::atomic<uint64_t> g_kicks{0};
 void engine_kick() {
   const auto& img = game_image();
-  void* dev = *reinterpret_cast<void**>(img.at(kRvaDevicePtr));
+  void* dev = *reinterpret_cast<void**>(img.at(kRvaDevice));
   if (!dev) return;
   void* fn = (*reinterpret_cast<void***>(dev))[kDeviceKickSlot];
   if (reinterpret_cast<uintptr_t>(fn) != img.at(kRvaDeviceKick)) return;  // not the device we know
@@ -308,29 +311,31 @@ void engine_kick() {
 void render_view_sbs(void* r, void* view, void* a3, void* a4, const Params& p) {
   g_view_done = true;
   IDXGISwapChain* sc = g_sc.load();
+  // Left eye first, as in every sbs update (eyestate.cpp: the first eye of an update advances the
+  // jitter phase and holds the objects' previous transforms for the eye that follows).
   pass2_eye(0, r);
   uint64_t t0 = now_us();
-  render_eye(r, view, a3, a4, p, 1);
+  render_eye(r, view, a3, a4, p, -1);
   uint64_t t1 = now_us();
   g_us_eye[0] += t1 - t0;
-  bool stashed = sc && gpu_stash_mid(sc, 1);
+  bool stashed = sc && gpu_stash_mid(sc, 0);
   // The engine submits a render's lists in two batches: at its kick inside renderWorld and in
   // endFrame. Kick now, so the first eye's second batch (lighting, post and the stash copy just
   // recorded into it) reaches the GPU before the second eye is recorded, not halfway through it.
   if (g_view_kick.load()) engine_kick();
-  if (census_on()) census("view sbs: right eye rendered, stashed=%d", stashed);
+  if (census_on()) census("view sbs: left eye rendered, stashed=%d", stashed);
   pass2_eye(1, r);
   t0 = now_us();
-  render_eye(r, view, a3, a4, p, -1);
+  render_eye(r, view, a3, a4, p, 1);
   g_us_eye[1] += now_us() - t0;
   pass2_eye(-1);
   bool placed = false;
-  if (stashed && present_width_scale(sc) >= 2 && gpu_put_mid(sc, 1)) {
+  if (stashed && present_width_scale(sc) >= 2 && gpu_place_mid(sc, 0)) {
     placed = true;
     cmdlist_duplicate(GetCurrentThreadId(), gpu_eye_width());
   }
   g_view_present = stashed;
-  if (census_on()) census("view sbs: left eye rendered, right eye placed=%d (overlay duplication armed)", placed);
+  if (census_on()) census("view sbs: right eye rendered, eyes placed=%d (overlay duplication armed)", placed);
 }
 
 void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
@@ -424,6 +429,8 @@ void taa_force_off(bool off) {
   }
 }
 
+bool g_was_sbs = false;
+
 // One game update = one ModeSwitch::render. In sbs mode (and only while the world is being
 // rendered) it runs twice: left eye, then right eye, from the same simulated state; the first
 // Present is swallowed after its back buffer is stashed, the second is composed and presented.
@@ -434,8 +441,15 @@ void __fastcall hk_modeSwitchRender(void* self) {
   g_pan_rad = rate != 0 ? g_pan_rad + rate * M_PI / 180.0 : 0;
   bool world = present_frame() - g_last_render_present.load() < 8;
   bool sbs = p.mode == Mode::Sbs && world;
-  taa_force_off(sbs && !p.taa_in_sbs);
-  objvel_force_off(sbs && !p.objvel_in_sbs);
+  // Without per-eye state (signature mismatch) TAA and object velocity would blend / smear across
+  // eyes, so they are switched off while sbs runs, as they are when the user asks for it.
+  taa_force_off(sbs && (!p.taa_in_sbs || !eyestate_history_available()));
+  objvel_force_off(sbs && (!p.objvel_in_sbs || !eyestate_available()));
+  if (sbs != g_was_sbs) {
+    eyestate_reset();
+    g_was_sbs = sbs;
+  }
+  eyestate_update(sbs && p.per_eye != 0);  // DLSS: one history, two eyes -> reset while sbs runs
   IDXGISwapChain* sc = g_sc.load();
   bool view = sbs && p.path == SbsPath::View && sc && cmdlist_install(sc);
   cmdlist_track(view);
@@ -549,7 +563,7 @@ void capture_if_armed(IDXGISwapChain* sc, uint64_t frame, const char* eye_tag) {
 bool present_gate(IDXGISwapChain* sc, uint64_t frame) {
   if (g_view_present.exchange(false)) {  // both eyes of one update in this one frame
     cmdlist_duplicate(0, 0);
-    gpu_compose_view(sc, 1);
+    gpu_compose_view(sc, 0);
     capture_if_armed(sc, frame, "SBS");
     return true;
   }
@@ -565,6 +579,10 @@ bool present_gate(IDXGISwapChain* sc, uint64_t frame) {
     return true;
   }
   int eye = g_eye_now.load();
+  // Full-SBS output without a stereo pair this frame (mode off/left/right/alternate, menus,
+  // videos): show the engine's single image to both eyes (2D in the glasses) rather than one
+  // eye and an undefined half.
+  if (present_width_scale(sc) > 1) gpu_duplicate(sc);
   capture_if_armed(sc, frame, eye < 0 ? "L" : eye > 0 ? "R" : "M");
   return true;
 }
@@ -584,17 +602,20 @@ bool check_sigs() {
 
 std::string status_json() {
   Params p = params();
-  char b[1024];
+  char b[2048];
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"sbs_path\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,"
            "\"main_view\":\"%p\",\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,"
-           "\"present\":%llu,\"taa_forced_off\":%s,\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\","
-           "\"kicks\":%llu,\"timed_updates\":%llu,\"us_update\":%llu,\"us_eye1\":%llu,\"us_eye2\":%llu,\"us_endframe\":%llu}",
+           "\"present\":%llu,\"taa_forced_off\":%s,\"taa_game\":%u,\"objvel_forced_off\":%s,\"eyestate\":%s,"
+           "\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\",\"kicks\":%llu,\"timed_updates\":%llu,\"us_update\":%llu,"
+           "\"us_eye1\":%llu,\"us_eye2\":%llu,\"us_endframe\":%llu}",
            mode_name(p.mode), p.path == SbsPath::View ? "view" : "frame", p.separation_mm, p.convergence_m,
            p.swap ? "true" : "false", g_main_view, g_applied, (unsigned long long)g_frames_biased.load(),
            (unsigned long long)g_render_frames.load(), (unsigned long long)g_sbs_updates.load(),
-           (unsigned long long)present_frame(), g_taa_forced ? "true" : "false", gpu_status().c_str(),
-           cmdlist_status().c_str(), pass2_status().c_str(), (unsigned long long)g_kicks.load(), (unsigned long long)g_n_timed.load(),
+           (unsigned long long)present_frame(), g_taa_forced ? "true" : "false",
+           *reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable)), g_objvel_forced ? "true" : "false",
+           eyestate_status_json().c_str(), gpu_status().c_str(), cmdlist_status().c_str(), pass2_status().c_str(),
+           (unsigned long long)g_kicks.load(), (unsigned long long)g_n_timed.load(),
            (unsigned long long)g_us_update.load(), (unsigned long long)g_us_eye[0].load(),
            (unsigned long long)g_us_eye[1].load(), (unsigned long long)g_us_end.load());
   return b;
@@ -614,6 +635,7 @@ void register_feature() {
     else if (id == "stereo.test_pan") g_pan_rate = atof(v.c_str());
     else if (id == "stereo.taa") g_p.taa_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.object_velocity") g_p.objvel_in_sbs = (v == "1" || v == "true");
+    else if (id == "stereo.per_eye") g_p.per_eye = (v == "0" || v == "false") ? 0 : v == "2" ? 2 : 1;
     else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
     else if (id == "stereo.sbs_path") g_p.path = v == "frame" ? SbsPath::Frame : SbsPath::View;
     else if (id == "stereo.view_kick") g_view_kick = (v == "1" || v == "true");
@@ -675,6 +697,7 @@ void register_feature() {
   lab_verb("stereo", [](const std::vector<std::string>& a, bool& ok) -> std::string {
     std::string sub = a.empty() ? "status" : a[0];
     if (sub == "status") return status_json();
+    if (sub == "window") return window_status();
     if (!g_hooked) {
       ok = false;
       return json_str("stereo hooks not installed (see torchbearer.log)");
@@ -695,6 +718,10 @@ void register_feature() {
       g_shot_dir = d ? d : ".";
       g_shot_files.clear();
       return json_str("capturing " + std::to_string(g_shots_left) + " frames to " + g_shot_dir);
+    }
+    if (sub == "probe") {
+      eyestate_probe(a.size() > 1 ? atoi(a[1].c_str()) : 4);
+      return json_str("probing the next eye renders into torchbearer.log");
     }
     if (sub == "peek") {  // peek BASE [+OFF | * ]...: BASE = r (RendererX86), img, or an address
       if (a.size() < 2) {
@@ -726,7 +753,7 @@ void register_feature() {
       return r + "]";
     }
     ok = false;
-    return json_str("usage: stereo [status|census N|shots N TAG [SKIP]|files]");
+    return json_str("usage: stereo [status|census N|shots N TAG [SKIP]|files|probe N]");
   });
 }
 
@@ -748,9 +775,11 @@ void start() {
     TB_LOG("stereo: hooks failed; feature disabled");
     return;
   }
+  eyestate_start();  // optional: without it sbs falls back to TAA / object velocity off
   pass2_start();
   present_on(on_present);
   present_filter(present_gate);
+  window_start();
   g_hooked = true;
   TB_LOG("stereo: hooks installed");
 }

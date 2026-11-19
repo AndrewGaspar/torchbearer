@@ -29,6 +29,7 @@ void present_filter(PresentFilterFn fn);
 // while GetDesc/GetDesc1 keep reporting the game's own width. Set it before the swapchain exists.
 void present_set_width_scale(unsigned scale);
 unsigned present_width_scale(IDXGISwapChain* sc);  // the scale this swapchain was created with
+unsigned present_width_scale_pending();             // the scale new swapchains will get
 
 // The object the swapchain was created with: for Direct3D 12 that is the game's
 // ID3D12CommandQueue (not AddRef'd; lives as long as the swapchain). nullptr if unknown.
