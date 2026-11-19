@@ -16,8 +16,13 @@ camera matrices (camera and object motion vectors), the TAA jitter phase (one pe
 both eyes) and the objects' previous transforms, so TAA and object motion blur stay on in sbs
 (measured: the disparity field with TAA on matches the TAA-off one, no cross-eye blending). DLSS has
 one feature, so in sbs it is reset every frame (safe, but soft); a DLSS feature per eye is
-specified, not built. What is not done: window sizing for a real 3840-wide display, per-eye DLSS,
-skinned-animation velocity for the second eye, HUD depth, and a half-SBS (squeezed) output.
+specified, not built. **Both eyes now render inside one engine frame** by default (`sbs_path =
+view`, section 6): `renderFrame` twice inside one `ModeSwitch::render`, beginFrame/endFrame, HUD and
+Present once per update, the HUD duplicated into both halves, render-side state that a render
+advances rewound for the second eye (separation-0 halves 0.036/255 apart), and optionally the
+shadow maps and sky probe reused for the second eye (+10 % fps, `skip_shadows`/`skip_probe`). What
+is not done: per-eye DLSS, HUD depth, a half-SBS (squeezed) output, and convergence with TAA on
+(section 6, open issues).
 
 Every address is an RVA (image base 0x140000000), `Game_f_x64_EOS.exe` as shipped on Epic
 (2026-11). "static" = read in Ghidra (`re/scripts/Serve.java`), "live" = observed with the
@@ -75,8 +80,10 @@ ModeSwitch::render enter
 
 So there is **no separate render thread consuming a frame packet**: the game thread records D3D12
 command lists during `renderFrame` (about 5 ms wall time per call in the prologue scene,
-recording plus submission) and submits the scene's lists at the end of `renderFrame`, the
-HUD/overlay lists and the frame's end in `endFrame`. (`rend::CommandBufferExecuteThread` exists
+recording plus submission) and submits the first half of the scene's lists from inside
+`renderFrame` (the device kick), the second half (lighting, post, the final image) together with
+the HUD/overlay lists and the frame's end in `endFrame` (correction from the command-list census,
+section 6). (`rend::CommandBufferExecuteThread` exists
 in RTTI; with the options seen here all `ExecuteCommandLists` calls come from the game thread, through `0x503184`.) Debug
 render options registered in `0x2b0580`: "Multi Thread Rendering" (u8 `0x955632`), "Split Command
 Buffers" (`0x955635`), "Late Shadow Pass" (`0xd755d6`), "Combined Post Pass" (`0x95566a`), "VSync
@@ -285,12 +292,11 @@ configured 2 × 32.5 mm.
 1. **Re-run the frame's render call per eye** (implemented). `ModeSwitch::render` `0x262cb0` is the
    whole render+present of one game update and the simulation (`ModeSwitch::update` `0x263600`) is
    a separate call. The hook runs it twice: pass 1 with the left eye, pass 2 with the right eye.
-2. Call `renderFrame` twice inside one `ModeSwitch::render`. Feasible and the natural next step:
-   the scene's command lists are submitted before `renderFrame` returns (live), so a copy queued
-   right after the first call is ordered correctly, and the HUD, `beginFrame`/`endFrame` and the
-   swallowed Present would all run once. Needs: where the scene's final image lands before the HUD
-   is drawn over it (the back buffer or `pColorUpsampleRT`), and the HUD composited into both
-   halves. Not done in this spike; (1) was enough to prove same-update pairs.
+2. Call `renderFrame` twice inside one `ModeSwitch::render`: **implemented, the default**
+   (`sbs_path = view`, section 6). The premise here was wrong in one point: only the first half of
+   a render's lists is submitted inside `renderFrame`; the half holding lighting, post and the
+   final image is submitted later (section 6), so the copy has to be recorded into the engine's
+   own list. (1) stays available as `sbs_path = frame`.
 3. Hold the simulation every other frame (time-frozen alternate frames). Not needed: (1) gets the
    same guarantee without touching the simulation.
 
@@ -323,8 +329,8 @@ configured 2 × 32.5 mm.
 | object motion vectors (View+0x88/+0x108 previous camera; object +0xb8 previous world) | the eye offset reads as object velocity: the player smears (captured); the second eye had no object motion at all (measured) | **done**: per-eye previous View matrices; objects keep the previous update's transform for the second eye | skinned animation (vertex buffers double-buffered by frame parity) still zero for the second eye |
 | DLSS (`0xd75620`, one NGX feature at device+0x38a8) | one history for both eyes: the disparity collapses (measured) | **reset every frame** while sbs runs (no cross-eye blending, but no accumulation: soft) | one DLSS feature per eye (section 5) |
 | frame counters (`0xb188d8`, `0xd744f8`) | advance twice per update: jitter sequence and anything keyed on frame parity runs at 2x | jitter: renderFrame is lent a per-update counter (same jitter for both eyes); the rest unchanged | pin per update once beginFrame runs once per update |
-| auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | none visible; the separation-0 control leaves a small residual (mean 0.81/255) | audit each `*_update` in renderWorld; skip on pass 2 |
-| HUD | drawn per eye at zero disparity | fine | draw once / at chosen depth |
+| auto exposure, GPU particles, cloth, foliage repulsion (render-side sims) | step per render, so twice per update and possibly differently per eye | the separation-0 residual (0.81/255) was film grain (random offset per render), the motion-blur/TAA frame-time rings and lens flares | **done in the view path** (section 6): rewound for the second eye, residual 0.036/255 |
+| HUD | drawn per eye at zero disparity | fine | **view path**: drawn once, duplicated into both halves (section 6) |
 | frame pacing | ModeSwitch::render waits 4.17 ms per call | fine | — |
 
 ### Cost (measured, run r17, `quiver lab gpu -- re/scripts/stereo_rate.sh awr`, GPU to itself)
@@ -348,17 +354,16 @@ frame rate, as expected for true stereo; the pass-2 shortcuts in section 4 are w
    Ishimura's anamorphic route. The window is made 3840x1080 (2x the engine's size) with the
    engine kept at one eye, menus usable with the mouse over either half: done, see
    [stereo-output.md](stereo-output.md).
-2. **Dual render per update**: keep the `ModeSwitch::render` ×2 structure. It reuses every engine
-   system unchanged and costs one extra render per update (CPU submit + GPU), which is the
-   unavoidable price of true stereo.
+2. **Dual render per update**: done both ways; the default is `renderFrame` ×2 inside one
+   `ModeSwitch::render` (section 6), the `ModeSwitch::render` ×2 structure is the fallback.
 3. **Temporal state per eye**: done for TAA (history pair, index, jitter), camera and object
    motion vectors (section 5). Remaining: a DLSS feature per eye, skinned-animation velocity for the
    second eye, and an audit of render-side simulations (particles, exposure, SSAO and volumetric
    temporal buffers) to step once per update.
-4. **Pass-2 shortcut**: skip work that is eye-independent on pass 2 (shadow maps, cube probe,
-   GPU sims) by recognising those passes in renderWorld. Shadow cascades are fitted to the view
-   frustum, so they are nearly eye-independent; reusing them is a large saving.
-5. **HUD**: draw once into the composite (or per eye with a chosen disparity).
+4. **Pass-2 shortcut**: done for the shadow pass and the sky probe (section 6, ~10 %); render-side
+   state the second eye would step again is rewound (flares, grain, frame-time rings).
+5. **HUD**: drawn once and duplicated into both halves at zero disparity (section 6); a chosen
+   depth would shift the duplicate.
 6. **Comfort defaults**: separation 32.5 mm per eye with convergence 3-5 m for third person,
    measured on the glasses.
 
@@ -537,6 +542,225 @@ DLSS mode/handle/reset).
 
 ---
 
+## 6. Both eyes in one engine frame (`sbs_path = view`, the default)
+
+Code: `hk_modeSwitchRender` / `render_view_sbs` in `stereo.cpp`, `cmdlist.{h,cpp}` (D3D12
+command-list layer), `gpu_stash_mid` / `gpu_place_mid` in `gpu.cpp`, `pass2.{h,cpp}` (second-eye
+handling). `sbs_path = frame` keeps the `ModeSwitch::render` ×2 path of section 3.
+
+### How the engine submits a render (live, `stereo census N cl`)
+
+`census N cl` also traces the command-list calls that touch the back buffer (barriers, copies,
+`OMSetRenderTargets` with the RTV/DSV handles, list resets/closes with draw counts, the lists in
+each `ExecuteCommandLists`). Mono frame, prologue-road:
+
+```
+ModeSwitch::render enter
+  ~23 command lists Reset (a per-frame pool, handed out in order)
+  ExecuteCommandLists n=1                       <- frame-start list: barrier bb PRESENT -> RENDER_TARGET
+  beginFrame; renderFrame
+    ExecuteCommandLists n=14..15 IN-RENDERFRAME <- the device "kick": every list closed so far
+                                                   (shadows, probe, depth/G-buffer: ~4200 draws)
+    list X: OMSetRenderTargets(back buffer, no DSV), 1 draw   <- the final post pass, recorded but
+                                                                 NOT submitted
+  renderFrame leave
+  endFrame
+    lists closed: 61, 2822, 2237, 200, 200, 200, 54 draws, list X (bb_draws 1 + HUD draws)
+    ExecuteCommandLists n=8                     <- lighting/forward/post + the final image + HUD
+    ExecuteCommandLists n=1                     <- barrier bb RENDER_TARGET -> PRESENT
+  Present
+```
+
+So, unlike what section 3 assumed, a render's lists go out in **two batches**: the kick inside
+`renderWorld` (the device's vtable +0x378, `0x4f6280` → `0x4f62b0` → `0x5034c0` →
+`ExecuteCommandLists` at `0x503184`; called once per render from the main pass `0x506b20`, before or
+after the shadow pass depending on "Late Shadow Pass"), and `endFrame`. The second batch holds
+about 5700 of ~10000 draws and the final post pass into the back buffer (static: `renderWorld`
+`0x5090b0` ends with `0x532030(post, scene, target)`, the target being the device's back-buffer RT
+from `device->vtbl[+0x48]`; live: the `OMSetRenderTargets` on the back buffer is after the kick).
+The HUD (`GameMode::render` → `0x335550`/`0x33b180` and the other modes' `render`) records into the
+back buffer's list with the scene DSV bound (live: `ds=0x...` on its `OMSetRenderTargets`).
+
+### What the view path does per update
+
+```
+ModeSwitch::render (once)          beginFrame (once: counter 0xb188d8, RendererX86 beginFrame
+                                   0x5064a0 -> render counter 0xd744f8 and frame time 0xd74504)
+  renderFrame hook:
+    pass2_eye(0); render_eye(LEFT)                  (eyestate: per-eye TAA/velocity, jitter)
+    gpu_stash_mid: barrier bb RT->COPY_SRC, copy bb[0,1920) -> eye texture 0, barrier back,
+                   RECORDED INTO THE ENGINE'S OPEN BACK-BUFFER LIST (after its post pass)
+    engine kick (device vtbl +0x378)               -> the left eye's second batch goes out now
+    pass2_eye(1); render_eye(RIGHT)                 (rewinds; optional shadow/probe reuse)
+    gpu_place_mid (also recorded into the engine's open back-buffer list):
+                   bb[0,1920) -> eye texture 1; eye 0 -> bb[0,1920); eye 1 -> bb[1920,3840)
+    overlay duplication armed
+  HUD / other modes: each draw into the back buffer is issued twice (viewport and scissor
+                   +1920 px, DSV unbound for the copy since rasterisation is limited to the
+                   smallest bound target, the 1920-wide depth buffer)
+endFrame (once): ExecuteCommandLists n=8, n=1; Present (once, nothing swallowed)
+```
+
+Why the copies are recorded into the engine's list: a list of ours submitted when `renderFrame`
+returns runs *before* the eye's second batch (live, first attempt: the stash captured the back
+buffer before the post pass). Recording into the list that last bound the back buffer (tracked by
+the `OMSetRenderTargets` hook, still open at that point) puts the copy right after the post pass in
+GPU order; with the kick the list is closed and submitted immediately after. The back buffer's
+state at that point is whatever the engine's barriers left it in (tracked per back buffer from
+`ResourceBarrier`, record time: `RENDER_TARGET`); each copy transitions from and back to it.
+Live census of a view-path update (r6/r13): the stash copy and its barriers inside the left eye's
+back-buffer list, `ExecuteCommandLists` of that list from the kick, the right eye's lists, the
+placement copies inside the right eye's back-buffer list, then the HUD's draws with `dups=4`.
+
+Why the kick matters (measured, GPU shared with another instance, so GPU-bound): without it the left
+eye's second batch waited for the right eye's kick, the GPU idled meanwhile, and the view path ran
+61 renders/s against 70 for the frame path; with it 69.1-69.4 for both.
+
+Frame-level work now once per update: beginFrame/endFrame (screenshot/scaling bookkeeping, the
+`0xb188d8` counter), the HUD and overlays, the frame-start/end barrier lists, Present, the
+renderer's beginFrame (`0x5064a0`: render counter, frame time, per-frame resource rings). Both eyes
+see the same render counter, so per-object "once per frame" updates (stamps compared with
+`0xd744f8`: skinning `0x46dff0`/`0x4b2390`, `0x46ea00`) run in the first eye only and the second
+eye reuses them, including the skinned vertex buffers double-buffered by counter parity
+(`0x46d650/0x46d680`; section 5): with both eyes on one counter value the second eye uses the
+first eye's buffer and the previous one is last update's, i.e. skinned animation velocity is
+right in both eyes. GPU rings keyed on `counter % n` (auto exposure `0x480340`/`0x480bf0`: a ring of
+1x1 exposure RTs and readback buffers; `0x4b5a60`/`0x4b6950`): the second eye reads the same
+previous slot and writes the same current slot as the first, in GPU order after it, so the result
+is the second eye's (equal to the first's within the luminance difference between the eyes); the
+CPU readback of a slot happens `n` frames later (static). No overwrite hazard: one queue, in order.
+
+### Second eye: state a render advances (`pass2.cpp`, measured)
+
+Separation 0 in the view path should give identical halves (same update, same camera). It did not:
+mean |L−R| 3.88/255 (r6), 0.95 after the flare fix. Causes found, each verified by switching it:
+
+- **Lens flares** (`rend::Flare` vtable `0x78f768` slot 8, `0x492bb0`, static): per render the flare
+  pushes its occlusion query result into a 10-sample average and resets the average unless it last
+  ran on frame `counter − 1` (+0x130). Twice in one frame the second call resets it: no flares in
+  the second eye (captured: the street lamp's flare only in one half). Fix: the flare's state
+  (+0xd0 index, +0xd4 count, the ring at +0xe0, +0xe8/+0xec fade, +0x130) is snapshotted before the
+  first eye's call and put back before the second eye's (`stereo.flare_rewind`).
+- **Film grain** (static): the post object (RendererX86+0x118) draws `g_vRandomOffset` for the grain
+  from a Mersenne Twister at +0xa8 (624 words + index at +0x9c0, `0x3e64e0`) every render, so the
+  two eyes got different grain. With grain off in the game's options the residual fell from 0.95 to
+  0.10/255 (r6).
+- **Frame-time rings** of motion blur (`0x470750`: globals `0x955618` index, `0x95561c` count,
+  `0x955620` capacity, `0x955628` float*) and TAA (`0x49a8c0`: `0x955850..0x955860`): every render
+  pushes the frame time, so the second eye averaged one more sample. Motion blur off: 0.10 → 0.035.
+
+The generator and both rings are snapshotted when the first eye starts and put back when the second
+starts (`stereo.rewind`); a ring is restored only if its array pointer is unchanged (it is
+allocated lazily on first use, which can happen during the first eye: live crash when the whole
+header was rewound right after motion blur was switched on). Result (r7, grain and motion blur on,
+TAA off): 0.052-0.111/255 (max 3) with, 0.56/255 without. Remaining residual: the volumetric light
+shafts (temporal buffer `0x4e3020`, single history across eyes, section 5). With master's per-eye
+TAA: **0.036-0.038/255** (max 6, r16 battery) and 0.001-0.012/255 in `awr-forest-night` (r18/r19).
+Not bit-identical, and not yet explained: a flock of birds attacking in `awr-forest-night` (r19,
+during the scripted attack, radial blur): 0.19-0.22/255 with no second-eye skips, the difference
+confined to the birds (and 2.5/255 once in r18 during the attack with the flashlight burst); some
+per-render state of that effect (swarm/particle step) is not rewound yet.
+
+Exposure (`0x480340`) needs no rewind in this path: it adapts from the previous slot to the
+current one in each eye with the same frame time, so both eyes compute the same exposure (the
+frame path instead adapted twice per update).
+
+### Second eye: work reused instead of redone (`skip_shadows`, `skip_probe`, default on)
+
+- **Shadow pass** `0x50dba0` (static: called once per `renderWorld`, early from `0x5090b0` or late
+  from `0x506b20`; shadow-filter globals, shadow manager begin RendererX86+0xf0 vtbl+0x18, each
+  visible light's shadow render vtbl+0x40). For the second eye the hook returns without calling it:
+  the light objects keep the first eye's shadow maps and shadow matrices (same update, same lights).
+  Cascades are fitted to the first eye's frustum; the second eye's is 65 mm to the side.
+- **Sky cube probe** `0x512220` (from the sky/atmosphere update `0x4a85d0`: the 6-face sky cube via
+  the static PerspectiveView `0xdc44f0`, its filtering, the SH terms; `g_sAmbientSHTerms`,
+  `g_sEnvironmentReflectionCube`): skipped for the second eye.
+
+Draws recorded (live census, prologue-road): first eye ~4200 before the kick + ~5700 after; second
+eye with both skips ~2960 + ~5720 (−1370 draws: the shadow pass and probe). The large second-batch
+lists (2600-2800 and 2000-2200 draws) are view-dependent geometry and stay.
+
+Verification (measured):
+- Separation 0 with the skips (second eye reuses, first eye rendered them): prologue-road 0.054-0.118
+  vs 0.052-0.111/255 without (r7); forest-night with the flashlight, interleaved off/on ×3 (r18):
+  0.007-0.012 vs 0.004-0.009/255, ×5 during the bird attack (r19): same level for off and on except
+  the flock (see above). Each skip alone 0.008/255 (r18).
+- Disparity field at 32.5 mm with skips off/on (prologue-road r7): player 29.03 / 28.91 px (probe
+  only 28.54, second off-capture 28.64), median of all patches +3.91 / +4.01 px, bins 20-60 / 10-20 /
+  5-10 / 1-5 px 170/529/391/989 vs 178/526/419/929 (captures ~70 updates apart, idle motion).
+  Forest-night (r18): player 29.95 off, 30.12 / 30.15 on.
+- Shadows in the second eye: present and in place with the reuse (flashlight beam, the boat's and
+  the debris's shadows; crop below). Frustum-edge artifacts: none seen at the left/right edges of
+  the right eye; at 65 mm the cascade fit margin covers the offset.
+- An A/B "render the second eye twice in one update, once with and once without the skips" lever
+  was tried and dropped: the third render is not equivalent (per-frame stamps already taken), so
+  its differences measured the lever, not the skips.
+
+![second eye with and without reused shadows](img/stereo-eye2-shadows-skip.jpg)
+
+*Right eye (rendered second), awr-forest-night r18, separation 32.5 mm: left rendered in full,
+right with the first eye's shadow maps and sky probe. Captures ~100 updates apart (the player
+turned slightly); shadows of the boat, debris and the flashlight beam are the same.*
+
+### Battery on the view path (measured, instance awr-pass run r16)
+
+`re/scripts/stereo_battery.sh` + `stereo_analyse.py`, prologue-road, 3840x1080 borderless, view
+path with both reuses on, TAA and object velocity per eye (master defaults). (Run numbers in this
+section are the awr-pass instance's.)
+
+| | view path (r16) | section 2 (frame path, TAA off, awr r16) |
+|---|---|---|
+| sep 0: \|L−R\| mean, disparity median | **0.036 / 0.038 /255** (max 6), +0.001 / 0.000 px (p5..p95 ±0.04) | 0.81/255 (max 14), +0.009 px (−0.23..+1.29) |
+| 16.25 / 32.5 / 65 mm: median of all patches | +1.79 / +3.94 / +7.63 px | +2.62 / +4.64 / +8.96 px (other camera pose) |
+| per-patch ratio 32.5/16.25, 65/16.25, 65/32.5 (requested 2, 4, 2) | **1.999, 3.984, 1.996** | 2.00/1.89/1.95/1.84 by bin, 3.05-3.85 |
+| field at 32.5 mm, 20-60 / 10-20 / 5-10 / 1-5 px | 190 / 525 / 415 / 915 patches | 423 / 364 / 435 / 769 |
+| pan 0.5°/update, far field: sbs halves vs alternate | +3.29..+3.62 px vs **+10.2 / +11.1 px** | +1.73 / +1.76 vs +12.69 / +12.35 px |
+| convergence 4 m: recovered Zc | 10.2 m (TAA on; see open issues) | 3.90 m |
+
+The scaling is now essentially exact because both eyes of a pair are one frame and the separations
+are taken minutes apart only between pairs. The player measured 29.07 px at 32.5 mm (r16, median of
+the patches ≥ 20 px), as in section 2 (29.4 px).
+
+![view path, both eyes in one frame](img/stereo-view-sbs.jpg)
+
+*3840x1080 view-path frame (downscaled), r16, prologue-road, 32.5 mm, TAA per eye: both eyes from
+one engine frame, the HUD hint drawn once and duplicated into both halves.*
+
+### Cost (measured, `quiver lab gpu --for awr-pass -- re/scripts/stereo_rate.sh awr-pass`, r16)
+
+GPU to itself (only awr-pass on it, 3840x1080 gamescope display, borderless, prologue-road, TAA and
+object velocity on per eye), two rounds:
+
+variant | renders/s | displayed frames/s | CPU ms per update (update / eye 1 / eye 2 / endFrame)
+---|---|---|---
+off (mono) | 142.5 / 143.3 | 142.5 / 143.3 | 5.72 / 5.36 / – / 0.27
+frame (ModeSwitch::render ×2) | 146.2 / 145.7 | 73.2 / 72.7 | 12.3 / 5.44 / 6.07 / 0.60
+view (renderFrame ×2) | 146.3 / 144.3 | 73.2 / 72.3 | 12.4 / 5.65 / 6.18 / 0.21
+view + shadow and probe reuse | 163.4 / 159.2 | **81.8 / 79.5** | 11.0 / 5.02 / 5.42 / 0.20
+
+Earlier, with the GPU shared (awr-taa rendering; r13): mono 69.4, frame 34.7, view 34.6, view +
+skips 39.6-39.9 fps (+14 %); shadows alone 39.4, probe alone ~0 (within noise). In this scene the
+game is CPU-bound on its single render thread when it has the GPU (≈5.5 ms of recording per eye),
+so the view path's savings (one beginFrame/endFrame and Present, the HUD once) are small and the
+reuse gains about 10 %; when the GPU is the limit, the reuse gains more. The rest of a render is
+view-dependent.
+
+### Open issues
+
+- **Convergence with TAA on** (both paths; came with per-eye TAA on by default): parallel −
+  converged at 4 m measured +6.2 px (frame path +5.1, view +6.5) instead of a uniform +18.86 px,
+  i.e. the TAA resolve largely removes the post-projection shift. TAA off: +15.5 px (Zc 4.85 m;
+  grain off). Film grain identical in both eyes (now) biases the disparity tool towards 0 in
+  flat fog, so measure convergence with grain off. Candidate fix: apply convergence as a
+  horizontal shift in the compositor copies (`gpu_place_mid`) instead of in the projection.
+- The bird flock in forest-night differs between eyes (above).
+- Lab: in a 1920x1080 display with `output = full` and windowed mode the window logic shrinks the
+  engine to 160x240 (r15; `stereo window: resize ...` chain). Measured instead on a 3840x1080
+  display, borderless, as `docs/stereo-output.md` prescribes.
+- One crash in forest-night ~10 s in-world (r17, view path, no skips), not reproduced in r18/r19.
+
+---
+
 ## Reproducing
 
 ```sh
@@ -550,13 +774,14 @@ quiver lab wait awr in-world                         # ~11 s with the levels fea
 # (without [dev] start_level: re/scripts/awr_to_world.sh awr steps warning -> title -> Continue)
 re/scripts/stereo_battery.sh awr                     # captures into the run folder
 python3 re/scripts/stereo_analyse.py <run folder>
-quiver lab gpu -- re/scripts/stereo_rate.sh awr     # renders/s and displayed frames/s per mode
+quiver lab gpu --for awr -- re/scripts/stereo_rate.sh awr 40 "off frame view view+skip"   # per variant
 quiver lab call awr stereo census 2                  # frame-structure trace into torchbearer.log
+quiver lab call awr stereo census 2 cl               # ... plus command lists touching the back buffer
 re/scripts/stereo_taa_battery.sh awr                 # per-eye temporal state variants (section 5)
 python3 re/scripts/stereo_taa_analyse.py <run folder>
 VARIANTS="dlssshared:1:1:0 dlssreset:1:1:1" re/scripts/stereo_taa_battery.sh awr   # with game.dlss on
 ```
 
-Lab verbs: `stereo status | census N | shots N TAG [SKIP] | files | probe N`, `tweak list [SUBSTR] | tweak NAME
+Lab verbs: `stereo status | census N [cl] | shots N TAG [SKIP] | files | probe N | peek r|img|ADDR [+OFF|*]...`, `tweak list [SUBSTR] | tweak NAME
 [VALUE]`, `cfg stereo.<key> <value>`. Ghidra: `re/scripts/Serve.java` (headless query server) and
 `re/scripts/ghq` (client).

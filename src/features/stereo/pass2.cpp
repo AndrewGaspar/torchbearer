@@ -53,7 +53,7 @@ bool sig_ok(const Sig& s) {
 }
 
 std::atomic<int> g_slot{-1};
-std::atomic<bool> g_skip_shadows{false}, g_skip_probe{false}, g_flare_rewind{true};
+std::atomic<bool> g_skip_shadows{true}, g_skip_probe{true}, g_flare_rewind{true};
 std::atomic<uint64_t> g_n_shadow_skip{0}, g_n_probe_skip{0}, g_n_flare_rewind{0}, g_n_flare_first{0};
 
 // --- flares ------------------------------------------------------------------------------------

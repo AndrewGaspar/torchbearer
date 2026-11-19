@@ -78,6 +78,10 @@ options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.converge
 title = "Temporal effects in 3D"
 options = ["stereo.taa", "stereo.object_velocity"]
 
+[[page.group]]
+title = "3D rendering"
+options = ["stereo.sbs_path", "stereo.skip_shadows", "stereo.skip_probe"]
+
 [[page]]
 id = "diagnostics"
 title = "Diagnostics"
@@ -732,3 +736,31 @@ help = "Boots without the 6-second epilepsy warning screen."
 default = true
 level = "basic"
 apply = "restart"
+
+[option."stereo.sbs_path"]
+type = "enum"
+label = "Eye rendering"
+help = "One frame: both eyes are rendered inside one engine frame (HUD, frame bookkeeping and Present once per game update; the HUD is copied into both halves). Two frames: the whole engine frame runs twice per update (the older path, kept as a fallback)."
+values = [
+  { value = "view", label = "Both eyes in one frame" },
+  { value = "frame", label = "Two frames per update (fallback)" },
+]
+default = "view"
+level = "advanced"
+apply = "live"
+
+[option."stereo.skip_shadows"]
+type = "bool"
+label = "Share shadow maps between eyes"
+help = "The second eye reuses the shadow maps the first eye rendered in the same update instead of rendering them again (eye-independent work; about 10 % faster). One-frame eye rendering only."
+default = true
+level = "advanced"
+apply = "live"
+
+[option."stereo.skip_probe"]
+type = "bool"
+label = "Share the sky probe between eyes"
+help = "The second eye reuses the sky cube and ambient lighting the first eye computed in the same update. One-frame eye rendering only."
+default = true
+level = "advanced"
+apply = "live"
