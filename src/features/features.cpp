@@ -4,6 +4,7 @@
 #include "core/lab.h"
 #include "features/levels.h"
 #include "features/settings.h"
+#include "features/stereo/stereo.h"
 
 namespace tb {
 
@@ -19,11 +20,13 @@ void features_register() {
   });
   settings_register();
   levels_register();
+  stereo::register_feature();
 }
 
 void features_start() {
   settings_start();
   levels_start();
+  stereo::start();
 }
 
 }  // namespace tb
