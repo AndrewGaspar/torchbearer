@@ -369,9 +369,41 @@ void render_view_sbs(void* r, void* view, void* a3, void* a4, const Params& p) {
 // image holds the full-width view squeezed 2:1, which the compositor stretches back. Applied from
 // the game's own values each update (the game rewrites them; ours are recognised and not
 // compounded).
+// Preferred route (live-verified, docs/stereo-output.md): the game's one aspect getter,
+// DisplaySettings::aspect (RVA 0x1e05d0, `+0x20 / +0x24` of the display object), feeds the 3D camera
+// AND the 2D UI context (its +0x70, which scales every glyph and sprite horizontally). Reporting
+// twice the real aspect makes the game itself lay the UI out at 16:9 and pick the 16:9 field of
+// view, both squeezed into the half-width eye. anamorphic_apply below is the fallback when that
+// hook is unavailable (signature mismatch).
+constexpr uintptr_t kRvaAspect = 0x1e05d0;
+constexpr uint8_t kSigAspect[21] = {0x66, 0x0f, 0x6e, 0x41, 0x20, 0x66, 0x0f, 0x6e, 0x49, 0x24, 0x0f,
+                                    0x5b, 0xc0, 0x0f, 0x5b, 0xc9, 0xf3, 0x0f, 0x5e, 0xc1, 0xc3};
+using Aspect_t = float(__fastcall*)(void*);
+Aspect_t o_aspect;
+std::atomic<bool> g_aspect_hooked{false}, g_ana_on{false};
+float __fastcall hk_aspect(void* display) {
+  float a = o_aspect(display);
+  return g_ana_on.load(std::memory_order_relaxed) ? a * 2.0f : a;
+}
+
+// The pixel-sized UI (menu logo, button prompts…) uses DisplaySettings::invResolution (RVA
+// 0x1e0650, out = {1/w, 1/h}, letterbox-adjusted): "1024 px" becomes 1024/w of the screen. With
+// the engine at half width that doubles; report 1/(2w) so it matches the 16:9 layout above.
+constexpr uintptr_t kRvaInvRes = 0x1e0650;
+constexpr uint8_t kSigInvRes[16] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x44, 0x8b, 0x51,
+                                    0x20, 0x45, 0x33, 0xc0, 0x44, 0x8b, 0x59, 0x24};
+using InvRes_t = float*(__fastcall*)(void*, float*);
+InvRes_t o_invres;
+float* __fastcall hk_invres(void* display, float* out) {
+  float* r = o_invres(display, out);
+  if (out && g_ana_on.load(std::memory_order_relaxed)) out[0] *= 0.5f;
+  return r;
+}
+
 float g_ana_orig_fov = 0, g_ana_orig_aspect = 0, g_ana_set_fov = -1, g_ana_set_aspect = -1;
 std::atomic<uint64_t> g_ana_applied{0};
 void anamorphic_apply(void* view) {
+  if (g_aspect_hooked.load(std::memory_order_relaxed)) return;  // the game does it (hk_aspect)
   float& fov = at<float>(view, view::kFov);
   float& aspect = at<float>(view, view::kAspect);
   if (!(fov == g_ana_set_fov && aspect == g_ana_set_aspect)) {
@@ -712,6 +744,7 @@ void register_feature() {
       // creation; hsbs additionally squeezes each eye (anamorphic, above). half: legacy crop.
       present_set_width_scale(v == "full" || v == "hsbs" ? 2 : 1);
       g_p.anamorphic = v == "hsbs";
+      g_ana_on = g_p.anamorphic;
       g_tag_layout = v == "full" ? "sbs" : v == "hsbs" ? "hsbs" : "";
       update_window_tag();
     }
@@ -859,6 +892,14 @@ void start() {
   present_on(on_present);
   present_filter(present_gate);
   window_start();
+  if (memcmp(reinterpret_cast<const void*>(img.at(kRvaAspect)), kSigAspect, sizeof kSigAspect) == 0 &&
+      hook_fn((void*)img.at(kRvaAspect), (void*)hk_aspect, (void**)&o_aspect, "DisplaySettings::aspect"))
+    g_aspect_hooked = true;
+  else
+    TB_LOG("stereo: aspect getter not hooked; hsbs falls back to the camera-only anamorphic override");
+  if (!(memcmp(reinterpret_cast<const void*>(img.at(kRvaInvRes)), kSigInvRes, sizeof kSigInvRes) == 0 &&
+        hook_fn((void*)img.at(kRvaInvRes), (void*)hk_invres, (void**)&o_invres, "DisplaySettings::invResolution")))
+    TB_LOG("stereo: inverse-resolution getter not hooked; pixel-sized UI stays twice as wide in hsbs");
   g_hooked = true;
   TB_LOG("stereo: hooks installed");
 }

@@ -120,10 +120,27 @@ stereo.cpp). Each half then holds the full 16:9 view squeezed 2:1 (captured: sam
 1920-per-eye render, everything half as wide), which the compositor's stretch undoes. Convergence
 shifts are computed in the squeezed eye's pixels (hit −4/+5 at 4 m, half of full's −9/+10).
 
-Known issue: the game's 2D UI lays itself out for the 960x1080 screen it is told about (element
-sizes follow the height, positions the width), so after the 2x stretch menus are twice as wide and
-the pause menu's logo overlaps its items (captured). Fix candidate: let the UI lay out at 16:9 and
-draw it squeezed into each half (needs the UI's screen size; not found yet).
+**UI (fixed in 0.4.6; static + live).** The game's 2D UI first laid itself out for the 960x1080
+screen it is told about, so after the 2x stretch menus and HUD were twice as wide (the pause
+menu's logo overlapped its items). Two getters on the display-settings object
+(`FUN_1401e0630()`, its `+0x20`/`+0x24` = the engine's width/height) feed all of it:
+- `DisplaySettings::aspect` (`0x1e05d0`, `w/h`): written into the 2D context's `+0x70`
+  (context `*0xd6b598`, set at boot by `0x2ab8f0` and per menu by `0x249690`/`0x24b4e0`), which
+  divides every glyph's and sprite's horizontal size (`0x465ca0`); also used by the menu
+  backdrop video's fit test (`0x256340`) and by the 3D camera's Hor+ FOV;
+- `DisplaySettings::invResolution` (`0x1e0650`, `{1/w, 1/h}`): pixel-sized UI, e.g. the menu
+  logo is `1024 px · 1/w` wide (`0x248090`).
+
+With `output = hsbs` the mod reports twice the aspect and half of `1/w`, i.e. the UI (and the
+camera) are laid out for 16:9 / 1920 wide and drawn squeezed into the 960-wide eye. Live: the 2D
+context aspect reads 1.7778 (was 0.8889), the camera FOV/aspect come out 1.3823 / 1.7778 from the
+game itself (the camera-only `anamorphic_apply` now stands down; it remains the fallback if the
+getter's signature changes), and stretched captures of the pause menu and the level-15 HUD match
+the full-resolution layout element for element.
+
+![hsbs pause menu, stretched as in the glasses](img/stereo-hsbs-menu.jpg)
+
+![HUD: full-resolution eye (top) vs hsbs eye stretched 2x (bottom)](img/stereo-hsbs-hud.jpg)
 
 ### The window tag (live, on the real HypXRland session)
 
