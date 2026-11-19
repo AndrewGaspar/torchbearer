@@ -27,7 +27,9 @@ add_library(torchbearer SHARED
   src/core/present.cpp
   src/core/module.cpp
   src/core/hyprland.cpp
+  src/core/camera.cpp
   src/features/features.cpp
+  src/features/firstperson.cpp
   src/features/stereo/stereo.cpp
   src/features/stereo/gpu.cpp
   src/features/stereo/cmdlist.cpp
