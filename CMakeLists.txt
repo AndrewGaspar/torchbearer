@@ -29,6 +29,10 @@ add_library(torchbearer SHARED
   src/features/features.cpp
   src/features/stereo/stereo.cpp
   src/features/stereo/gpu.cpp
+  src/features/intro.cpp
+  src/features/settings.cpp
+  src/features/settings_keys.cpp
+  src/features/levels.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 target_include_directories(torchbearer PRIVATE src third_party)
@@ -39,10 +43,12 @@ target_link_options(torchbearer PRIVATE -static -static-libgcc -static-libstdc++
   -Wl,--enable-stdcall-fixup)
 target_link_libraries(torchbearer PRIVATE minhook dxguid uuid)
 
-# Everything a mod folder needs: the DLL plus the shipped config and Quiver schema.
-add_custom_command(TARGET torchbearer POST_BUILD
+# Everything a mod folder needs: the DLL plus the shipped config and Quiver schema. Re-copied on
+# every build (not only when the DLL relinks), so dist/ edits always reach build/mod.
+add_custom_target(mod ALL
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/mod
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:torchbearer> ${CMAKE_BINARY_DIR}/mod/dxgi.dll
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/dist/torchbearer.ini ${CMAKE_BINARY_DIR}/mod/
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/dist/quiver-mod.toml ${CMAKE_BINARY_DIR}/mod/
-  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/dist/quiver-options.toml ${CMAKE_BINARY_DIR}/mod/)
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:torchbearer> ${CMAKE_BINARY_DIR}/mod/dxgi.dll
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/dist/torchbearer.ini
+    ${CMAKE_SOURCE_DIR}/dist/quiver-mod.toml ${CMAKE_SOURCE_DIR}/dist/quiver-options.toml
+    ${CMAKE_BINARY_DIR}/mod/
+  DEPENDS torchbearer)

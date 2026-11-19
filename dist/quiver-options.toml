@@ -2,20 +2,623 @@ format = 1
 surface = "torchbearer"
 title = "Torchbearer"
 help = "Alan Wake Remastered: the game's own settings, live, and stereoscopic 3D."
+audited = "2026-11-18: game.* and keys.* written with src/features/settings.cpp; every id, range and apply mode checked in the lab (docs/settings.md)."
 
 [match]
 files = ["torchbearer.ini"]
 
+# The mod re-reads torchbearer.ini every 250 ms and also takes values live over the mod SDK.
+# The game's settings (ids game.* and keys.*) are applied through the game's own code on its main
+# thread (docs/settings.md). A setting with no value leaves the game's own value alone; a change
+# made in the game's own menu is reported back and saved to the profile.
 [file.ini]
 path = "torchbearer.ini"
 format = "ini"
 owner = "quiver"
 reload = "poll"
 
+# ---------------------------------------------------------------- pages
+
+[[page]]
+id = "display"
+title = "Display"
+options = ["game.resolution", "game.display_mode", "game.vsync", "game.dlss",
+           "game.resolution_scale", "game.hdr", "game.monitor"]
+
+[[page]]
+id = "picture"
+title = "Picture"
+options = ["game.brightness", "game.fov", "game.motion_blur", "game.film_grain", "game.hud",
+           "game.hud_size"]
+
+[[page]]
+id = "quality"
+title = "Graphics quality"
+options = ["game.quality", "game.taa", "game.fxaa", "game.msaa", "game.anisotropy",
+           "game.shadows", "game.volumetrics", "game.terrain", "game.draw_distance"]
+
+[[page]]
+id = "audio"
+title = "Audio and subtitles"
+options = ["game.music", "game.effects", "game.speech", "game.cinematic", "game.english_speech",
+           "game.subtitles", "game.subtitle_size", "game.subtitle_background", "game.commentary"]
+
+[[page]]
+id = "controls"
+title = "Controls"
+options = ["game.invert_y", "game.invert_x", "game.mouse_sensitivity_x",
+           "game.mouse_sensitivity_y", "game.direct_aiming", "game.modern_camera"]
+
+[[page.group]]
+title = "Gamepad"
+options = ["game.gamepad_sensitivity", "game.vibration", "game.gamepad_layout",
+           "game.driving_layout", "game.swap_sticks", "game.swap_triggers"]
+
+[[page]]
+id = "keys"
+title = "Key bindings"
+options = ["keys.move_forward", "keys.move_backward", "keys.move_left", "keys.move_right",
+           "keys.turboboost", "keys.walk", "keys.jump", "keys.use", "keys.reload",
+           "keys.shoot", "keys.light_boost", "keys.throw_item", "keys.reload_battery",
+           "keys.look_at", "keys.toggle_manuscript", "keys.inventory_right", "keys.inventory_up",
+           "keys.inventory_left", "keys.inventory_down", "keys.inventory_extra",
+           "keys.toggle_side"]
+
+[[page]]
+id = "startup"
+title = "Startup"
+options = ["intro.skip_startup_video", "intro.skip_logo_screens", "intro.skip_epilepsy_warning"]
+
 [[page]]
 id = "diagnostics"
 title = "Diagnostics"
 options = ["log.verbose"]
+
+# ---------------------------------------------------------------- display
+
+[option."game.resolution"]
+type = "string"
+label = "Resolution"
+help = "Width x height, e.g. 1920x1080. Ignored in borderless mode, which uses the display's own resolution."
+pattern = '^[0-9]{3,5}x[0-9]{3,5}$'
+apply = "live"
+
+[option."game.display_mode"]
+type = "enum"
+label = "Window mode"
+values = [
+  { value = "fullscreen", label = "Fullscreen" },
+  { value = "windowed", label = "Windowed" },
+  { value = "borderless", label = "Borderless" },
+]
+apply = "live"
+
+[option."game.vsync"]
+type = "bool"
+label = "VSync"
+default = "0"
+apply = "live"
+
+[option."game.dlss"]
+type = "enum"
+label = "NVIDIA DLSS"
+help = "Replaces the game's anti-aliasing while on (TAA and MSAA are switched off, as the game's menu does)."
+values = [
+  { value = "off", label = "Off" },
+  { value = "ultra_performance", label = "Ultra Performance" },
+  { value = "performance", label = "Performance" },
+  { value = "balanced", label = "Balanced" },
+  { value = "quality", label = "Quality" },
+  { value = "dlaa", label = "DLAA" },
+]
+default = "off"
+apply = "live"
+
+[option."game.resolution_scale"]
+type = "int"
+label = "Resolution scale"
+help = "Render resolution with TAA; the game ignores it while DLSS is on."
+min = 50
+max = 100
+step = 10
+unit = "%"
+default = 100
+when = { "game.dlss" = "off" }
+apply = "live"
+
+[option."game.hdr"]
+type = "bool"
+label = "HDR"
+help = "Only on an HDR display (the game greys it out otherwise)."
+default = "0"
+level = "advanced"
+apply = "live"
+
+[option."game.monitor"]
+type = "int"
+label = "Monitor"
+help = "Which display the game uses (0 = the first)."
+min = 0
+max = 7
+default = 0
+level = "advanced"
+apply = "live"
+
+# ---------------------------------------------------------------- picture
+
+[option."game.brightness"]
+type = "int"
+label = "Brightness"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 50
+apply = "live"
+
+[option."game.fov"]
+type = "int"
+label = "Field of view"
+help = "Relative to the game's default field of view (the menu's slider spans 75 to 125 %)."
+min = 75
+max = 125
+step = 5
+unit = "%"
+default = 100
+apply = "live"
+
+[option."game.motion_blur"]
+type = "bool"
+label = "Motion blur"
+default = "1"
+apply = "live"
+
+[option."game.film_grain"]
+type = "bool"
+label = "Film grain"
+default = "1"
+apply = "live"
+
+[option."game.hud"]
+type = "bool"
+label = "HUD"
+default = "1"
+apply = "live"
+
+[option."game.hud_size"]
+type = "int"
+label = "HUD size"
+help = "Scales the HUD by up to 2x. The game's own menu resets this to 50 % whenever any option is changed there."
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 0
+apply = "live"
+
+# ---------------------------------------------------------------- quality
+
+[option."game.quality"]
+type = "enum"
+label = "Graphics quality"
+help = "Custom uses the values below; the other presets set them."
+values = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+  { value = "custom", label = "Custom" },
+]
+apply = "live"
+
+[option."game.taa"]
+type = "bool"
+label = "Temporal anti-aliasing"
+default = "1"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.fxaa"]
+type = "bool"
+label = "FXAA"
+default = "0"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.msaa"]
+type = "bool"
+label = "MSAA"
+default = "1"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.anisotropy"]
+type = "enum"
+label = "Anisotropic filtering"
+values = [
+  { value = "off", label = "Off" },
+  { value = "2x", label = "2x" },
+  { value = "4x", label = "4x" },
+  { value = "8x", label = "8x" },
+  { value = "16x", label = "16x" },
+]
+default = "8x"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.shadows"]
+type = "enum"
+label = "Shadow quality"
+values = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+]
+default = "high"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.volumetrics"]
+type = "enum"
+label = "Volumetric light quality"
+values = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+]
+default = "high"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.terrain"]
+type = "enum"
+label = "Terrain quality"
+values = [
+  { value = "low", label = "Low" },
+  { value = "medium", label = "Medium" },
+  { value = "high", label = "High" },
+]
+default = "high"
+when = { "game.quality" = "custom" }
+apply = "live"
+
+[option."game.draw_distance"]
+type = "int"
+label = "Draw distance"
+help = "Scales the camera's far plane from 75 % (at 0) to 100 % (at 100) of the game's maximum."
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 100
+when = { "game.quality" = "custom" }
+apply = "live"
+
+# ---------------------------------------------------------------- audio and subtitles
+
+[option."game.music"]
+type = "int"
+label = "Music volume"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 100
+apply = "live"
+
+[option."game.effects"]
+type = "int"
+label = "Effects volume"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 100
+apply = "live"
+
+[option."game.speech"]
+type = "int"
+label = "Speech volume"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 100
+apply = "live"
+
+[option."game.cinematic"]
+type = "int"
+label = "Cinematics volume"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 100
+apply = "live"
+
+[option."game.english_speech"]
+type = "bool"
+label = "English speech"
+help = "English voices with another language's text (the game offers it only for some languages)."
+default = "0"
+apply = "live"
+latency = "from the next line of dialogue"
+
+[option."game.subtitles"]
+type = "bool"
+label = "Subtitles"
+default = "0"
+apply = "live"
+
+[option."game.subtitle_size"]
+type = "int"
+label = "Subtitle size"
+help = "The menu's \"Enlarge font size\"."
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 0
+when = { "game.subtitles" = "1" }
+apply = "live"
+
+[option."game.subtitle_background"]
+type = "int"
+label = "Subtitle background"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 0
+when = { "game.subtitles" = "1" }
+apply = "live"
+
+[option."game.commentary"]
+type = "enum"
+label = "Video commentary"
+help = "Developer commentary over gameplay (a portrait in the corner)."
+values = [
+  { value = "off", label = "Off" },
+  { value = "original", label = "Original" },
+  { value = "remaster", label = "Remaster" },
+]
+default = "off"
+apply = "live"
+
+# ---------------------------------------------------------------- controls
+
+[option."game.invert_y"]
+type = "bool"
+label = "Invert vertical look"
+default = "0"
+apply = "live"
+
+[option."game.invert_x"]
+type = "bool"
+label = "Invert horizontal look"
+default = "0"
+apply = "live"
+
+[option."game.mouse_sensitivity_x"]
+type = "int"
+label = "Mouse sensitivity (horizontal)"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 50
+apply = "live"
+
+[option."game.mouse_sensitivity_y"]
+type = "int"
+label = "Mouse sensitivity (vertical)"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 50
+apply = "live"
+
+[option."game.direct_aiming"]
+type = "bool"
+label = "Direct aiming"
+help = "Aim where the mouse points, without the remaster's aim smoothing."
+default = "0"
+apply = "live"
+
+[option."game.modern_camera"]
+type = "enum"
+label = "Modern camera"
+values = [
+  { value = "off", label = "Off" },
+  { value = "recoil", label = "Weapon recoil" },
+  { value = "camera_and_recoil", label = "Camera style and weapon recoil" },
+]
+default = "recoil"
+apply = "live"
+
+[option."game.gamepad_sensitivity"]
+type = "int"
+label = "Gamepad sensitivity"
+min = 0
+max = 100
+step = 5
+unit = "%"
+default = 100
+level = "advanced"
+apply = "live"
+
+[option."game.vibration"]
+type = "bool"
+label = "Vibration"
+default = "1"
+level = "advanced"
+apply = "live"
+
+[option."game.gamepad_layout"]
+type = "enum"
+label = "On-foot layout"
+values = [{ value = "1", label = "Layout 1" }, { value = "2", label = "Layout 2" }]
+default = "1"
+level = "advanced"
+apply = "live"
+
+[option."game.driving_layout"]
+type = "enum"
+label = "Driving layout"
+values = [
+  { value = "1", label = "Layout 1" }, { value = "2", label = "Layout 2" },
+  { value = "3", label = "Layout 3" }, { value = "4", label = "Layout 4" },
+]
+default = "1"
+level = "advanced"
+apply = "live"
+
+[option."game.swap_sticks"]
+type = "bool"
+label = "Swap sticks"
+default = "0"
+level = "advanced"
+apply = "live"
+
+[option."game.swap_triggers"]
+type = "bool"
+label = "Swap triggers"
+default = "0"
+level = "advanced"
+apply = "live"
+
+# ---------------------------------------------------------------- key bindings
+# Names as Quiver writes them (KeyW, Digit1, Space, Shift, Ctrl, Tab, F5, ArrowUp, Numpad8);
+# Mouse1..Mouse5 are the left, right, middle, back and forward buttons. Binding a key that another
+# action uses unbinds that action, as the game's own menu does.
+
+[option."keys.move_forward"]
+type = "key"
+label = "Move forward"
+default = "KeyW"
+apply = "live"
+
+[option."keys.move_backward"]
+type = "key"
+label = "Move backward"
+default = "KeyS"
+apply = "live"
+
+[option."keys.move_left"]
+type = "key"
+label = "Move left"
+default = "KeyA"
+apply = "live"
+
+[option."keys.move_right"]
+type = "key"
+label = "Move right"
+default = "KeyD"
+apply = "live"
+
+[option."keys.turboboost"]
+type = "key"
+label = "Sprint / dodge"
+default = "Shift"
+apply = "live"
+
+[option."keys.walk"]
+type = "key"
+label = "Walk"
+default = "Ctrl"
+apply = "live"
+
+[option."keys.jump"]
+type = "key"
+label = "Jump"
+default = "Space"
+apply = "live"
+
+[option."keys.use"]
+type = "key"
+label = "Use"
+default = "KeyE"
+apply = "live"
+
+[option."keys.reload"]
+type = "key"
+label = "Reload"
+default = "KeyR"
+apply = "live"
+
+[option."keys.shoot"]
+type = "key"
+label = "Shoot"
+default = "Mouse1"
+apply = "live"
+
+[option."keys.light_boost"]
+type = "key"
+label = "Boost flashlight"
+default = "Mouse2"
+apply = "live"
+
+[option."keys.throw_item"]
+type = "key"
+label = "Throw flare / flashbang"
+default = "Mouse3"
+apply = "live"
+
+[option."keys.reload_battery"]
+type = "key"
+label = "Change battery"
+default = "KeyQ"
+apply = "live"
+
+[option."keys.look_at"]
+type = "key"
+label = "Look at"
+default = "KeyF"
+apply = "live"
+
+[option."keys.toggle_manuscript"]
+type = "key"
+label = "Manuscript"
+default = "F5"
+apply = "live"
+
+[option."keys.inventory_right"]
+type = "key"
+label = "Weapon slot 1"
+default = "Digit1"
+apply = "live"
+
+[option."keys.inventory_up"]
+type = "key"
+label = "Weapon slot 2"
+default = "Digit2"
+apply = "live"
+
+[option."keys.inventory_left"]
+type = "key"
+label = "Weapon slot 3"
+default = "Digit3"
+apply = "live"
+
+[option."keys.inventory_down"]
+type = "key"
+label = "Weapon slot 4"
+default = "Digit4"
+apply = "live"
+
+[option."keys.inventory_extra"]
+type = "key"
+label = "Weapon slot 5"
+default = "Digit5"
+apply = "live"
+
+[option."keys.toggle_side"]
+type = "key"
+label = "Switch shoulder"
+default = "Tab"
+apply = "live"
+
+# ---------------------------------------------------------------- diagnostics
 
 [option."log.verbose"]
 type = "bool"
@@ -23,3 +626,27 @@ label = "Verbose log"
 help = "Writes more detail to torchbearer.log."
 level = "debug"
 apply = "live"
+
+[option."intro.skip_startup_video"]
+type = "bool"
+label = "Skip the Remedy logo video"
+help = "Boots without the 5-second Remedy video."
+default = true
+level = "basic"
+apply = "restart"
+
+[option."intro.skip_logo_screens"]
+type = "bool"
+label = "Skip the logo screens"
+help = "Boots without the Epic Games logo and the partner logos / rights notice (3 seconds each)."
+default = true
+level = "basic"
+apply = "restart"
+
+[option."intro.skip_epilepsy_warning"]
+type = "bool"
+label = "Skip the photosensitivity warning"
+help = "Boots without the 6-second epilepsy warning screen."
+default = true
+level = "basic"
+apply = "restart"

@@ -1,0 +1,8 @@
+#!/bin/sh
+# re/scripts/q CMDFILE OUTFILE: run Query.java against a private copy of the Ghidra project
+# (default re/ghidra-settings in the main checkout; override with TB_GHIDRA). Never point it at
+# re/ghidra itself while anyone else may have it open.
+here=$(cd "$(dirname "$0")" && pwd)
+proj=${TB_GHIDRA:-/home/ajg/code/torchbearer/re/ghidra-settings}
+exec /opt/ghidra/support/analyzeHeadless "$proj" awr -process Game_f_x64_EOS.exe -noanalysis -readOnly \
+  -scriptPath "$here" -postScript Query.java "$(realpath "$1")" "$(realpath -m "$2")" > "$2.log" 2>&1

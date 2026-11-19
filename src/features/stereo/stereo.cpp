@@ -268,7 +268,6 @@ void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
   g_last_render_present = present_frame();
   if (g_render_frames++ == 0) {
     TB_LOG("stereo: first renderFrame (view %p)", view);
-    lab_state("in-world", {"frame=" + std::to_string(present_frame())});
   }
   Params p = params();
   if (p.mode == Mode::Off && g_applied == 0) {

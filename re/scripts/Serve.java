@@ -221,11 +221,7 @@ public class Serve extends GhidraScript {
       Arrays.sort(reqs);
       for (File rq : reqs) {
         String body;
-        try {
-          body = Files.readString(rq.toPath());
-        } catch (IOException e) {
-          continue;  // vanished (client gave up): skip it
-        }
+        try { body = Files.readString(rq.toPath()); } catch (IOException e) { continue; }
         rq.delete();
         String base = rq.getName().substring(0, rq.getName().length() - 4);
         StringBuilder o = new StringBuilder();
@@ -236,7 +232,7 @@ public class Serve extends GhidraScript {
           o.append("### ").append(line.trim()).append("\n");
           try { run1(line, o); } catch (Exception e) { o.append("error: ").append(e).append("\n"); }
         }
-        Path tmp = dir.resolve(base + ".tmp");
+        Path tmp = dir.resolve(base + ".otmp");
         Files.writeString(tmp, o.toString());
         Files.move(tmp, dir.resolve(base + ".out"), StandardCopyOption.ATOMIC_MOVE);
         if (quit) { dec.dispose(); return; }

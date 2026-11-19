@@ -18,6 +18,7 @@
 #include "core/present.h"
 #include "core/quiver.h"
 #include "features/features.h"
+#include "features/intro.h"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
@@ -46,6 +47,7 @@ void init() {
     TB_LOG("real dxgi: %p", (void*)real_dxgi());
     tb::hook_init();
     tb::lab_init();
+    tb::intro_report();
     tb::features_register();  // listeners first, so they see the initial config
     tb::config_init();
     tb::quiver_init();
@@ -124,6 +126,8 @@ __declspec(dllexport) HRESULT WINAPI DXGIGetDebugInterface1(UINT flags, REFIID r
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(inst);
+    // Must beat Game::Game, which runs early in WinMain: plain memory writes only.
+    tb::intro_early();
     // The game imports dxgi statically, so we're loaded before its entry point runs. Start init
     // off the loader lock; the first export call also waits for it.
     CloseHandle(CreateThread(nullptr, 0, init_thread, nullptr, 0, nullptr));
