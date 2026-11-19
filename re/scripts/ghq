@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Client for Serve.java: ghq 'decomp 0x140123456' ['xrefs ...' ...]; prints the answer.
+# GHQ_DIR selects the server's request folder.
+set -euo pipefail
+dir=${GHQ_DIR:?set GHQ_DIR to the Serve.java request folder}
+id=q$(date +%s%N)$$
+printf '%s\n' "$@" > "$dir/$id.tmp" && mv "$dir/$id.tmp" "$dir/$id.req"
+for _ in $(seq 1 6000); do
+  if [[ -f $dir/$id.out ]]; then cat "$dir/$id.out"; rm -f "$dir/$id.out"; exit 0; fi
+  read -rt 0.1 <> <(:) || true
+done
+echo "timeout" >&2; exit 1

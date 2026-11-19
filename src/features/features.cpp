@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "core/lab.h"
+#include "features/stereo/stereo.h"
 
 namespace tb {
 
@@ -15,8 +16,9 @@ void features_register() {
     if (a.size() >= 2) cfg_set(a[0], a[1], "lab");
     return json_str(cfg_str(a[0]));
   });
+  stereo::register_feature();
 }
 
-void features_start() {}
+void features_start() { stereo::start(); }
 
 }  // namespace tb

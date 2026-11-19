@@ -1,0 +1,498 @@
+// Stereoscopic 3D for Alan Wake Remastered (docs/stereo.md).
+//
+// The lever: rend::View::setViewToWorld is where every camera's transform enters the renderer, and
+// everything the GPU sees (g_mWorldToView, g_mViewToWorld, g_mWorldToClip, g_vViewPoint, culling)
+// is derived from it. RendererX86::renderFrame tells us which View is the main scene camera (it is
+// the one passed in), so the eye offset is applied to that View only, as a translation along its
+// own right axis. Shadow, reflection and light views keep their own transforms.
+//
+// Modes ([stereo] mode):
+//   off        pass-through
+//   left/right one fixed eye on every frame (mono-frame bias; measurement and sanity)
+//   alternate  eyes alternate per presented frame (frame-sequential, like Ishimura)
+//   sbs        both eyes from the same simulated frame: the scene is rendered twice per game update
+//              (renderFrame re-invoked for the second eye) and composed side by side
+#include "features/stereo/stereo.h"
+
+#include <windows.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "core/config.h"
+#include "core/hook.h"
+#include "core/lab.h"
+#include "core/log.h"
+#include "core/module.h"
+#include "core/present.h"
+#include "features/stereo/engine.h"
+#include "features/stereo/gpu.h"
+
+namespace tb::stereo {
+namespace {
+
+using RenderFrame_t = void(__fastcall*)(void* r, void* view, void* a3, void* a4);
+using SetViewToWorld_t = void(__fastcall*)(void* view, const double* m43);
+using SetPostProjection_t = void(__fastcall*)(void* view, const double* m44);
+using Void1_t = void(__fastcall*)(void*);
+using Bool1_t = char(__fastcall*)(void*);
+
+RenderFrame_t o_renderFrame;
+SetViewToWorld_t o_setViewToWorld;
+SetPostProjection_t o_setPostProjection;
+Void1_t o_modeSwitchRender;
+Bool1_t o_beginFrame;
+Void1_t o_endFrame;
+
+enum class Mode { Off, Left, Right, Alternate, Sbs };
+
+struct Params {
+  Mode mode = Mode::Off;
+  double separation_mm = 32.5;  // per eye
+  double convergence_m = 0.0;   // 0 = parallel
+  bool swap = false;
+  bool taa_in_sbs = false;  // keep the game's TAA on in sbs mode (it then blends across eyes)
+};
+std::mutex g_pmu;
+Params g_p;
+
+Params params() {
+  std::lock_guard lk(g_pmu);
+  return g_p;
+}
+
+Mode parse_mode(const std::string& s) {
+  if (s == "left") return Mode::Left;
+  if (s == "right") return Mode::Right;
+  if (s == "alternate") return Mode::Alternate;
+  if (s == "sbs") return Mode::Sbs;
+  return Mode::Off;
+}
+const char* mode_name(Mode m) {
+  switch (m) {
+    case Mode::Left: return "left";
+    case Mode::Right: return "right";
+    case Mode::Alternate: return "alternate";
+    case Mode::Sbs: return "sbs";
+    default: return "off";
+  }
+}
+
+uintptr_t rva(const void* p) {
+  auto a = reinterpret_cast<uintptr_t>(p);
+  return game_image().contains(a) ? a - game_image().base : a;
+}
+template <typename T>
+T& at(void* base, size_t off) {
+  return *reinterpret_cast<T*>(static_cast<uint8_t*>(base) + off);
+}
+
+// --- census ------------------------------------------------------------------------------------
+std::atomic<int> g_census{0};  // presents left to trace
+std::atomic<uint64_t> g_census_end{0};
+bool census_on() { return g_census.load(std::memory_order_relaxed) > 0; }
+void census(const char* fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
+void census(const char* fmt, ...) {
+  char buf[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  TB_LOG("census f=%llu tid=%lu %s", (unsigned long long)present_frame(), GetCurrentThreadId(), buf);
+}
+
+// --- eye state ---------------------------------------------------------------------------------
+// All of it lives on the thread that calls renderFrame (the game thread, measured).
+void* g_main_view = nullptr;   // the View last passed to renderFrame
+double g_game_v2w[12];         // the game's own (unbiased) transform for g_main_view
+bool g_have_game_v2w = false;
+double g_applied = 0;          // metres along the view's right axis currently applied
+thread_local bool t_in_frame = false;
+thread_local double t_conv_shift = 0;  // NDC x shift added to the post-projection (convergence)
+std::atomic<int> g_eye_now{0};  // eye of the frame being rendered: -1 left, +1 right, 0 mono
+std::atomic<uint64_t> g_frames_biased{0};
+std::atomic<uint64_t> g_render_frames{0};
+
+double g_prev_w2c[2][16];  // per-eye copy of the TAA object's previous world-to-clip
+bool g_have_prev[2] = {false, false};
+
+// Signed offset (metres, along view right) for an eye (-1 left, +1 right).
+double eye_offset(const Params& p, int eye) {
+  if (eye == 0) return 0;
+  double e = p.separation_mm / 1000.0 * eye;
+  return p.swap ? -e : e;
+}
+
+void biased(const double* in, double off, double* out) {
+  memcpy(out, in, sizeof(double) * 12);
+  out[9] += in[0] * off;  // position += right * off
+  out[10] += in[1] * off;
+  out[11] += in[2] * off;
+}
+
+// Apply `off` to the main view now, from the game's own transform.
+void apply_offset(void* view, double off) {
+  if (!g_have_game_v2w || view != g_main_view) {
+    memcpy(g_game_v2w, &at<double>(view, view::kViewToWorld), sizeof g_game_v2w);
+    if (g_applied != 0) {  // undo our own bias if the game has not set it since
+      for (int i = 0; i < 3; i++) g_game_v2w[9 + i] -= g_game_v2w[i] * g_applied;
+    }
+    g_have_game_v2w = true;
+  }
+  double m[12];
+  biased(g_game_v2w, off, m);
+  o_setViewToWorld(view, m);
+  g_applied = off;
+}
+
+// --- hooks -------------------------------------------------------------------------------------
+void __fastcall hk_setViewToWorld(void* view, const double* m) {
+  if (census_on()) {
+    census("setViewToWorld ret=%#llx view=%p vt=%#llx pos=(%.3f %.3f %.3f) fwd=(%.3f %.3f %.3f) right=(%.3f %.3f %.3f)%s",
+           (unsigned long long)rva(__builtin_return_address(0)), view,
+           (unsigned long long)rva(at<void*>(view, 0)), m[9], m[10], m[11], m[6], m[7], m[8], m[0], m[1],
+           m[2], view == g_main_view ? " MAIN" : "");
+  }
+  if (view == g_main_view && view) {
+    memcpy(g_game_v2w, m, sizeof g_game_v2w);
+    g_have_game_v2w = true;
+    if (g_applied != 0) {
+      double b[12];
+      biased(m, g_applied, b);
+      o_setViewToWorld(view, b);
+      return;
+    }
+  }
+  o_setViewToWorld(view, m);
+}
+
+void __fastcall hk_setPostProjection(void* view, const double* m) {
+  if (census_on() && view == g_main_view) {
+    census("setPostProjection ret=%#llx view=%p jitter=(%.6f %.6f)", (unsigned long long)rva(__builtin_return_address(0)),
+           view, m[12], m[13]);
+  }
+  if (t_in_frame && view == g_main_view && t_conv_shift != 0) {
+    double b[16];
+    memcpy(b, m, sizeof b);
+    b[12] += t_conv_shift;
+    o_setPostProjection(view, b);
+    return;
+  }
+  o_setPostProjection(view, m);
+}
+
+// sbs: which of the two engine frames of this game update is being rendered (0 = not in sbs).
+std::atomic<int> g_pass{0};
+std::atomic<uint64_t> g_last_render_present{0};
+std::atomic<uint64_t> g_sbs_updates{0};
+
+int pick_eye(const Params& p) {
+  switch (p.mode) {
+    case Mode::Sbs: return g_pass == 1 ? -1 : g_pass == 2 ? 1 : 0;
+    case Mode::Left: return -1;
+    case Mode::Right: return 1;
+    case Mode::Alternate: return (present_frame() & 1) ? 1 : -1;
+    default: return 0;
+  }
+}
+
+void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int eye) {
+  double off = eye_offset(p, eye);
+  if (off != g_applied || view != g_main_view) {
+    g_main_view = view;
+    apply_offset(view, off);
+  }
+  // Convergence: shift NDC x by +off*m00/Zc so the disparity is zero at Zc metres.
+  t_conv_shift = 0;
+  // The main view is a BaseCamera (vtable RVA 0x752ad0), a PerspectiveView subclass: the FOV/zoom
+  // fields are PerspectiveView's. Sanity-check them instead of the exact vtable.
+  float fov = at<float>(view, view::kFov), zoom = at<float>(view, view::kZoom);
+  if (off != 0 && p.convergence_m > 0 && fov > 0.1f && fov < 3.0f && zoom > 0.01f && zoom < 100.f) {
+    double m00 = 1.0 / std::tan(double(fov) * 0.5) / double(zoom ? zoom : 1.0f);
+    t_conv_shift = off * m00 / p.convergence_m;
+  }
+  g_eye_now = eye;
+  // Per-eye temporal state: the TAA object (RendererX86+0x140) keeps last frame's unjittered
+  // world-to-clip at +0x60 and builds camera motion vectors (motion blur, TAA reprojection) from
+  // it. When eyes alternate, "last frame" is the other eye, so the eye offset reads as camera
+  // velocity and smears the image. Give each eye its own previous matrix.
+  uint8_t* taa = nullptr;
+  bool per_eye = eye != 0 && (p.mode == Mode::Sbs || p.mode == Mode::Alternate);
+  if (per_eye) {
+    taa = at<uint8_t*>(r, kRendererTaa);
+    int i = eye < 0 ? 0 : 1;
+    if (taa && g_have_prev[i]) memcpy(taa + kTaaPrevWorldToClip, g_prev_w2c[i], sizeof g_prev_w2c[i]);
+  }
+  t_in_frame = true;
+  o_renderFrame(r, view, a3, a4);
+  t_in_frame = false;
+  if (per_eye && taa) {
+    int i = eye < 0 ? 0 : 1;
+    memcpy(g_prev_w2c[i], taa + kTaaPrevWorldToClip, sizeof g_prev_w2c[i]);
+    g_have_prev[i] = true;
+  }
+  if (off != 0) g_frames_biased++;
+}
+
+void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
+  if (census_on()) {
+    const double* m = &at<double>(view, view::kViewToWorld);
+    census("renderFrame ret=%#llx r=%p view=%p vt=%#llx a3=%p a4=%p fov=%.4f zoom=%.3f aspect=%.4f near=%.3f far=%.1f pos=(%.3f %.3f %.3f) fwd=(%.3f %.3f %.3f)",
+           (unsigned long long)rva(__builtin_return_address(0)), r, view,
+           (unsigned long long)rva(at<void*>(view, 0)), a3, a4, at<float>(view, view::kFov),
+           at<float>(view, view::kZoom), at<float>(view, view::kAspect), at<float>(view, view::kNear),
+           at<float>(view, view::kFar), m[9], m[10], m[11], m[6], m[7], m[8]);
+  }
+  g_last_render_present = present_frame();
+  if (g_render_frames++ == 0) {
+    TB_LOG("stereo: first renderFrame (view %p)", view);
+    lab_state("in-world", {"frame=" + std::to_string(present_frame())});
+  }
+  Params p = params();
+  if (p.mode == Mode::Off && g_applied == 0) {
+    g_main_view = view;
+    o_renderFrame(r, view, a3, a4);
+    return;
+  }
+  render_eye(r, view, a3, a4, p, pick_eye(p));
+}
+
+// The game's TAA switch (Options > Anti-aliasing; also forced off by DLSS): with it on, the second
+// eye would resolve against the first eye's history. Off for the duration of sbs unless asked.
+constexpr uintptr_t kRvaTaaEnable = 0x955636;   // u8, read by renderFrame (jitter) and renderWorld
+constexpr uintptr_t kRvaTaaEnable2 = 0x955694;  // u8, set together with it by the options code
+bool g_taa_forced = false;
+uint8_t g_taa_saved[2];
+void taa_force_off(bool off) {
+  uint8_t* a = reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable));
+  uint8_t* b = reinterpret_cast<uint8_t*>(game_image().at(kRvaTaaEnable2));
+  if (off && !g_taa_forced) {
+    g_taa_saved[0] = *a;
+    g_taa_saved[1] = *b;
+    *a = 0;
+    *b = 0;
+    g_taa_forced = true;
+    TB_LOG("stereo: TAA forced off for sbs (was %u/%u)", g_taa_saved[0], g_taa_saved[1]);
+  } else if (!off && g_taa_forced) {
+    *a = g_taa_saved[0];
+    *b = g_taa_saved[1];
+    g_taa_forced = false;
+    TB_LOG("stereo: TAA restored (%u/%u)", g_taa_saved[0], g_taa_saved[1]);
+  }
+}
+
+// One game update = one ModeSwitch::render. In sbs mode (and only while the world is being
+// rendered) it runs twice: left eye, then right eye, from the same simulated state; the first
+// Present is swallowed after its back buffer is stashed, the second is composed and presented.
+void __fastcall hk_modeSwitchRender(void* self) {
+  if (census_on()) census("ModeSwitch::render enter ret=%#llx", (unsigned long long)rva(__builtin_return_address(0)));
+  Params p = params();
+  bool world = present_frame() - g_last_render_present.load() < 8;
+  bool sbs = p.mode == Mode::Sbs && world;
+  taa_force_off(sbs && !p.taa_in_sbs);
+  if (!sbs) {
+    o_modeSwitchRender(self);
+  } else {
+    g_pass = 1;
+    o_modeSwitchRender(self);
+    g_pass = 2;
+    o_modeSwitchRender(self);
+    g_pass = 0;
+    g_sbs_updates++;
+  }
+  if (census_on()) census("ModeSwitch::render leave");
+}
+char __fastcall hk_beginFrame(void* self) {
+  char c = o_beginFrame(self);
+  if (census_on()) census("Renderer::beginFrame -> %d ret=%#llx", c, (unsigned long long)rva(__builtin_return_address(0)));
+  return c;
+}
+void __fastcall hk_endFrame(void* self) {
+  if (census_on()) census("Renderer::endFrame enter ret=%#llx", (unsigned long long)rva(__builtin_return_address(0)));
+  o_endFrame(self);
+  if (census_on()) census("Renderer::endFrame leave");
+}
+
+// --- command queue trace -------------------------------------------------------------------
+using ExecuteCommandLists_t = void(STDMETHODCALLTYPE*)(void* q, UINT n, void* const* lists);
+ExecuteCommandLists_t o_executeCommandLists;
+void STDMETHODCALLTYPE hk_executeCommandLists(void* q, UINT n, void* const* lists) {
+  if (census_on())
+    census("ExecuteCommandLists q=%p n=%u ret=%#llx%s", q, n, (unsigned long long)rva(__builtin_return_address(0)),
+           t_in_frame ? " IN-RENDERFRAME" : "");
+  o_executeCommandLists(q, n, lists);
+}
+
+// Does the engine ask the swapchain which buffer is current (so a swallowed Present is safe)?
+using GetCurrentBackBufferIndex_t = UINT(STDMETHODCALLTYPE*)(void* sc);
+GetCurrentBackBufferIndex_t o_getCurrentBackBufferIndex;
+UINT STDMETHODCALLTYPE hk_getCurrentBackBufferIndex(void* sc) {
+  UINT i = o_getCurrentBackBufferIndex(sc);
+  if (census_on())
+    census("GetCurrentBackBufferIndex -> %u ret=%#llx", i, (unsigned long long)rva(__builtin_return_address(0)));
+  return i;
+}
+
+// --- captures ----------------------------------------------------------------------------------
+std::mutex g_cmu;
+int g_shots_left = 0;
+int g_shot_skip = 0;
+std::string g_shot_tag;
+std::string g_shot_dir;
+std::vector<std::string> g_shot_files;
+
+void on_present(IDXGISwapChain* sc, uint64_t frame) {
+  static bool ecl_hooked = false;
+  if (!ecl_hooked) {
+    ecl_hooked = true;
+    if (void* q = present_queue(sc)) {
+      o_executeCommandLists = reinterpret_cast<ExecuteCommandLists_t>(hook_vtable(q, 10, (void*)hk_executeCommandLists));
+      TB_LOG("stereo: traced ExecuteCommandLists on queue %p", q);
+    }
+    o_getCurrentBackBufferIndex =
+        reinterpret_cast<GetCurrentBackBufferIndex_t>(hook_vtable(sc, 36, (void*)hk_getCurrentBackBufferIndex));
+  }
+  if (g_census.load() > 0) {
+    census("Present");
+    if (--g_census == 0) TB_LOG("census done");
+  }
+}
+
+void capture_if_armed(IDXGISwapChain* sc, uint64_t frame, const char* eye_tag) {
+  std::lock_guard lk(g_cmu);
+  if (g_shot_skip > 0) {
+    g_shot_skip--;
+    return;
+  }
+  if (g_shots_left > 0) {
+    char name[512];
+    snprintf(name, sizeof name, "%s\\frame_%08llu_%s_%s.bmp", g_shot_dir.c_str(), (unsigned long long)frame,
+             g_shot_tag.c_str(), eye_tag);
+    if (gpu_capture(sc, name)) g_shot_files.push_back(name);
+    g_shots_left--;
+  }
+}
+
+// After the listeners, just before the real Present.
+bool present_gate(IDXGISwapChain* sc, uint64_t frame) {
+  int pass = g_pass.load();
+  if (pass == 1) {  // left eye of an sbs update: keep it, don't show it
+    capture_if_armed(sc, frame, "L");
+    gpu_store_eye(sc, 0);
+    return false;
+  }
+  if (pass == 2) {
+    gpu_compose(sc);
+    capture_if_armed(sc, frame, "SBS");
+    return true;
+  }
+  int eye = g_eye_now.load();
+  capture_if_armed(sc, frame, eye < 0 ? "L" : eye > 0 ? "R" : "M");
+  return true;
+}
+
+bool check_sigs() {
+  const auto& img = game_image();
+  for (const auto& s : kSigs) {
+    if (memcmp(reinterpret_cast<const void*>(img.at(s.rva)), s.bytes, sizeof s.bytes) != 0) {
+      const uint8_t* b = reinterpret_cast<const uint8_t*>(img.at(s.rva));
+      TB_LOG("stereo: signature mismatch for %s at RVA %#llx (%02x %02x %02x %02x ...); feature disabled",
+             s.name, (unsigned long long)s.rva, b[0], b[1], b[2], b[3]);
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string status_json() {
+  Params p = params();
+  char b[512];
+  snprintf(b, sizeof b,
+           "{\"mode\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,\"main_view\":\"%p\","
+           "\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,\"present\":%llu,"
+           "\"taa_forced_off\":%s,\"gpu\":\"%s\"}",
+           mode_name(p.mode), p.separation_mm, p.convergence_m, p.swap ? "true" : "false", g_main_view, g_applied,
+           (unsigned long long)g_frames_biased.load(), (unsigned long long)g_render_frames.load(),
+           (unsigned long long)g_sbs_updates.load(), (unsigned long long)present_frame(), g_taa_forced ? "true" : "false",
+           gpu_status().c_str());
+  return b;
+}
+
+bool g_hooked = false;
+
+}  // namespace
+
+void register_feature() {
+  cfg_listen("stereo.", [](const std::string& id, const std::string& v) {
+    std::lock_guard lk(g_pmu);
+    if (id == "stereo.mode") g_p.mode = parse_mode(v);
+    else if (id == "stereo.separation") g_p.separation_mm = atof(v.c_str());
+    else if (id == "stereo.convergence") g_p.convergence_m = atof(v.c_str());
+    else if (id == "stereo.swap_eyes") g_p.swap = (v == "1" || v == "true");
+    else if (id == "stereo.taa") g_p.taa_in_sbs = (v == "1" || v == "true");
+    else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
+  });
+  // quiver lab call awr stereo [status | census N | shots N TAG [SKIP] | files]
+  lab_verb("stereo", [](const std::vector<std::string>& a, bool& ok) -> std::string {
+    std::string sub = a.empty() ? "status" : a[0];
+    if (sub == "status") return status_json();
+    if (!g_hooked) {
+      ok = false;
+      return json_str("stereo hooks not installed (see torchbearer.log)");
+    }
+    if (sub == "census") {
+      int n = a.size() > 1 ? atoi(a[1].c_str()) : 2;
+      g_census = n;
+      return json_str("census armed for " + std::to_string(n) + " presents");
+    }
+    if (sub == "shots") {
+      std::lock_guard lk(g_cmu);
+      g_shots_left = a.size() > 1 ? atoi(a[1].c_str()) : 2;
+      g_shot_tag = a.size() > 2 ? a[2] : "shot";
+      g_shot_skip = a.size() > 3 ? atoi(a[3].c_str()) : 0;
+      const char* d = getenv("QUIVER_LAB_RUN_DIR");
+      g_shot_dir = d ? d : ".";
+      g_shot_files.clear();
+      return json_str("capturing " + std::to_string(g_shots_left) + " frames to " + g_shot_dir);
+    }
+    if (sub == "files") {
+      std::lock_guard lk(g_cmu);
+      std::string r = "[";
+      for (size_t i = 0; i < g_shot_files.size(); i++) r += (i ? "," : "") + json_str(g_shot_files[i]);
+      return r + "]";
+    }
+    ok = false;
+    return json_str("usage: stereo [status|census N|shots N TAG [SKIP]|files]");
+  });
+}
+
+void start() {
+  if (!check_sigs()) return;
+  const auto& img = game_image();
+  bool ok = hook_fn((void*)img.at(kRvaRenderFrame), (void*)hk_renderFrame, (void**)&o_renderFrame,
+                    "RendererX86::renderFrame") &&
+            hook_fn((void*)img.at(kRvaSetViewToWorld), (void*)hk_setViewToWorld, (void**)&o_setViewToWorld,
+                    "View::setViewToWorld") &&
+            hook_fn((void*)img.at(kRvaSetPostProjection), (void*)hk_setPostProjection,
+                    (void**)&o_setPostProjection, "View::setPostProjection") &&
+            hook_fn((void*)img.at(kRvaModeSwitchRender), (void*)hk_modeSwitchRender, (void**)&o_modeSwitchRender,
+                    "ModeSwitch::render") &&
+            hook_fn((void*)img.at(kRvaBeginFrame), (void*)hk_beginFrame, (void**)&o_beginFrame,
+                    "Renderer::beginFrame") &&
+            hook_fn((void*)img.at(kRvaEndFrame), (void*)hk_endFrame, (void**)&o_endFrame, "Renderer::endFrame");
+  if (!ok) {
+    TB_LOG("stereo: hooks failed; feature disabled");
+    return;
+  }
+  present_on(on_present);
+  present_filter(present_gate);
+  g_hooked = true;
+  TB_LOG("stereo: hooks installed");
+}
+
+}  // namespace tb::stereo

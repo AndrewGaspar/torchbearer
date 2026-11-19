@@ -27,6 +27,8 @@ add_library(torchbearer SHARED
   src/core/present.cpp
   src/core/module.cpp
   src/features/features.cpp
+  src/features/stereo/stereo.cpp
+  src/features/stereo/gpu.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 target_include_directories(torchbearer PRIVATE src third_party)
