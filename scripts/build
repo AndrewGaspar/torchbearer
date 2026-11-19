@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Configure (once) and build the mod into build/mod/ (dxgi.dll + torchbearer.ini + Quiver schema).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [[ ! -f build/build.ninja ]]; then
+  cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+fi
+cmake --build build "$@"
+ln -sf build/compile_commands.json compile_commands.json

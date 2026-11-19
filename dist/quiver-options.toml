@@ -1,0 +1,25 @@
+format = 1
+surface = "torchbearer"
+title = "Torchbearer"
+help = "Alan Wake Remastered: the game's own settings, live, and stereoscopic 3D."
+
+[match]
+files = ["torchbearer.ini"]
+
+[file.ini]
+path = "torchbearer.ini"
+format = "ini"
+owner = "quiver"
+reload = "poll"
+
+[[page]]
+id = "diagnostics"
+title = "Diagnostics"
+options = ["log.verbose"]
+
+[option."log.verbose"]
+type = "bool"
+label = "Verbose log"
+help = "Writes more detail to torchbearer.log."
+level = "debug"
+apply = "live"
