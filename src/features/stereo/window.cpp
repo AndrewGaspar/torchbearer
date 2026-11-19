@@ -91,9 +91,13 @@ std::atomic<bool> g_stretched{false};  // output = hsbs: map x -> x/2 (see windo
 // engine renders a normal 1920-wide eye; the 2x-wide swapchain reaches the compositor through
 // Wine's Wayland viewport (GE-Proton11-12-hypxr, WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1), which
 // shows each half 1:1 over the window box. No widening, no WM_SIZE or mouse translation, no
-// desktop halving; only the borderless coercion stays.
+// desktop halving, no borderless coercion: the window is left entirely to the game.
 std::atomic<bool> g_keep{false};
-bool split() { return g_stretched.load() || g_keep.load(); }  // a compositor splits the window
+// hsbs needs the window to be the desktop (X11 can't scale a 2x image into a smaller window);
+// sbs (larger-swapchain Proton on Wine-Wayland) works at any window size, so it is left alone.
+bool split() { return g_stretched.load(); }
+// The desktop size seen by the game's borderless queries, before halving (hsbs window creation).
+std::atomic<int> g_desktop_w{0}, g_desktop_h{0};
 std::atomic<int> g_widened{0}, g_sizes{0}, g_mouse{0};
 int g_last_real_w = 0, g_last_engine_w = 0, g_last_h = 0;
 
@@ -178,6 +182,14 @@ void widen(void* win) {
 
 void __fastcall hk_create(void* win, const char* title, int w, int h, int mode, int monitor, uint8_t flags) {
   if (active() && g_keep) return o_create(win, title, w, h, mode, monitor, flags);
+  // hsbs borderless: create the window at the desktop size straight away. The game first creates
+  // it at its saved resolution (often 1440x900) and applies the desktop size seconds later, and
+  // Hyprland remembers that first geometry as the window's floating size, restored on leaving
+  // fullscreen (live: a 2880x900 floating window whose halves were different slices).
+  if (active() && g_stretched && mode == 2 && g_desktop_w.load() > 0) {
+    w = g_desktop_w.load() / 2;
+    h = g_desktop_h.load();
+  }
   if (active()) {
     set_engine_size(w, h);
     TB_LOG("stereo window: create %dx%d mode %d monitor %d -> engine %dx%d", w, h, mode, monitor, g_engine_w.load(),
@@ -274,6 +286,8 @@ uint64_t __fastcall hk_monitorMode(int idx, int* out, int monitor) {
     if (!game) TB_LOG("stereo window: boot desktop query before the Game pointer is set; left alone");
   }
   if (borderless && out[0] > 1 && !g_keep) {
+    g_desktop_w = out[0];
+    g_desktop_h = out[1];
     static int logged_w = 0;
     if (logged_w != out[0]) TB_LOG("stereo window: borderless at %dx%d desktop -> engine resolution %dx%d", out[0], out[1], out[0] / 2,
            out[1]);

@@ -118,7 +118,16 @@ swapchain is 2x wide, the window is tagged `stereo-sbs` and Quiver is told `sbs`
 last step can't happen there): fullscreen run as borderless, swapchain 1920 -> 3840, eye textures
 1920x1080, composed 3840x1080 frame with both full-resolution eyes and the HUD in each.
 Without the larger-swapchain Proton on Wine-Wayland, vkd3d-proton shrinks the 3840 image into the
-window, which is a (filtered) half side-by-side; on X11 it is not usable — use `hsbs` there.
+window (a filtered half side-by-side). On X11 it crops instead (live, lab: the display showed only
+the left eye), so on X11 use `hsbs`. The Proton: `GE-Proton11-12-hypxr` (user's fork, branch
+`custom-ge11`, two rebuilt files in a reflink copy of GE-Proton11-12), smoke-tested by the Proton
+agent: with the switch, 3840-wide buffers reach the compositor in a ~1920 window.
+
+hsbs and non-fullscreen windows: a borderless hsbs window is now created at the desktop size
+straight away (the game first created it at its saved 1440x900 and only applied the desktop size
+later; Hyprland restored that first geometry as the floating size on leaving fullscreen, and a
+2880x900 window's halves were different slices — live, user report). An hsbs window resized to
+something else still isn't followed; use sbs (Wayland) for windowed play.
 
 ## Not done
 
