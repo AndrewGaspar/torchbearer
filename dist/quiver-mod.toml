@@ -1,6 +1,6 @@
 id = "torchbearer"
 name = "Torchbearer"
-version = "0.4.9"
+version = "0.5.0"
 kind = "mod"
 description = "QoL improvements and stereoscopic 3D for Alan Wake Remastered: every game setting live from Quiver's options, and true dual-eye side-by-side stereo for 3D glasses."
 save_compatible = true

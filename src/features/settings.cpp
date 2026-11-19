@@ -550,6 +550,14 @@ bool usable(const Setting& s) { return (g_checks & s.needs) == s.needs; }
 std::mutex g_mu;
 std::map<std::string, std::string> g_want;  // config values (non-empty), by id
 std::set<std::string> g_dirty;              // ids changed in the config since the last tick
+// When the mod last applied values (GetTickCount64). For a few seconds after, the game reverting
+// one of them is not the player's choice: entering the main menu from the title screen copies the
+// menu's (old, saved) values back into the settings (live: DLSS Performance / TAA off / MSAA off
+// applied at "ready" came back as off / on / on 0.7 s later, at "leaving the title screen", and
+// were then adopted as game changes, overwriting the profile). Such reverts are re-applied.
+uint64_t g_applied_ms = 0;
+constexpr uint64_t kRevertGraceMs = 10000;
+std::map<std::string, int> g_reverts;  // re-applies per id, capped so the mod never fights the game
 std::map<std::string, std::string> g_seen;  // game values as of our last look (for reporting)
 uint64_t g_frame = 0, g_ready_at = 0, g_save_at = 0;
 bool g_ready = false, g_save_res = false;
@@ -630,6 +638,7 @@ void apply_dirty() {
     groups |= s->group | 0x80000000u;
   }
   if (!groups) return;
+  g_applied_ms = GetTickCount64();
   if ((groups & DLSS) && (g_checks & C_DLSS)) apply_dlss();
   if ((groups & GRAPHICS) && (g_checks & C_QUALITY)) apply_graphics();
   if ((groups & (APPLY | GRAPHICS)) && (g_checks & C_APPLY))
@@ -662,6 +671,13 @@ void report_game_changes() {
       std::lock_guard lk(g_mu);
       auto w = g_want.find(s.id);
       if (w != g_want.end() && w->second == v) continue;  // ours, applied late (display mode)
+      if (w != g_want.end() && g_applied_ms && GetTickCount64() - g_applied_ms < kRevertGraceMs &&
+          g_reverts[s.id]++ < 3) {
+        TB_LOG("settings: the game reverted %s to %s right after we applied %s; applying it again", s.id.c_str(),
+               v.c_str(), w->second.c_str());
+        g_dirty.insert(s.id);
+        continue;
+      }
     }
     TB_LOG("settings: game changed %s -> %s", s.id.c_str(), v.c_str());
     {
