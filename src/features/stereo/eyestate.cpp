@@ -10,6 +10,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/module.h"
+#include "features/stereo/dlss.h"
 #include "features/stereo/engine.h"
 
 namespace tb::stereo {
@@ -173,6 +174,7 @@ bool eyestate_start() {
     return false;
   }
   g_ok = true;
+  dlss_start(true);  // the reset signature is part of kEyeSigs
   TB_LOG("stereo eyestate: ready (per-eye TAA history %s)", g_history_ok ? "on" : "unavailable");
   return true;
 }
@@ -209,6 +211,7 @@ void eyestate_enter(void* r, void* view, int eye, bool first_of_update, const Ey
   t_hold_prev = o.view_prev && o.another_eye_follows;
   t_in_eye = true;
   t_eye_index = eye < 0 ? 0 : 1;
+  dlss_eye_enter(eye);
   probe("enter", r, view, eye);
 }
 
@@ -222,6 +225,7 @@ void eyestate_leave(void* r, void* view, int eye) {
   t_in_eye = false;
   t_eye_index = 2;
   t_hold_prev = false;
+  dlss_eye_leave(eye);
   probe("leave", r, view, eye);
   if (g_probe.load(std::memory_order_relaxed) > 0) g_probe--;
   Eye& e = g_eye[eye < 0 ? 0 : 1];
@@ -239,47 +243,24 @@ void eyestate_leave(void* r, void* view, int eye) {
 
 void eyestate_probe(int n) { g_probe = n; }
 
-// DLSS has one NGX feature and so one history for both eyes; without a feature per eye (not
-// implemented, docs/stereo.md), each eye would accumulate onto the other eye's image. While eyes
-// are rendered from the same update with DLSS on, the evaluate is told Reset = 1 every time: DLSS
-// then works as a per-frame (spatial) upscaler, symmetric between the eyes, with no cross-eye
-// blending. Restored as soon as that no longer holds.
-bool g_dlss_reset = false;
-uint32_t eyestate_dlss_mode() { return g_ok ? *reinterpret_cast<uint32_t*>(game_image().at(kRvaDlssMode)) : 0; }
+// DLSS: one feature per eye while both eyes of an update render (dlss.cpp), else the reset
+// fallback.
 void eyestate_update(bool dual) {
   if (!g_ok) return;
-  bool want = dual && eyestate_dlss_mode() != 0;
-  if (want == g_dlss_reset) return;
-  auto* imm = reinterpret_cast<uint32_t*>(game_image().at(kRvaDlssResetImm));
-  DWORD old;
-  if (!VirtualProtect(imm, 4, PAGE_EXECUTE_READWRITE, &old)) return;
-  *imm = want ? 1 : 0;
-  VirtualProtect(imm, 4, old, &old);
-  FlushInstructionCache(GetCurrentProcess(), imm, 4);
-  g_dlss_reset = want;
-  TB_LOG("stereo eyestate: DLSS reset every frame %s (DLSS mode %u)", want ? "on (one DLSS history for two eyes)" : "off",
-         eyestate_dlss_mode());
-}
-
-void* dlss_handle() {
-  if (!g_ok) return nullptr;
-  void* dev = *reinterpret_cast<void**>(game_image().at(kRvaDevice));
-  constexpr uintptr_t kRvaVtblDeviceD3D12PC = 0x790f58;  // rend::DeviceD3D12PC (RTTI, static)
-  if (!dev || *reinterpret_cast<uintptr_t*>(dev) != game_image().at(kRvaVtblDeviceD3D12PC)) return nullptr;
-  return at<void*>(dev, kDeviceDlssHandle);
+  dlss_update(dual);
 }
 
 std::string eyestate_status_json() {
-  char b[512];
+  char b[1024];
   snprintf(b, sizeof b,
            "{\"available\":%s,\"history\":%s,\"swaps\":%llu,\"remapped\":%llu,\"jitter_n\":%u,"
            "\"obj_prev_stores\":%llu,\"obj_prev_held\":%llu,\"obj_moving\":[%llu,%llu,%llu],"
-           "\"dlss_mode\":%u,\"dlss_handle\":\"%p\",\"dlss_reset\":%s}",
+           "\"dlss\":%s}",
            g_ok ? "true" : "false", g_history_ok ? "true" : "false", (unsigned long long)g_swaps.load(),
            (unsigned long long)g_remapped.load(), g_jitter_n,
            (unsigned long long)(g_store_in.load() + g_store_out.load()), (unsigned long long)g_store_held.load(),
            (unsigned long long)g_moving[0].load(), (unsigned long long)g_moving[1].load(),
-           (unsigned long long)g_moving[2].load(), eyestate_dlss_mode(), dlss_handle(), g_dlss_reset ? "true" : "false");
+           (unsigned long long)g_moving[2].load(), dlss_status_json().c_str());
   return b;
 }
 
