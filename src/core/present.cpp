@@ -5,11 +5,14 @@
 
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/hook.h"
 #include "core/lab.h"
 #include "core/log.h"
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace tb {
 namespace {
@@ -69,13 +72,105 @@ void remember_queue(IDXGISwapChain* sc, IUnknown* dev) {
   g_queues.emplace_back(sc, dev);
 }
 
+// --- stall watchdog ------------------------------------------------------------------------------
+// If the presenting thread stops presenting for kStallMs, log where it is: its instruction pointer
+// and the code addresses found on its stack, as module+offset. (2026-11-19: a real launch stopped
+// presenting a few seconds after the main menu with every thread asleep, unreproducible in the lab,
+// and a debugger attach killed the process.) Reported once per stall; reads only, the thread is
+// suspended for the duration of one GetThreadContext and a stack copy.
+constexpr DWORD kStallMs = 5000;
+std::atomic<DWORD> g_present_tick{0};
+std::atomic<DWORD> g_present_tid{0};
+std::atomic<DWORD> g_test_stall_ms{0};  // lab verb `stall MS`: sleep in the next Present (tests the watchdog)
+
+std::string where(uintptr_t a) {
+  if (a < 0x100000) return {};  // small integers, not code
+  HMODULE m = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(a), &m) ||
+      !m)
+    return {};
+  wchar_t path[MAX_PATH];
+  DWORD n = GetModuleFileNameW(m, path, MAX_PATH);
+  std::wstring w(path, n);
+  size_t slash = w.find_last_of(L"\\/");
+  std::wstring base = slash == std::wstring::npos ? w : w.substr(slash + 1);
+  uintptr_t off = a - reinterpret_cast<uintptr_t>(m);
+  if (off < 0x1000) return {};  // the module base / headers: data, not a return address
+  if (m == reinterpret_cast<HMODULE>(&__ImageBase)) base = L"torchbearer";
+  char b[160];
+  snprintf(b, sizeof b, "%ls+%#llx", base.c_str(), (unsigned long long)off);
+  return b;
+}
+
+void report_stall(DWORD tid, DWORD since_ms) {
+  HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+  if (!t) {
+    TB_LOG("stall: no present for %lu ms; presenting thread %lu not accessible", since_ms, tid);
+    return;
+  }
+  CONTEXT c{};
+  c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  uintptr_t stack[512];
+  size_t got = 0;
+  bool ok = false;
+  if (SuspendThread(t) != DWORD(-1)) {
+    ok = GetThreadContext(t, &c);
+    if (ok) {
+      SIZE_T rd = 0;
+      ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.Rsp), stack, sizeof stack, &rd);
+      got = rd / sizeof(uintptr_t);
+    }
+    ResumeThread(t);
+  }
+  CloseHandle(t);
+  if (!ok) {
+    TB_LOG("stall: no present for %lu ms; could not read thread %lu", since_ms, tid);
+    return;
+  }
+  TB_LOG("stall: no present for %lu ms; presenting thread %lu at rip %s (%#llx), rsp %#llx", since_ms, tid,
+         where(c.Rip).c_str(), (unsigned long long)c.Rip, (unsigned long long)c.Rsp);
+  int shown = 0;
+  for (size_t i = 0; i < got && shown < 24; i++) {
+    std::string w = where(stack[i]);
+    if (w.empty()) continue;
+    TB_LOG("stall:   [rsp+%#zx] %s", i * sizeof(uintptr_t), w.c_str());
+    shown++;
+  }
+}
+
+void watchdog() {
+  bool reported = false;
+  for (;;) {
+    Sleep(1000);
+    DWORD last = g_present_tick.load(), tid = g_present_tid.load();
+    if (!last || !tid) continue;
+    DWORD since = GetTickCount() - last;
+    if (since >= kStallMs && !reported) {
+      reported = true;
+      report_stall(tid, since);
+    } else if (since < kStallMs && reported) {
+      reported = false;
+      TB_LOG("stall: presenting again");
+    }
+  }
+}
+
 // Returns false if a filter vetoed the real Present.
 bool on_present(IDXGISwapChain* sc) {
   uint64_t f = g_frame.fetch_add(1) + 1;
+  g_present_tick = GetTickCount();
   if (f == 1) {
     TB_LOG("first present");
     lab_state("running", {"frame=1"});
+    g_present_tid = GetCurrentThreadId();
+    CloseHandle(CreateThread(nullptr, 0, [](void*) -> DWORD { watchdog(); return 0; }, nullptr, 0, nullptr));
+    lab_verb("stall", [](const std::vector<std::string>& a, bool& ok) -> std::string {
+      g_test_stall_ms = a.empty() ? 7000 : DWORD(atoi(a[0].c_str()));
+      return json_str("the next Present sleeps " + std::to_string(g_test_stall_ms.load()) + " ms");
+    });
   }
+  if (DWORD ms = g_test_stall_ms.exchange(0)) Sleep(ms);
   std::vector<PresentFn> ls;
   {
     std::lock_guard lk(g_mu);
