@@ -30,8 +30,10 @@
 #include "core/log.h"
 #include "core/module.h"
 #include "core/present.h"
+#include "features/stereo/cmdlist.h"
 #include "features/stereo/engine.h"
 #include "features/stereo/gpu.h"
+#include "features/stereo/pass2.h"
 
 namespace tb::stereo {
 namespace {
@@ -50,6 +52,11 @@ Bool1_t o_beginFrame;
 Void1_t o_endFrame;
 
 enum class Mode { Off, Left, Right, Alternate, Sbs };
+// sbs: how the two eyes of one game update are rendered.
+//   Frame  ModeSwitch::render twice (two whole engine frames; the first Present swallowed)
+//   View   renderFrame twice inside one ModeSwitch::render (one engine frame: beginFrame/endFrame,
+//          HUD and Present once; the HUD duplicated into both halves)
+enum class SbsPath { Frame, View };
 
 struct Params {
   Mode mode = Mode::Off;
@@ -58,6 +65,7 @@ struct Params {
   bool swap = false;
   bool taa_in_sbs = false;  // keep the game's TAA on in sbs mode (it then blends across eyes)
   bool objvel_in_sbs = false;  // keep object motion vectors in sbs mode (they then smear)
+  SbsPath path = SbsPath::View;
 };
 std::mutex g_pmu;
 Params g_p;
@@ -110,6 +118,7 @@ void census(const char* fmt, ...) {
 // --- eye state ---------------------------------------------------------------------------------
 // All of it lives on the thread that calls renderFrame (the game thread, measured).
 void* g_main_view = nullptr;   // the View last passed to renderFrame
+std::atomic<void*> g_renderer{nullptr};  // RendererX86 (renderFrame's this), for the peek verb
 double g_game_v2w[12];         // the game's own (unbiased) transform for g_main_view
 bool g_have_game_v2w = false;
 double g_applied = 0;          // metres along the view's right axis currently applied
@@ -207,6 +216,11 @@ void __fastcall hk_setPostProjection(void* view, const double* m) {
 std::atomic<int> g_pass{0};
 std::atomic<uint64_t> g_last_render_present{0};
 std::atomic<uint64_t> g_sbs_updates{0};
+// sbs_path = view: this ModeSwitch::render renders both eyes inside its one renderFrame call.
+bool g_view_update = false;  // game thread only
+bool g_view_done = false;    // both eyes rendered in this update
+std::atomic<bool> g_view_present{false};  // the next Present is a view-path sbs frame
+std::atomic<IDXGISwapChain*> g_sc{nullptr};  // the game's swapchain (last presented)
 
 int pick_eye(const Params& p) {
   switch (p.mode) {
@@ -247,6 +261,7 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
   }
   t_in_frame = true;
   o_renderFrame(r, view, a3, a4);
+  g_render_frames++;  // one scene render (one eye)
   t_in_frame = false;
   if (per_eye && taa) {
     int i = eye < 0 ? 0 : 1;
@@ -254,6 +269,33 @@ void render_eye(void* r, void* view, void* a3, void* a4, const Params& p, int ey
     g_have_prev[i] = true;
   }
   if (off != 0) g_frames_biased++;
+}
+
+// sbs_path = view: both eyes inside this one renderFrame call, i.e. inside one engine frame
+// (beginFrame .. endFrame, HUD, Present all once per update). The right eye renders first; once
+// renderFrame returns its lists are submitted (live census: the scene's ExecuteCommandLists is
+// inside renderFrame) and its final image is in the back buffer's first eye-width columns, so a
+// copy queued now on the game's queue lands after the right eye's work and before the left eye's.
+// The left eye then renders into the same columns, the stash goes into the second half, and
+// everything drawn into the back buffer after this (HUD, overlays) is duplicated into the second
+// half by cmdlist.cpp until Present.
+void render_view_sbs(void* r, void* view, void* a3, void* a4, const Params& p) {
+  g_view_done = true;
+  IDXGISwapChain* sc = g_sc.load();
+  pass2_eye(0);
+  render_eye(r, view, a3, a4, p, 1);
+  bool stashed = sc && gpu_stash_mid(sc, 1);
+  if (census_on()) census("view sbs: right eye rendered, stashed=%d", stashed);
+  pass2_eye(1);
+  render_eye(r, view, a3, a4, p, -1);
+  pass2_eye(-1);
+  bool placed = false;
+  if (stashed && present_width_scale(sc) >= 2 && gpu_put_mid(sc, 1)) {
+    placed = true;
+    cmdlist_duplicate(GetCurrentThreadId(), gpu_eye_width());
+  }
+  g_view_present = stashed;
+  if (census_on()) census("view sbs: left eye rendered, right eye placed=%d (overlay duplication armed)", placed);
 }
 
 void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
@@ -266,16 +308,24 @@ void __fastcall hk_renderFrame(void* r, void* view, void* a3, void* a4) {
            at<float>(view, view::kFar), m[9], m[10], m[11], m[6], m[7], m[8]);
   }
   g_last_render_present = present_frame();
-  if (g_render_frames++ == 0) {
+  g_renderer = r;
+  if (g_render_frames.load() == 0) {
     TB_LOG("stereo: first renderFrame (view %p)", view);
   }
   Params p = params();
   if (p.mode == Mode::Off && g_applied == 0) {
     g_main_view = view;
     o_renderFrame(r, view, a3, a4);
+    g_render_frames++;
+    if (census_on()) census("renderFrame leave");
+    return;
+  }
+  if (g_view_update && !g_view_done) {
+    render_view_sbs(r, view, a3, a4, p);
     return;
   }
   render_eye(r, view, a3, a4, p, pick_eye(p));
+  if (census_on()) census("renderFrame leave");
 }
 
 // The game's TAA switch (Options > Anti-aliasing; also forced off by DLSS): with it on, the second
@@ -347,8 +397,18 @@ void __fastcall hk_modeSwitchRender(void* self) {
   bool sbs = p.mode == Mode::Sbs && world;
   taa_force_off(sbs && !p.taa_in_sbs);
   objvel_force_off(sbs && !p.objvel_in_sbs);
+  IDXGISwapChain* sc = g_sc.load();
+  bool view = sbs && p.path == SbsPath::View && sc && cmdlist_install(sc);
+  cmdlist_track(view);
   if (!sbs) {
     o_modeSwitchRender(self);
+  } else if (view) {
+    g_view_update = true;
+    g_view_done = false;
+    o_modeSwitchRender(self);
+    g_view_update = false;
+    cmdlist_duplicate(0, 0);  // normally disarmed at Present; also if this update had none
+    if (g_view_done) g_sbs_updates++;
   } else {
     g_pass = 1;
     o_modeSwitchRender(self);
@@ -374,9 +434,16 @@ void __fastcall hk_endFrame(void* self) {
 using ExecuteCommandLists_t = void(STDMETHODCALLTYPE*)(void* q, UINT n, void* const* lists);
 ExecuteCommandLists_t o_executeCommandLists;
 void STDMETHODCALLTYPE hk_executeCommandLists(void* q, UINT n, void* const* lists) {
-  if (census_on())
-    census("ExecuteCommandLists q=%p n=%u ret=%#llx%s", q, n, (unsigned long long)rva(__builtin_return_address(0)),
-           t_in_frame ? " IN-RENDERFRAME" : "");
+  if (census_on()) {
+    std::string ls;
+    for (UINT i = 0; i < n && i < 32; i++) {
+      char b[24];
+      snprintf(b, sizeof b, " %p", lists[i]);
+      ls += b;
+    }
+    census("ExecuteCommandLists q=%p n=%u ret=%#llx%s lists:%s", q, n, (unsigned long long)rva(__builtin_return_address(0)),
+           t_in_frame ? " IN-RENDERFRAME" : "", ls.c_str());
+  }
   o_executeCommandLists(q, n, lists);
 }
 
@@ -399,6 +466,7 @@ std::string g_shot_dir;
 std::vector<std::string> g_shot_files;
 
 void on_present(IDXGISwapChain* sc, uint64_t frame) {
+  g_sc = sc;
   static bool ecl_hooked = false;
   if (!ecl_hooked) {
     ecl_hooked = true;
@@ -411,7 +479,10 @@ void on_present(IDXGISwapChain* sc, uint64_t frame) {
   }
   if (g_census.load() > 0) {
     census("Present");
-    if (--g_census == 0) TB_LOG("census done");
+    if (--g_census == 0) {
+      cmdlist_trace(false);
+      TB_LOG("census done");
+    }
   }
 }
 
@@ -432,6 +503,12 @@ void capture_if_armed(IDXGISwapChain* sc, uint64_t frame, const char* eye_tag) {
 
 // After the listeners, just before the real Present.
 bool present_gate(IDXGISwapChain* sc, uint64_t frame) {
+  if (g_view_present.exchange(false)) {  // both eyes of one update in this one frame
+    cmdlist_duplicate(0, 0);
+    gpu_compose_view(sc, 1);
+    capture_if_armed(sc, frame, "SBS");
+    return true;
+  }
   int pass = g_pass.load();
   if (pass == 1) {  // left eye of an sbs update: keep it, don't show it
     capture_if_armed(sc, frame, "L");
@@ -463,15 +540,16 @@ bool check_sigs() {
 
 std::string status_json() {
   Params p = params();
-  char b[512];
+  char b[1024];
   snprintf(b, sizeof b,
-           "{\"mode\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,\"main_view\":\"%p\","
-           "\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,\"present\":%llu,"
-           "\"taa_forced_off\":%s,\"gpu\":\"%s\"}",
-           mode_name(p.mode), p.separation_mm, p.convergence_m, p.swap ? "true" : "false", g_main_view, g_applied,
-           (unsigned long long)g_frames_biased.load(), (unsigned long long)g_render_frames.load(),
-           (unsigned long long)g_sbs_updates.load(), (unsigned long long)present_frame(), g_taa_forced ? "true" : "false",
-           gpu_status().c_str());
+           "{\"mode\":\"%s\",\"sbs_path\":\"%s\",\"separation_mm\":%.3f,\"convergence_m\":%.3f,\"swap\":%s,"
+           "\"main_view\":\"%p\",\"applied_m\":%.5f,\"frames_biased\":%llu,\"render_frames\":%llu,\"sbs_updates\":%llu,"
+           "\"present\":%llu,\"taa_forced_off\":%s,\"gpu\":\"%s\",\"cl\":\"%s\",\"pass2\":\"%s\"}",
+           mode_name(p.mode), p.path == SbsPath::View ? "view" : "frame", p.separation_mm, p.convergence_m,
+           p.swap ? "true" : "false", g_main_view, g_applied, (unsigned long long)g_frames_biased.load(),
+           (unsigned long long)g_render_frames.load(), (unsigned long long)g_sbs_updates.load(),
+           (unsigned long long)present_frame(), g_taa_forced ? "true" : "false", gpu_status().c_str(),
+           cmdlist_status().c_str(), pass2_status().c_str());
   return b;
 }
 
@@ -490,7 +568,12 @@ void register_feature() {
     else if (id == "stereo.taa") g_p.taa_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.object_velocity") g_p.objvel_in_sbs = (v == "1" || v == "true");
     else if (id == "stereo.output") present_set_width_scale(v == "full" ? 2 : 1);  // at swapchain creation
+    else if (id == "stereo.sbs_path") g_p.path = v == "frame" ? SbsPath::Frame : SbsPath::View;
   });
+  // Back buffers and their RTVs (bookkeeping only; cmdlist.cpp needs them to recognise the back
+  // buffer in command lists when sbs_path = view is used).
+  resize_on([](IDXGISwapChain* sc, unsigned, unsigned) { cmdlist_on_swapchain(sc); });
+  pass2_register();
   // quiver lab call awr tweak list [SUBSTR] | tweak NAME [VALUE]: the engine's tweakable registry.
   lab_verb("tweak", [](const std::vector<std::string>& a, bool& ok) -> std::string {
     if (a.empty()) {
@@ -550,6 +633,8 @@ void register_feature() {
     }
     if (sub == "census") {
       int n = a.size() > 1 ? atoi(a[1].c_str()) : 2;
+      // "census N cl": also trace command-list calls touching the back buffer.
+      if (a.size() > 2 && a[2] == "cl" && g_sc.load() && cmdlist_install(g_sc.load())) cmdlist_trace(true);
       g_census = n;
       return json_str("census armed for " + std::to_string(n) + " presents");
     }
@@ -562,6 +647,29 @@ void register_feature() {
       g_shot_dir = d ? d : ".";
       g_shot_files.clear();
       return json_str("capturing " + std::to_string(g_shots_left) + " frames to " + g_shot_dir);
+    }
+    if (sub == "peek") {  // peek BASE [+OFF | * ]...: BASE = r (RendererX86), img, or an address
+      if (a.size() < 2) {
+        ok = false;
+        return json_str("usage: stereo peek r|img|ADDR [+OFF|*]...");
+      }
+      uintptr_t v = a[1] == "r" ? reinterpret_cast<uintptr_t>(g_renderer.load())
+                    : a[1] == "img" ? game_image().base
+                                    : uintptr_t(strtoull(a[1].c_str(), nullptr, 16));
+      std::string trail;
+      for (size_t i = 2; i < a.size() && v; i++) {
+        if (a[i] == "*") {
+          if (IsBadReadPtr(reinterpret_cast<void*>(v), 8)) return json_str("bad pointer after " + trail);
+          v = *reinterpret_cast<uintptr_t*>(v);
+        } else {
+          v += uintptr_t(strtoll(a[i].c_str(), nullptr, 16));
+        }
+        trail += " " + a[i];
+      }
+      char b[96];
+      snprintf(b, sizeof b, "%#llx%s%#llx", (unsigned long long)v, game_image().contains(v) ? " rva " : "",
+               game_image().contains(v) ? (unsigned long long)(v - game_image().base) : 0ull);
+      return json_str(b);
     }
     if (sub == "files") {
       std::lock_guard lk(g_cmu);
@@ -592,6 +700,7 @@ void start() {
     TB_LOG("stereo: hooks failed; feature disabled");
     return;
   }
+  pass2_start();
   present_on(on_present);
   present_filter(present_gate);
   g_hooked = true;
