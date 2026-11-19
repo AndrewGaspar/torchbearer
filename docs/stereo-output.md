@@ -156,8 +156,10 @@ On this machine GE-Proton picks Wine's **Wayland** driver whenever `WAYLAND_DISP
 `proton run` self-test window was not XWayland; Quiver keeps the variable for real launches). There
 a game's Vulkan image is in Wine's *client subsurface* (winewayland wayland_surface.c), and
 HypXRland crops only a window's main surface — so a tagged Wine-Wayland game would **not** be
-split per eye. Two ways out: run the game on Wine's X11 driver (e.g. `winewayland.drv=d` in the
-mod's launch settings; everything in the lab ran X11 under gamescope), or teach HypXRland to crop
-a stereo window's covering subsurface (Wine's client surface). Full resolution under HypXRland
+split per eye. Two ways out: run the game on Wine's X11 driver, or teach HypXRland to crop a
+stereo window's covering subsurface (Wine's client surface; requested from the hypxrland session
+2026-11-19). **Interim (0.4): the mod's launch settings disable `winewayland.drv`**, so Wine uses
+its X11 driver (XWayland), the path every lab test ran on. Cost: Wine-Wayland HDR is unavailable
+with the mod. Full resolution under HypXRland
 additionally needs Wine to allow a swapchain larger than the window (win32u/vulkan.c pins the
 Vulkan extent to the client rect; the Wayland driver would then scale it with its viewport).
