@@ -270,7 +270,7 @@ void window_start() {
   // output = full is read at start-up (the swapchain is created with it), and so is this.
   g_active = present_width_scale_pending() > 1;
   void* win = window_obj();
-  TB_LOG("stereo window: hooks installed, %s; window object %p at start", active() ? "active (output = full)" : "inactive",
+  TB_LOG("stereo window: hooks installed, %s; window object %p at start", active() ? "active (2x-wide swapchain: output full or hsbs)" : "inactive",
          win);
   if (active() && win) {  // the window may already exist
     set_engine_size(at<int>(win, kWinW), at<int>(win, kWinH));

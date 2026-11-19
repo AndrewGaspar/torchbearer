@@ -4,6 +4,8 @@
 
 #include "core/quiver.h"
 
+#include <thread>
+#include <windows.h>
 #include <string>
 
 #include "core/config.h"
@@ -25,6 +27,20 @@ void quiver_init() {
   quiver_on_values_cb(g_q, on_values, nullptr);
   TB_LOG("quiver SDK: %s", quiver_connected(g_q) ? "connected" : "opened (connects in background)");
   if (g_q && !g_layout.empty()) quiver_set_stereo_layout(g_q, g_layout.c_str());
+  // Say whether the SDK ever connects (it does so in the background): without this the log can't
+  // tell "not offered by Quiver" from "connected" (2026-11-19: Sight drew mono and nothing said why).
+  if (g_q)
+    std::thread([] {
+      for (int i = 0; i < 120; i++) {
+        if (quiver_connected(g_q)) {
+          TB_LOG("quiver SDK: connected (%.1f s after open); stereo layout %s", i * 0.5,
+                 g_layout.empty() ? "(none)" : g_layout.c_str());
+          return;
+        }
+        Sleep(500);
+      }
+      TB_LOG("quiver SDK: not connected 60 s after open (no channel offered, or quiverd unreachable)");
+    }).detach();
 }
 
 void quiver_live(const char* id) { quiver_handle_option(g_q, id); }
