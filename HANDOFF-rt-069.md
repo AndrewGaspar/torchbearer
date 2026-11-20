@@ -57,8 +57,10 @@ Written 2026-11-20 ~14:07 MST by Muse (muse-wonder-full-1.0), picking up subagen
 
 ## Not done / not verified
 
-- Stereo second-eye lost spot: **not isolated** (beam lowered at idle; no aimed A/B captured).
-  Next: aim via pad (`pads=1`, LT aim) in sbs with `skip_shadows = 1`, RT vs `rt_spot_on 0`.
+- Stereo second-eye lost spot: aimed A/B done (r76, pad LT, sbs/hsbs + `skip_shadows = 1`):
+  eyes match in both modes, no second-eye darkness — but the bird encounter + floodlights
+  dominate the frame, so treat as consistent-with, not isolated proof. A quiet aimed test
+  (indoor fixture) would settle it. Note `awr-rt` now has `pads=1` in its manifest.
 - Ferry temporal improvement: motion plumbing is on and the ferry renders cleanly (r74), but no
   temporal-noise measurement (`quiver lab bench` or stepped virtual-clock frames would do it).
 - Skinned close-up banding: receiver-from-hit is on by default (`dev.rtao_receiver`); no close-up

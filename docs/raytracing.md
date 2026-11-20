@@ -622,10 +622,12 @@ With `ao = game` the scene capture runs for the TLAS alone (the AO chain and its
 live r67: swap and draws bound, `ao_copies` 0). The flashlight's atlas view still renders:
 `g_sShadowMapTex` is also read by `raymarchSunlight`, `downsample_shadow_map_PS` and the sun
 resolve (static), so skipping it is not the free saving it looked like. Stereo: runs in
-sbs/hsbs with `skip_shadows = 1` (live r73, both eyes rendered, draws bound in both); whether
-it restores the second eye's lost spot (docs/stereo.md section 6) was **not** isolated — the
-beam is lowered at idle in the lab, so no aimed A/B was captured. Cost is inside the game's
-deferred-light pass and not isolated by our timestamps.
+sbs/hsbs with `skip_shadows = 1` (live r73/r76, both eyes rendered, draws bound in both); with
+the flashlight aimed (lab pad LT), the two eyes' centre luminance matches in RT (131.0 vs 130.8
+mean) as in the game's mode, i.e. no second-eye darkness was observed — but the aimed captures
+were taken during the bird encounter with floodlights dominating, so the lost-spot fix
+(docs/stereo.md section 6) is **consistent with, not isolated by**, this test. Cost is inside
+the game's deferred-light pass and not isolated by our timestamps.
 
 ## Reproducing
 
