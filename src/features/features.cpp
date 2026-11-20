@@ -5,7 +5,9 @@
 #include "core/config.h"
 #include "core/lab.h"
 #include "features/firstperson.h"
+#include "features/graphics.h"
 #include "features/levels.h"
+#include "features/rt/rt.h"
 #include "features/settings.h"
 #include "features/stereo/stereo.h"
 
@@ -25,6 +27,8 @@ void features_register() {
   levels_register();
   stereo::register_feature();
   firstperson_register();
+  graphics_register();
+  rt::register_feature();
 }
 
 void features_start() {
@@ -33,6 +37,8 @@ void features_start() {
   levels_start();
   stereo::start();
   firstperson_start();
+  graphics_start();
+  rt::start();
   hook_batch_end();
 }
 

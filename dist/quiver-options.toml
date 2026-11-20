@@ -37,6 +37,10 @@ title = "Graphics quality"
 options = ["game.quality", "game.taa", "game.fxaa", "game.msaa", "game.anisotropy",
            "game.shadows", "game.volumetrics", "game.terrain", "game.draw_distance"]
 
+[[page.group]]
+title = "Beyond the game's menu"
+options = ["graphics.ssao"]
+
 [[page]]
 id = "audio"
 title = "Audio and subtitles"
@@ -797,6 +801,15 @@ label = "Share the sky probe between eyes"
 help = "The second eye reuses the sky cube and ambient lighting the first eye computed in the same update. One-frame eye rendering only."
 default = true
 level = "advanced"
+apply = "live"
+
+# ---------------------------------------------------------------- graphics (docs/raytracing.md)
+
+[option."graphics.ssao"]
+type = "bool"
+label = "Original 2010 ambient occlusion (SSAO)"
+help = "Use the game's original screen-space ambient occlusion, which the remaster ships but never enables, instead of its HBAO. Stronger contact shading that also reaches distant scenery (with the slight halos of its era), at the same cost."
+default = false
 apply = "live"
 
 # ---------------------------------------------------------------- camera (docs/first-person.md)
