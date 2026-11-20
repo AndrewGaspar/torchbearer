@@ -10,6 +10,10 @@ namespace tb {
 //    the shadow buffer's alpha), so the option runs SSAO and skips HBAO. The main pass's branches
 //    are patched instead of the globals, so nothing the game saves to its config changes; 0
 //    restores the game's own branches. Applied between frames.
+//  - [graphics] ao = game, ssao or rtao: the ambient occlusion. game = the remaster's HBAO, ssao =
+//    the above, rtao = ray-traced AO (rt/trace.cpp) written where HBAO's result goes. Set, it
+//    takes precedence over `ssao`; unset (empty), `ssao` decides. rtao needs the D3D12 capture,
+//    installed at launch only when the game starts with ao = rtao.
 void graphics_register();
 void graphics_start();
 

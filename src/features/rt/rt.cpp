@@ -9,6 +9,8 @@
 //   rt gpu on|off|status   GPU time of engine passes (timestamps recorded into the engine's lists)
 //   rt grab NAME WHERE     copy an engine render target at a pass boundary -> <run>/rt-grab-*.raw
 //   rt flag ssao|hbao [0|1]  force the SSAO / HBAO branch of the main pass (code patch, dev)
+//   rt scene on|off|status|validate [MASK] [img]|budget N|casters 0|1|reset
+//                          geometry capture, BLAS/TLAS and the ray passes (scene.cpp, trace.cpp)
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include "features/rt/rt.h"
 
@@ -32,6 +34,7 @@
 #include "core/present.h"
 #include "features/graphics.h"
 #include "features/rt/rt_internal.h"
+#include "features/rt/rt_scene.h"
 
 namespace tb::rt {
 namespace {
@@ -311,6 +314,7 @@ void grab_present() {
 }
 
 void mark(Pass p, int phase, void* obj) {
+  scene_mark(int(p), phase, obj);
   if (census_active()) census_mark(kPassName[p], phase, obj);
   if (phase == 0) grab_mark(p, 0, obj);
   time_mark(p, phase);
@@ -396,6 +400,11 @@ const Hook kHooks[] = {
      (void*)hk_post, (void**)&o_post},
 };
 std::atomic<bool> g_engine_hooked{false};
+// Scene + ray passes, wanted by [graphics] ao = rtao or `rt scene on`; switched at present (game
+// thread): it needs the device (hooks from launch), the list hooks and the engine markers.
+std::atomic<int> g_want_scene{0};
+int g_have_scene = 0;
+bool g_scene_failed_logged = false;
 
 bool engine_hooks() {
   if (g_engine_hooked) return true;
@@ -519,17 +528,66 @@ std::string verb(const std::vector<std::string>& a, bool& ok) {
     return "{\"branch\":" + json_str(graphics_branch_state(a[1])) + ",\"global\":" +
            std::to_string(*reinterpret_cast<const uint8_t*>(game_image().at(g))) + "}";
   }
+  if (sub == "scene") {
+    std::string m = a.size() > 1 ? a[1] : "status";
+    if (m == "on" || m == "off") {
+      g_want_scene = m == "on" ? 1 : 0;
+      for (int i = 0; i < 100 && g_have_scene != g_want_scene.load(); i++) Sleep(10);  // applied at present
+      if (g_have_scene != g_want_scene.load()) ok = false;
+      return scene_status();
+    }
+    if (m == "validate") {
+      unsigned mask = a.size() > 2 ? unsigned(strtoul(a[2].c_str(), nullptr, 0)) : 0x0f;
+      bool img = a.size() > 3 && a[3] == "img";
+      trace_validate_arm(mask, img);
+      Sleep(400);  // traced at the next kick, read back kSlots submissions later
+      return scene_status();
+    }
+    return scene_verb(m, a.size() > 2 ? a[2] : "");
+  }
   ok = false;
   return json_str("usage: rt status | dxr [test] | census N [TAG] | shaders H,H|all [disasm] | gpu on|off|reset|status | "
-                  "grab NAME PASS[:phase] [TAG] | flag ssao|hbao [game|1|0]");
+                  "grab NAME PASS[:phase] [TAG] | flag ssao|hbao [game|1|0] | "
+                  "scene on|off|status|validate [MASK] [img]|budget N|casters 0|1|reset");
 }
 
 }  // namespace
 
+ID3D12Resource* pool_resource(const char* name) { return pool_res(name); }
+
+namespace {
+
+void apply_scene() {
+  int want = g_want_scene.load();
+  if (want == g_have_scene) return;
+  if (!want) {
+    scene_enable(false);
+    g_have_scene = 0;
+    return;
+  }
+  if (capture_on() && capture_lists() && engine_hooks() && scene_enable(true)) {
+    g_have_scene = 1;
+    g_scene_failed_logged = false;
+  } else if (!g_scene_failed_logged) {
+    g_scene_failed_logged = true;
+    TB_LOG("rt: ray-traced passes unavailable (%s)", capture_on() ? "hooks failed" :
+           "the D3D12 capture is installed at launch: start the game with [graphics] ao = rtao");
+  }
+}
+
+}  // namespace
+
+void set_rtao(bool on) { g_want_scene = on ? 1 : 0; }
+bool rtao_active() { return g_have_scene == 1 && scene_enabled(); }
+
 void register_feature() {
   lab_verb("rt", verb);
+  cfg_listen("dev.", [](const std::string& id, const std::string& v) {
+    if (id.rfind("dev.rtao_", 0) == 0 || id.rfind("dev.rt_sun", 0) == 0) trace_config(id, v);
+  });
   present_on([](IDXGISwapChain* sc, uint64_t) {
     g_sc = sc;
+    apply_scene();
     census_present();
     timer_present();
     grab_present();
@@ -537,7 +595,11 @@ void register_feature() {
 }
 
 void start() {
-  if (cfg_bool("dev.rt_capture", false)) capture_early();
+  // The D3D12 capture goes in at launch (it tracks resources and pipeline states as they are
+  // created): for the census ([dev] rt_capture) and for the ray-traced passes ([graphics] ao =
+  // rtao, or [dev] rt_scene = 1 for the lab verbs). Otherwise nothing is hooked.
+  bool full = cfg_bool("dev.rt_capture", false);
+  if (full || cfg_str("graphics.ao") == "rtao" || cfg_bool("dev.rt_scene", false)) capture_early(full);
 }
 
 }  // namespace tb::rt

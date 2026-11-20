@@ -995,6 +995,9 @@ void register_feature() {
   });
 }
 
+int eye_now() { return g_eye_now.load(); }
+void* main_view() { return g_main_view; }
+
 void start() {
   if (!check_sigs()) return;
   const auto& img = game_image();

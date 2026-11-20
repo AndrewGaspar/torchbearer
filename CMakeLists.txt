@@ -47,6 +47,8 @@ add_library(torchbearer SHARED
   src/features/rt/census.cpp
   src/features/rt/dxr.cpp
   src/features/rt/dxc.cpp
+  src/features/rt/scene.cpp
+  src/features/rt/trace.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 # Dev only: embeds vkd3d-proton's LGPL ray-query test shader for `rt dxrtest` (docs/raytracing.md).
