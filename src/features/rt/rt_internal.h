@@ -68,6 +68,21 @@ struct DrawRec {
   ID3D12Resource* rt0 = nullptr;  // G-buffer: render targets 0 (device depth) and 1 (normals)
   ID3D12Resource* rt1 = nullptr;
   uint64_t ps = 0;       // pixel shader hash
+  // Alpha-tested draws (DF_ALPHA; shaders/alpha.hlsli, rays.hlsl cs_gather): how the draw's own
+  // shaders compute the alpha sample's UVs, and which texture it samples. uv_mode 0 = not
+  // resolved (the geometry stays opaque for rays); alpha_idx < 0 likewise.
+  uint8_t uv_mode = 0;        // 1 UV = A.xy * scale, 2 UV = A.xy, 3 atlas (grass cards)
+  uint8_t uv_fmt_a = 0, uv_fmt_b = 0, uv_comp_a = 0;
+  uint16_t uv_off_a = 0, uv_off_b = 0;  // attribute byte offsets in the UV stream's vertex
+  uint64_t uv_vb = 0;         // VA of BaseVertexLocation's vertex in the UV stream's buffer view
+  uint32_t uv_stride = 0;
+  float uv_scale = 1.0f;      // mode 1
+  uint32_t atlas_off = 0;     // mode 3: byte offset of the atlas table in $Globals
+  uint8_t atlas_rows = 0;     // mode 3: float4 rows per atlas entry
+  float alpha_thresh = 0.5f;
+  int32_t alpha_idx = -1;     // the alpha SRV's index in the game's bound descriptor heap
+  uint64_t alpha_cpu = 0;     // its CPU descriptor handle (copied into the mod's heap per update)
+  uint64_t alpha_heap = 0;    // that heap's GPU start (the spotlight binds it as space 10)
 };
 // Arm or disarm the capture (needs the device hooks from launch and the list hooks).
 bool scene_capture(bool on);
