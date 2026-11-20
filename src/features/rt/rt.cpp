@@ -587,8 +587,9 @@ bool rtao_active() { return g_have_scene == 1 && scene_enabled(); }
 void register_feature() {
   lab_verb("rt", verb);
   cfg_listen("dev.", [](const std::string& id, const std::string& v) {
-    if (id.rfind("dev.rtao_", 0) == 0 || id.rfind("dev.rt_sun", 0) == 0) trace_config(id, v);
+    if (id.rfind("dev.rtao_", 0) == 0 || id.rfind("dev.rt_sun", 0) == 0 || id == "dev.rt_alpha") trace_config(id, v);
     if (id == "dev.rt_spot_on") spot_enable(v != "0");
+    else if (id.rfind("dev.rt_spot_", 0) == 0) scene_spot_config(id, v);
   });
   present_on([](IDXGISwapChain* sc, uint64_t) {
     g_sc = sc;

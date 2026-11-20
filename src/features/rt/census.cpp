@@ -877,7 +877,10 @@ CreateRS_t o_rs;
 using SerializeVRS_t = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 using CreateVDeser_t = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
 
-// The game's root signature with the two parameters appended, or an empty vector.
+// The game's root signature with the spotlight's parameters appended (spotlight.hlsl: SRV t0
+// space9 TLAS, CBV b0 space9, SRV t1 space9 alpha buffer, a descriptor table over the game's
+// own heap at t0 space10, static sampler s0 space9), or an empty vector. Appended at the end,
+// so every original index keeps its meaning; only installed with the RT flashlight on.
 std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
   HMODULE m = GetModuleHandleW(L"d3d12.dll");
   auto deser = m ? reinterpret_cast<CreateVDeser_t>(GetProcAddress(m, "D3D12CreateVersionedRootSignatureDeserializer")) : nullptr;
@@ -891,7 +894,7 @@ std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC d = *vd;
     std::vector<D3D12_ROOT_PARAMETER1> ps(d.Desc_1_1.pParameters, d.Desc_1_1.pParameters + d.Desc_1_1.NumParameters);
     *base = int(ps.size());
-    D3D12_ROOT_PARAMETER1 a{}, b{};
+    D3D12_ROOT_PARAMETER1 a{}, b{}, c{}, t4{};
     a.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     a.Descriptor.ShaderRegister = 0;
     a.Descriptor.RegisterSpace = 9;
@@ -899,10 +902,32 @@ std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
     a.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     b = a;
     b.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    c = a;
+    c.Descriptor.ShaderRegister = 1;
+    static const D3D12_DESCRIPTOR_RANGE1 kHeapRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, ~0u, 0, 10,
+                                                    D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+    t4.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    t4.DescriptorTable.NumDescriptorRanges = 1;
+    t4.DescriptorTable.pDescriptorRanges = &kHeapRange;
+    t4.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     ps.push_back(a);
     ps.push_back(b);
+    ps.push_back(c);
+    ps.push_back(t4);
     d.Desc_1_1.NumParameters = UINT(ps.size());
     d.Desc_1_1.pParameters = ps.data();
+    std::vector<D3D12_STATIC_SAMPLER_DESC> ss(d.Desc_1_1.pStaticSamplers,
+                                              d.Desc_1_1.pStaticSamplers + d.Desc_1_1.NumStaticSamplers);
+    D3D12_STATIC_SAMPLER_DESC wrap{};
+    wrap.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    wrap.AddressU = wrap.AddressV = wrap.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    wrap.MaxLOD = D3D12_FLOAT32_MAX;
+    wrap.ShaderRegister = 0;
+    wrap.RegisterSpace = 9;
+    wrap.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    ss.push_back(wrap);
+    d.Desc_1_1.NumStaticSamplers = UINT(ss.size());
+    d.Desc_1_1.pStaticSamplers = ss.data();
     ID3DBlob *o = nullptr, *e = nullptr;
     if (SUCCEEDED(ser(&d, &o, &e)) && o) {
       auto* p = static_cast<const uint8_t*>(o->GetBufferPointer());
@@ -1453,10 +1478,15 @@ void spot_bind(ID3D12GraphicsCommandList* l) {
     if (it == g_spot_base.end()) return;
     base = it->second;
   }
-  uint64_t tlas = 0, cb = 0;
-  if (base < 0 || !scene_spot_bind(&tlas, &cb)) return;
+  uint64_t tlas = 0, cb = 0, alpha = 0;
+  if (base < 0 || !scene_spot_bind(&tlas, &cb, &alpha)) return;
   o_gSrv(l, UINT(base), tlas);
   o_gCbv(l, UINT(base + 1), cb);
+  o_gSrv(l, UINT(base + 2), alpha);
+  if (s->heap_gpu0) {
+    D3D12_GPU_DESCRIPTOR_HANDLE h{s->heap_gpu0};  // t0 space10: the game's heap, by heap index
+    o_gTab(l, UINT(base + 3), h);
+  }
   g_spot_draws++;
 }
 

@@ -1429,10 +1429,10 @@ static const char kSpotHlsl[] = R"TBHLSL(// The game's shadowed spot light pixel
 //   TB_SHADOW_RQ   [graphics] flashlight_shadows = rt: the flashlight's shadow by inline ray queries
 //                  (DXR 1.1, ps_6_5) against the mod's TLAS towards a disc the size of its bulb
 //                  (soft penumbra), alpha-tested foliage included; every other shadowed spot keeps
-//                  the PCF on the atlas. Extra bindings, in a copy of the pipeline's root signature
-//                  made for this shader only (census.cpp): t0 space9 TLAS, b0 space9 constants,
-//                  t1 space9 the alpha buffer, t0.. space10 the game's own descriptor heap (the
-//                  alpha textures by heap index), s0 space9 a wrap sampler.
+//                  the PCF on the atlas. Extra bindings, appended to every root signature at
+//                  creation while the RT flashlight is on (census.cpp rs_extend): t0 space9 TLAS,
+//                  b0 space9 constants, t1 space9 the alpha buffer, t0.. space10 the game's own
+//                  descriptor heap (the alpha textures by heap index), s0 space9 a wrap sampler.
 //
 // Built at dev time with a current DXC (scripts/build_shaders), embedded as DXIL.
 

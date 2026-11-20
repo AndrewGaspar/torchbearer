@@ -1483,13 +1483,15 @@ GrowBuf g_spot_cb[kSlots];
 uint64_t g_spot_frame = ~0ull;
 uint64_t g_spot_cb_va = 0;
 std::atomic<float> g_spot_bias{0.03f}, g_spot_radius{0.04f}, g_spot_rays{4}, g_spot_clear{0.35f};
+std::atomic<float> g_spot_maxdist{3.0f}, g_spot_mincos{0.5f};
+std::atomic<int> g_spot_all{0};
 
 }  // namespace
 
 bool scene_spot_ready() { return g_on.load(std::memory_order_relaxed) && g_tlas_va && g_last_update == present_frame(); }
 
 // Game thread, at a swapped spotlight draw (after the kick: the TLAS of this update is built).
-bool scene_spot_bind(uint64_t* tlas, uint64_t* cb) {
+bool scene_spot_bind(uint64_t* tlas, uint64_t* cb, uint64_t* alpha) {
   if (!scene_spot_ready()) return false;
   uint64_t f = present_frame();
   if (f != g_spot_frame) {
@@ -1497,15 +1499,29 @@ bool scene_spot_bind(uint64_t* tlas, uint64_t* cb) {
     if (!g_spot_cb[slot].ensure(256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ) ||
         !g_spot_cb[slot].cpu)
       return false;
-    float c[8] = {float(g_anchor[0]), float(g_anchor[1]), float(g_anchor[2]), float(0x0f), g_spot_bias, g_spot_radius,
-                  g_spot_rays, g_spot_clear};
+    float c[12] = {float(g_anchor[0]), float(g_anchor[1]), float(g_anchor[2]), float(0x0f), g_spot_bias, g_spot_radius,
+                   g_spot_rays, g_spot_clear, g_alpha_va ? 1.0f : 0.0f, g_spot_maxdist, g_spot_mincos,
+                   float(g_spot_all.load())};
     memcpy(g_spot_cb[slot].cpu, c, sizeof c);
     g_spot_cb_va = g_spot_cb[slot].va();
     g_spot_frame = f;
   }
   *tlas = g_tlas_va;
   *cb = g_spot_cb_va;
+  *alpha = g_alpha_va ? g_alpha_va : g_tlas_va;  // unread while tb_q.x is 0, but never null
   return true;
+}
+
+void scene_spot_config(const std::string& id, const std::string& v) {
+  double x = atof(v.c_str());
+  if (id == "dev.rt_spot_bias" && !v.empty()) g_spot_bias = float(x);
+  else if (id == "dev.rt_spot_radius" && !v.empty()) g_spot_radius = float(x);
+  else if (id == "dev.rt_spot_rays" && !v.empty()) g_spot_rays = float(x);
+  else if (id == "dev.rt_spot_clear" && !v.empty()) g_spot_clear = float(x);
+  else if (id == "dev.rt_spot_maxdist" && !v.empty()) g_spot_maxdist = float(x);
+  else if (id == "dev.rt_spot_mincos" && !v.empty()) g_spot_mincos = float(x);
+  else if (id == "dev.rt_spot_all" && !v.empty()) g_spot_all = x != 0 ? 1 : 0;
+  g_spot_frame = ~0ull;  // rewrite the constants at the next swapped draw
 }
 
 // ---- census.cpp / rt.cpp callbacks --------------------------------------------------------------

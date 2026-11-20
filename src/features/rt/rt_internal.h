@@ -109,10 +109,11 @@ void scene_after_exec(ID3D12CommandQueue* q, unsigned n, ID3D12CommandList* cons
 void scene_invalidate(uint64_t va, uint64_t size);
 // scene.cpp, called by rt.cpp's engine markers (game thread).
 void scene_mark(int pass, int phase, void* obj);
-// The flashlight prototype ([dev] rt_spot = 2): whether this frame has a TLAS, and the root
-// arguments (TLAS VA, constants VA) to set before a swapped spotlight draw.
+// The flashlight ([dev] rt_spot = 2 / flashlight_shadows = rt): whether this frame has a TLAS,
+// and the root arguments (TLAS VA, constants VA, alpha buffer VA) for a swapped spotlight draw.
 bool scene_spot_ready();
-bool scene_spot_bind(uint64_t* tlas, uint64_t* cb);
+bool scene_spot_bind(uint64_t* tlas, uint64_t* cb, uint64_t* alpha);
+void scene_spot_config(const std::string& id, const std::string& value);  // [dev] rt_spot_* tuning
 
 // rt.cpp: an engine pool render target by name (pShadowRT, pLinearDepthRT, ...), or nullptr.
 ID3D12Resource* pool_resource(const char* name);
