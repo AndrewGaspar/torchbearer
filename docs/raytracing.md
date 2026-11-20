@@ -626,8 +626,10 @@ sbs/hsbs with `skip_shadows = 1` (live r73/r76, both eyes rendered, draws bound 
 the flashlight aimed (lab pad LT), the two eyes' centre luminance matches in RT (131.0 vs 130.8
 mean) as in the game's mode, i.e. no second-eye darkness was observed — but the aimed captures
 were taken during the bird encounter with floodlights dominating, so the lost-spot fix
-(docs/stereo.md section 6) is **consistent with, not isolated by**, this test. Cost is inside
-the game's deferred-light pass and not isolated by our timestamps.
+(docs/stereo.md section 6) is **consistent with, not isolated by**, this test. (The quiet indoor
+fixture cannot isolate it either: Alan has no flashlight in the apartment dream, live r77 — eyes
+match there trivially.) Cost is inside the game's deferred-light pass and not isolated by our
+timestamps.
 
 ## Reproducing
 
