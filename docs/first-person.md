@@ -7,17 +7,20 @@ the prototype `[camera] mode = first_person` (`src/features/firstperson.cpp`, ex
 
 Status in one paragraph: **it works as a render-side first-person view.** During normal gameplay
 the rendered camera sits at Alan's eyes (his animated head slot plus a small offset), looks where
-the game's own third-person camera looks (converged on that camera's centre ray at 15 m), his
-body, flashlight and gun meshes are hidden with the engine's render-object "hidden" flag while the
-flashlight's beam stays on (not with the per-character hide mask, which stops "use" working:
-section 5), and the game is unchanged underneath: walking, mouse look, aiming the
+the game's own third-person camera looks (converged on that camera's centre ray at 15 m), only
+his head, hair and neck are left out of the rendered view (since 0.6.3, `hide = head`, section 6:
+his arms and hands holding the flashlight and gun, his torso and legs stay, and his shadow keeps
+the head; `hide = body/all` hide the body with the engine's render-object "hidden" flag, not with
+the per-character hide mask, which stops "use" working: section 5), and the game is unchanged
+underneath: walking, mouse look, aiming the
 flashlight, focusing it on the Taken birds all play as before because every gameplay system still
 reads the third-person camera. Cutscene, free, death and vehicle cameras and scripted shots inside
 the player camera fall back to the game's camera (and the body comes back). It composes with
 stereo: first person is a camera filter that runs before the stereo eye offset, so `sbs` renders
 both eyes around the first-person eye point (measured depth-dependent disparity). What it is not
-yet: a first-person game (no arms/viewmodel, aim parallax at close range, DOF focus and sound
-listener still at the third-person camera, head bob only low-passed).
+yet: a first-person game (the arms are the third-person animation's: the hands come into view
+when aiming or looking down, not when walking with the flashlight low; aim parallax at close
+range, DOF focus and sound listener still at the third-person camera, head bob only low-passed).
 
 Addresses are RVAs (image base 0x140000000) of `Game_f_x64_EOS.exe` (Epic, 2026-11). "static" =
 read in Ghidra (`re/scripts/Serve.java`), "live" = observed in the lab (instance `awr-fp`,
@@ -31,7 +34,7 @@ read in Ghidra (`re/scripts/Serve.java`), "live" = observed in the lab (instance
 [camera]
 mode = first_person   ; third_person = the game's camera (inert)
 fov = 0               ; horizontal degrees at 16:9 in first person, 0 = the game's (game.fov)
-hide = all            ; all | body (keep held flashlight/gun) | none
+hide = head           ; head (default: arms, body, held items visible) | all | body | none
 anchor = head         ; head (animated) | body (root + eye_height)
 smooth = 0.1          ; s, low-pass on the head's motion relative to the body
 eye_up = 0.05         ; m above the head slot
@@ -46,7 +49,10 @@ game's current use target, i.e. what the interaction prompt is for, the game's h
 player and whether ours is applied), `fp usables [mask] [radius]` (game objects of a type mask near
 the player: 4 = pickups, 0x40 = triggers incl. use triggers, 0x4d = everything "use" considers;
 for finding pickups to test with), `fp hidetest on|off` (test aid: first person's hiding of the
-player in third person too).
+player in third person too), `fp parts [bones]` (the player's render objects, their submeshes with
+material effect and bind-pose height range, and with `bones` the skeleton's bone names),
+`fp mask HEX` (test aid: the body's per-submesh draw mask), `fp give weapons|flashlight` (test aid:
+what the game's Developer Menu cheats do: revolver, flare gun, shotgun; flashlight and batteries).
 
 ---
 
@@ -163,7 +169,8 @@ High/Mid/Low/Safe Pos, Switch Side Speed, Modern Central Offset Scale, Aim Speed
   or 8", read by GameMode `0x34dcb0`), which broke "use" in first person up to 0.6.1: section 5.
   The prototype now sets the render flags itself.
 - Near plane: `Camera:Near` 0.2 m. With `hide = none` and the eye 0.1 m ahead of the head joint the
-  head is behind the camera; not pursued further (the body is hidden by default).
+  head is mostly behind the camera, but the hair comes into view when the head moves ahead of the
+  smoothed eye (walking, live: `fp-head-walk.jpg`). Section 6 covers what `hide = head` does.
 
 ## 3. Aiming and gameplay in first person
 
@@ -215,7 +222,10 @@ whatever the stereo mode (off included):
   value keeping its vertical FOV for the view's aspect (so hsbs's doubled aspect still works), and
   the projection is marked dirty. Rendering another camera clears "active" (the Cameraman camera
   stops being set in other modes, so the filter alone would not notice).
-- Hide (since 0.6.2, section 5): the visual half of `CharacterHide::set` applied directly, without
+- Hide `head` (since 0.6.3, the default; section 6): the head's submeshes are left out of the
+  main-view collection of the body's render object; nothing else is hidden. If that is not
+  available it falls back to `body` below.
+- Hide `body` / `all` (since 0.6.2, section 5): the visual half of `CharacterHide::set` applied directly, without
   touching the game's mask: render-object flag 8 on the body, its attachment slots, the inventory's
   linked entity and the held throwable, plus (`hide = all`) on the weapon and flashlight meshes
   only (the flashlight's own hidden flag, which also switches the beam off, is left alone). Not
@@ -305,7 +315,175 @@ the frozen reader handled both), a flashlight pickup proper (the tested pickups 
 ammo and a supply case; every type-4 pickup starts through the same `0x3207a0` call, static), use while a cutscene's mask
 hides the character (ours is not applied then, by design).
 
-## 6. Evidence
+## 6. Arms and body in view: `hide = head` (0.6.3)
+
+Goal: see Alan's arms and hands holding the flashlight and gun as the third-person animations
+pose them, and his torso and legs when looking down, without the head, hair or neck in view.
+Result: `[camera] hide = head` (the new default) leaves exactly the head's submeshes out of the
+main view; everything else of Alan, the held items and the beam render as in third person, and
+his shadow still has a head. Lab instance `awr-fp`, 1920x1080, build 0.6.3.
+
+### How Alan is built (static + live)
+
+- **One skinned mesh, one render object.** `Character::init` `0x1794a0` creates the body's render
+  slot at Character +0x2d8 with `0x2afcc0`: +0 present, +8 a `rend::Object` (0x1f8 bytes, ctor
+  `0x46cd00`, vtable `0x785d48`), +0x10 a `rend::BoneArray` (`0x4b21d0`: +8 bone matrices, +0x10
+  skinning matrices, +0x18 count). `Character vtable +0x2a0` returns that slot (what the hiding
+  code already used). `rend::Object`: +0x24 flags (8 = hidden, `0x463180`), +0x80 the `rend::Mesh`
+  (0x280 bytes, ctor `0x4ae770`), +0x88 world transform, +0xe8 the BoneArray, +0xf8 per-submesh
+  skinned vertex buffers (double-buffered by frame parity, `0x46d650`), +0x158 **per-submesh draw
+  mask**, +0x178 LOD weights.
+- **The mesh has submeshes, one per material.** `rend::Mesh` +0x28: up to 32 submesh pointers,
+  +0x128 their count, +0x238/+0x240 bones (0x80 each: name char[0x40], inverse bind at +0x40,
+  bounding sphere at +0x70), +0x244 LOD count, +0x268..+0x27c bounding box. A submesh: +8 its
+  material (effect name: `StandardMaterial.rfx`, `Hair.rfx`, `Skin_d3t.rfx`, `Character.rfx`),
+  +0x10 vertex format (4-byte entries {stream, type, semantic, index}, count at +0x50,
+  `0x4ba240`), +0x54 stride, +0x80 vertex buffer (vtable +0x30 maps the CPU copy, +0x38 unmaps:
+  the debug normal drawer `0x4d0c30` does this), +0x90 LOD, +0x94 vertex count, +0x9c offset.
+- **The draw mask is checked per view pass.** The main-view collection `0x4cad50` (reached through
+  `rend::Object` vtable +0x40 = `0x46dfb0`) skips submesh i when bit i of +0x158 is clear
+  (`test [r13+0x158], r14d` at `0x4cbf42`), and so does the shadow collection `0x4cd150`
+  (`0x4cd6a5`). The ctor sets the mask to all ones. Skinning happens inside these collections
+  (per submesh, the first pass that draws it skins it: `0x46d6f0`, `0x4c5ec0`).
+- **Live census** (`fp parts`, level 03 body, 14 submeshes, 152 bones, one LOD; isolated with
+  `fp mask` in third person, `fp-head-parts.jpg`; heights are bind-pose vertex ranges in metres
+  above the feet, the mesh is 1.87 m tall):
+
+| # | effect | height (m) | what (live, isolated) |
+|---|---|---|---|
+| 0, 4 | Hair.rfx | 1.60-1.73, 1.61-1.87 | hair (scalp layer, hair cards) |
+| 1, 2, 3, 7 | Character.rfx | 1.72-1.75 | eyes, eyelashes (small) |
+| 6 | Skin_d3t.rfx | 1.46-1.84 | head skin: face, ears, **neck down to the collar** |
+| 8, 9 | Skin_d3t.rfx | 1.64-1.69, 1.65-1.67 | teeth, tongue |
+| 5 | Skin_d3t.rfx | 0.88-1.08 | both hands (T-pose, x +/-0.64) |
+| 10 | Character.rfx | 0.00-1.00 | jeans and shoes |
+| 11 | Character.rfx | 0.93-0.95 | small part at the left wrist (watch) |
+| 12 | Character.rfx | 0.83-1.59 | jacket (incl. sleeves) |
+| 13 | Character.rfx | 0.94-1.65 | hoodie and its hood |
+
+  The order differs per level (level 15's mesh has 15 submeshes with a `StandardMaterial` one
+  first, live), so parts are not identified by index. Bones are named (`Head`, `Neck0`, `Neck1`,
+  `FBone_*` face rig, `L_Hand`, `Jkt_*` jacket, `Hood`...): `Neck0`'s sphere centre is at 1.607 m,
+  `Head` 1.723 m, the eyes (`FBone_L_Eye`) 1.732 m and 0.098 m forward (live).
+- No attachment slots, linked entity or held throwable were present in these levels; the
+  flashlight (3 submeshes) and the weapon are their own render objects (live).
+
+### What `hide = head` does (`src/features/firstperson.cpp`)
+
+1. **Find the head's submeshes** once per mesh: map each submesh's vertex buffer (as `0x4d0c30`),
+   read the bind-pose position (the float3 of semantic 0) and take the lowest vertex. A submesh is
+   "head" when all its vertices are above the neck threshold: `Neck0`'s height minus 0.2 m (1.41 m;
+   without that bone, 75 % of the mesh height). Live result in levels 03 and 15: `0x3df` = hair x2,
+   eyes x4, head skin, teeth, tongue (log line `firstperson: hide = head: head parts ...`). The
+   hood (1.65 m) stays because the hoodie submesh reaches 0.94 m.
+2. **Hide them in the main view only**: a hook on `0x4cad50` clears those bits of the player's
+   body's +0x158 for the call and restores them after. The shadow collection never sees the
+   change, so the head still casts its shadow (live, `fp-head-shadow.jpg`: third person with
+   `fp hidetest on`, the body has no head, the shadow on the rock has one). Measured over ~15000
+   collections: all on the game thread (`head_collects_other_thread` 0) and all for the Cameraman
+   view (`head_collects_other_view` 0), so there is no race with another pass.
+3. **Nothing else is hidden**: the flashlight and gun meshes, the beam, the hands. The game's hide
+   mask is never touched (use and pickups as in section 5); when the game's mask hides the
+   character (scripts, cutscenes) we do nothing.
+4. **Fallback**: a signature mismatch (`kHeadSigs`: the collection's prologue, `0x46dfb0`, both
+   mask tests, `0x4d0c30`'s layout, the format reader, the bone fields), a failed hook, a mesh with
+   1 or more than 32 submeshes, an unreadable vertex buffer, or no head / everything classified as
+   head: `hide = head` hides the body as `hide = body` does, with a log line.
+5. **Inert** in third person: the hook compares one pointer and passes through (live:
+   `head_collects` unchanged over 60 frames in third person, mask `0xffffffff`, flags unchanged).
+
+Bone collapse (scaling the head bones to zero in the skinning palette, BoneArray +0x10 from
+`0x4b2390`) was not needed: the skinned vertices are shared by the main and shadow passes
+(skinned once per frame, `0x46d6f0`), so collapsing bones would have removed the head from the
+shadow too, while the submesh mask is per pass.
+
+### Camera placement against the body
+
+- The eye (head slot 0x1d + 0.05 m up + 0.10 m along the view's horizontal forward) lands on
+  Alan's eyes: in bind pose the head joint is at 1.668 m, so the eye is at ~1.72 m and 0.10 m
+  forward vs the eyes' 1.73 m and 0.098 m (static from the bone data, live census).
+- The nearest remaining geometry is the collar (top of the hoodie and jacket, 1.59-1.65 m, ~0.1 m
+  behind and 0.1-0.25 m below the eye) and the hood behind it. Looking forward or down to the pitch
+  limit it stays out of view; once (stereo capture at the level 03 spawn while starting to aim with
+  the camera pitched down) the open collar showed at the right edge as a dark ring with jacket
+  fabric (`fp-head-stereo-hsbs.jpg`), not reproduced in a later turn-into-aim sequence
+  (`fp-head-turn-aim.jpg`). The open neck is the artefact of hiding a submesh that runs down into
+  the collar.
+- `eye_forward` 0.15-0.25 instead of 0.10 (live, same frame, aiming down): the hands and the
+  flashlight leave the frame at 0.20 and beyond; 0.10 stays the default.
+- Near plane `Camera:Near` 0.2 m (PerspectiveView +0xcbc) left as is: no geometry was cut in any
+  capture (the hands when aiming are ~0.4 m from the eye); `kViewNear` stays unused.
+- Walking: the head moves ahead of the smoothed eye (`smooth = 0.1`); with `hide = none` the hair
+  then hangs into the top of the view, with `hide = head` the view is clean (live, same frame,
+  `fp-head-walk.jpg`).
+- The torso and legs are **not** in view even at the pitch limit (-60 deg, the game camera's
+  clamp): they are straight below the eye, and the bottom of the frame is ~84 deg down; the hand
+  and flashlight show at the bottom (live, `fp-head-down.jpg`).
+
+### Arms in view
+
+| situation | what shows (live) |
+|---|---|
+| looking ahead, flashlight lowered (default pose) | nothing of Alan: the beam enters from below the frame |
+| looking down ~40 deg | left sleeve, hand and flashlight at the lower left |
+| looking down 60 deg (limit) | hand and flashlight at the bottom |
+| aiming the flashlight (right mouse), `fov = 0` | both hands at the bottom edge |
+| aiming the flashlight, `fov = 100` | hands, sleeves and flashlight in frame (`fp-head-aim-flashlight.jpg`) |
+| aiming with the revolver | revolver in the right hand, flashlight in the left, both sleeves (`fp-head-aim-gun.jpg`; `hide = body` shows them floating) |
+| turning into aim while looking down | hands, revolver and flashlight throughout (`fp-head-turn-aim.jpg`) |
+| supply case "Open", "Pick up batteries" | works (10 -> 12 batteries); the pickup gesture is not in frame |
+| stereo `sbs` / `hsbs` | both eyes show the hands; the head is hidden in both (the hook runs for every main-view collection) |
+
+Proposal, not shipped as a default: `fov = 90-100` keeps the hands in frame when aiming without
+moving the aim point (the view still converges on the game camera's ray at `aim_distance`). A
+pitch bias or a lower eye would bring the walking pose's hands in but moves the screen centre off
+the aim point or the eye off the eyes.
+
+### Tested (live, 0.6.3 build, lab `awr-fp`, 1920x1080; frames compared on the virtual clock)
+
+| case | result |
+|---|---|
+| level 03 and level 15 (`awr-forest-night`) start, looking ahead | identical to `none`/`all`/`body`: no body in frame |
+| looking down 45 / 60 deg | sleeve, hand, flashlight; no head, hair or collar |
+| walking (W, frames 20 and 50 after the press) | clean; `none` shows the hair at the top |
+| aiming the flashlight, level 15 bird fight | hands in frame, beam and "[F] Focus" unchanged |
+| revolver (`fp give weapons`) aiming | revolver and flashlight in the hands |
+| use and pickups, level 03 supply case | case opened, batteries picked up |
+| shadows (third person, `fp hidetest on`) | body headless, shadow with the head |
+| third person | inert (no collection hits, mask and flags untouched) |
+| stereo `sbs`, `hsbs` | composes; head hidden in both eyes |
+
+![submeshes of Alan's body, each alone (level 03, third person)](img/fp-head-parts.jpg)
+![third person: normal (left) and with the head hidden as in first person (right): the shadow on the rock keeps the head](img/fp-head-shadow.jpg)
+![walking: hide = head (left), hide = none (right, the hair in view)](img/fp-head-walk.jpg)
+![aiming the revolver: hide = head (left), hide = body (right)](img/fp-head-aim-gun.jpg)
+![aiming the flashlight: fov 0 (left), fov 100 (right)](img/fp-head-aim-flashlight.jpg)
+![looking down at the pitch limit: hide = head (left), none (right)](img/fp-head-down.jpg)
+![stereo hsbs, aiming at the level 03 spawn: hands in both eyes; the open collar at the right](img/fp-head-stereo-hsbs.jpg)
+![turning into aim while looking down (frames 6 apart)](img/fp-head-turn-aim.jpg)
+
+### Risks and next steps
+
+- The head-skin submesh includes the neck down to the collar: when the eye looks steeply down
+  into the collar the opening can show (seen once). Options: a slightly lower near plane does not
+  help; collapsing only the `Head`/`FBone_*` bones would keep a neck stump in view; a dark
+  "collar cap" is not available in the mesh. Moving the eye 0.05 m further forward only while
+  pitched below -45 deg would hide it at the cost of the hands at the bottom.
+- The classification relies on bind-pose heights; a costume whose head piece reaches below the
+  neck threshold (a scarf, a hat with a collar) would stay visible, and a costume whose torso part
+  sits entirely above it would be hidden. Each new mesh is logged with its height ranges.
+- Reflections and the cube probe: the main collection only saw the Cameraman view for the player
+  (`head_collects_other_view` 0); a mirror that does render him would use the same path and show
+  him headless.
+- Torso and legs: to see them the view must pitch beyond -60 deg (a first-person pitch range on
+  top of the game camera's, applied only to the rendered view) or the eye must move back above
+  the shoulders; neither was prototyped.
+- Hands while walking: a camera-relative arm pose (override the arm bones' pose so the flashlight
+  hand sits in the lower left of the view) would be the viewmodel route; it needs the animation
+  pose write path (`Character +0x1b8 -> +8`, pose +0x160 per slot) and would change the
+  third-person pose too unless restricted to the render.
+
+## 7. Evidence
 
 - Third vs first person, night (`fp-forest-third-vs-first.jpg`, top/bottom, level 15 start; two
   runs at the same spot) and day (`fp-day-third-vs-first.jpg`, level 02 ferry, toggled live).
@@ -325,42 +503,45 @@ hides the character (ours is not applied then, by design).
 ![fallback: free camera, then first person again](img/fp-fallback-freecam.jpg)
 ![day: third person (top), first person (bottom)](img/fp-day-third-vs-first.jpg)
 
-## 7. What works, what doesn't
+## 8. What works, what doesn't
 
 Works (live): walking, mouse look, aiming and focusing the flashlight, use and pickups (since
-0.6.2), the bird fights including cinematic moments, level loads, switching modes live, the free-camera fallback and back, scripted
+0.6.2), Alan's arms, hands, held flashlight and revolver, torso and legs with only the head hidden
+(since 0.6.3, section 6), the bird fights including cinematic moments, level loads, switching modes live, the free-camera fallback and back, scripted
 helicopter shot fallback, stereo sbs (hsbs) around the first-person eye.
 
 Doesn't, or not yet:
 
 - **Aim parallax**: the game aims from its third-person camera; the screen centre matches the
   aim point only at `aim_distance`. Close targets (a Taken at 3 m) will be off by ~10 deg.
-- **No arms or viewmodel**: `hide = all` shows only the beam coming out of nowhere at the lower
-  left; `hide = body` keeps the flashlight and gun meshes floating where the hands are.
+- **Arms only where the animation puts them**: with `hide = head` the hands are the third-person
+  animation's, so they show when aiming (flashlight or gun) or looking down 40 deg or more, not
+  while walking with the flashlight held low (it lights the scene from below the frame). With
+  `hide = all` only the beam shows; `hide = body` keeps the flashlight and gun floating.
 - **Head motion**: the walk-start dip (25 cm) and sway come straight from the animation;
   `smooth = 0.1` softens it but does not remove it; `anchor = body` is steady but ignores
   crouching animations.
 - **Pitch** stays clamped at +/-60 deg (the game camera's limit).
 - **DOF focus and the sound listener** stay at the third-person camera (static).
-- Probably no player shadow while hidden (render-object flag 8; not checked).
+- Probably no player shadow with `hide = body/all` (render-object flag 8; not checked). With
+  `hide = head` the shadow is complete (live, section 6).
 - Not tested: guns, driving, Bink and in-engine cutscenes in first person (static reasoning only),
   death, scripts that hide the character for their own reasons while first person is active (ours
   stands aside while the game's mask hides the character, by design).
 - A scripted shot that stays within 6 m of the head (a close "look at" camera) is rendered first
   person, looking where that shot looks.
 
-## 8. Next steps (prioritised)
+## 9. Next steps (prioritised)
 
 1. **Aim from the eye**: find the game's aim ray (the flashlight/gun target: TailCamera aim
    state, `Aim:*` / adhesion code, "Light:Aim beam" users) and either feed it the first-person
    camera (the float transform at +0xcc8 of the Cameraman camera, read by `0x1d2400(true)`
    callers) or converge the view on the actual hit point each frame instead of a fixed distance.
-2. **Head and body**: hide only the head and keep the body (look down and see legs): needs the
-   per-mesh/per-part render objects of the character (the render object list behind
-   `Character vtable +0x2a0 -> +8`) or a head-bone scale-to-zero in the pose; keep the shadow
-   (cast-only flag rather than flag 8).
-3. **Viewmodel**: show the flashlight and gun in the hands (`hide = body` already does) with arms:
-   either keep the arms of the body mesh (2.) or move the held items to a camera-relative pose.
+2. **Head and body**: done in 0.6.3 (`hide = head`, section 6). Left: the torso and legs are below
+   the frame even at the pitch limit; see section 6 "Next steps" (a first-person pitch range, a
+   camera-relative arm pose).
+3. **Viewmodel**: the arms of the body mesh hold the flashlight and gun (section 6). For hands in
+   view while walking: a modest `fov` (90-100) or a viewmodel pose (section 6).
 4. **Cutscenes**: verify mode 3 and Bink fallback in a real in-engine cinematic; blend between the
    game's shot and the eye instead of cutting (a 0.3-0.5 s blend on mode changes); decide per
    scripted-shot type (Reveal vs Attached) instead of the 6 m rule.

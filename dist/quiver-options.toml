@@ -799,7 +799,7 @@ apply = "live"
 [option."camera.mode"]
 type = "enum"
 label = "Camera"
-help = "Prototype: first person puts the camera at Alan's eyes during normal gameplay (on foot, player camera) and hides his body, and works with 3D mode. Cutscene, cinematic, free, death and driving cameras stay the game's own."
+help = "Prototype: first person puts the camera at Alan's eyes during normal gameplay (on foot, player camera) and hides his head (see Hide in first person), and works with 3D mode. Cutscene, cinematic, free, death and driving cameras stay the game's own."
 values = [
   { value = "third_person", label = "Third person (the game's camera)" },
   { value = "first_person", label = "First person" },
@@ -823,13 +823,14 @@ apply = "live"
 [option."camera.hide"]
 type = "enum"
 label = "Hide in first person"
-help = "What of Alan is hidden in first person (the flashlight's beam stays on either way). Applied on the next switch into first person."
+help = "What of Alan is hidden in first person (the flashlight's beam stays on either way). Head: his arms, hands, the flashlight and gun in them, torso and legs stay visible, and his shadow keeps the head."
 values = [
+  { value = "head", label = "Head only (arms, hands and body visible)" },
   { value = "all", label = "Body, flashlight and gun" },
   { value = "body", label = "Body only (held flashlight and gun visible)" },
   { value = "none", label = "Nothing", level = "debug" },
 ]
-default = "all"
+default = "head"
 level = "basic"
 apply = "live"
 
