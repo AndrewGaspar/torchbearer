@@ -5,9 +5,10 @@
 // movement relative to the camera, AI, sound listener) reads BaseCamera's float transform at
 // +0xcc8, which is left alone. What changes is the transform the renderer gets: a camera filter
 // (core/camera.h, run from stereo's View::setViewToWorld hook before any eye offset) moves the
-// main view to the player's eyes, keeping the game camera's orientation. The player's body is
-// hidden with the game's own per-character hide mask, the bit its debug panel's "Hide character"
-// uses (Character update re-applies it every frame, so our hook only has to OR it in).
+// main view to the player's eyes, keeping the game camera's orientation. What of the player is
+// drawn depends on `hide`: head (default) leaves only the head's submeshes out of the main views
+// (they stay in the shadow maps), so arms, hands, held items, torso and legs show; body / all hide
+// the body with render-object flags (never the game's hide mask, which freezes "use").
 //
 // Active only while the player camera is the game's camera (camera mode 0), the view being set is
 // the Cameraman camera, a player exists and is not in a vehicle; anything else (cutscene /
@@ -167,7 +168,7 @@ struct Params {
   double eye_up = 0.05;       // m above the head slot (world up)
   double eye_forward = 0.10;  // m ahead of it, along the camera's horizontal forward
   double eye_height = 1.70;   // anchor = body: m above the character's root
-  enum class Hide { None, Body, All } hide = Hide::All;
+  enum class Hide { None, Head, Body, All } hide = Hide::Head;
   double fov_deg = 0;         // horizontal FOV at 16:9, degrees; 0 = the game's own
   double smooth = 0.1;        // s: low-pass time constant on the head's offset from the root
   double aim_distance = 15;   // m: >0 = look at the point this far along the game camera's ray
@@ -417,6 +418,89 @@ std::string usables(uint32_t mask, double r) {
   return o + "]";
 }
 
+// ---- render-object census (`fp parts`) -------------------------------------------------------
+bool readable(const void* p, size_t n) {
+  MEMORY_BASIC_INFORMATION mi;
+  if (!p || !VirtualQuery(p, &mi, sizeof mi) || mi.State != MEM_COMMIT) return false;
+  if (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+  auto end = static_cast<const uint8_t*>(mi.BaseAddress) + mi.RegionSize;
+  return static_cast<const uint8_t*>(p) + n <= end;
+}
+
+std::string cstr_at(const void* p, size_t max = 64) {
+  if (!readable(p, 1)) return "";
+  std::string s;
+  auto* c = static_cast<const char*>(p);
+  for (size_t i = 0; i < max && readable(c + i, 1) && c[i]; i++) {
+    unsigned char ch = c[i];
+    if (ch < 0x20 || ch > 0x7e) return s.empty() ? "" : s + "?";
+    s += ch == '"' || ch == '\\' ? '_' : char(ch);
+  }
+  return s;
+}
+
+bool submesh_min_y(void* sm, float& mn, float& mx);
+
+// A render object, its mesh and submeshes (material effect, bind-pose height range of the
+// vertices); with `bones`, the mesh's bone names and bounding spheres.
+std::string ro_json(void* ro, bool bones) {
+  if (!readable(ro, 0x1f8)) return "null";
+  char b[512];
+  void* mesh = rd<void*>(ro, 0x80);
+  int nsub = mesh && readable(mesh, 0x280) ? rd<int>(mesh, 0x128) : -1;
+  int nlod = nsub >= 0 ? rd<int>(mesh, 0x244) : -1;
+  int nbone = nsub >= 0 ? rd<int>(mesh, 0x240) : -1;
+  void* ba = rd<void*>(ro, 0xe8);
+  snprintf(b, sizeof b,
+           "{\"ro\":\"%p\",\"flags\":\"0x%x\",\"mask\":\"0x%x\",\"mesh\":\"%p\",\"submeshes\":%d,\"lods\":%d,"
+           "\"lod_w\":[%.2f,%.2f,%.2f],\"bones\":%d,\"bone_array\":%d,\"pos\":[%.2f,%.2f,%.2f],"
+           "\"bbox\":[%.2f,%.2f,%.2f,%.2f,%.2f,%.2f],\"parts\":[",
+           ro, rd<uint32_t>(ro, 0x24), rd<uint32_t>(ro, 0x158), mesh, nsub, nlod, rd<float>(ro, 0x178),
+           rd<float>(ro, 0x17c), rd<float>(ro, 0x180), nbone, ba && readable(ba, 0x20) ? rd<int>(ba, 0x18) : -1,
+           rd<float>(ro, 0xac), rd<float>(ro, 0xb0), rd<float>(ro, 0xb4), nsub >= 0 ? rd<float>(mesh, 0x268) : 0.f,
+           nsub >= 0 ? rd<float>(mesh, 0x26c) : 0.f, nsub >= 0 ? rd<float>(mesh, 0x270) : 0.f,
+           nsub >= 0 ? rd<float>(mesh, 0x274) : 0.f, nsub >= 0 ? rd<float>(mesh, 0x278) : 0.f,
+           nsub >= 0 ? rd<float>(mesh, 0x27c) : 0.f);
+  std::string o = b;
+  for (int i = 0; i < nsub && i < 32; i++) {
+    void* sm = rd<void*>(mesh, 0x28 + size_t(i) * 8);
+    if (!readable(sm, 0x130)) {
+      o += i ? ",null" : "null";
+      continue;
+    }
+    void* mat = rd<void*>(sm, 8);
+    std::string name;
+    if (readable(mat, 0x90)) {
+      void* fx = rd<void*>(mat, 0);
+      name = fx && readable(fx, 8) ? cstr_at(rd<void*>(fx, 0)) : cstr_at(static_cast<uint8_t*>(mat) + 8);
+    }
+    char t[300];
+    float mn = 0, mx = 0;
+    bool vok = submesh_min_y(sm, mn, mx);
+    snprintf(t, sizeof t,
+             "%s{\"i\":%d,\"lod\":%d,\"fx\":\"%s\",\"mflags\":\"0x%x\",\"verts\":%d,\"y\":[%.2f,%.2f]}",
+             i ? "," : "", i, rd<int>(sm, 0x90), name.c_str(), readable(mat, 0x90) ? rd<uint32_t>(mat, 0x88) : 0,
+             rd<int>(sm, 0x94), vok ? mn : -1.f, vok ? mx : -1.f);
+    o += t;
+  }
+  o += "]";
+  if (bones && nbone > 0) {
+    o += ",\"bone_list\":[";
+    auto* bl = rd<uint8_t*>(mesh, 0x238);
+    for (int i = 0; i < nbone && i < 256 && readable(bl + size_t(i) * 0x80, 0x80); i++) {
+      auto* e = bl + size_t(i) * 0x80;
+      char t[256];
+      // name (char[0x40]), +0x40..0x6c inverse bind, +0x70 bounding sphere (centre, radius) in
+      // bind-pose model space
+      snprintf(t, sizeof t, "%s[%d,\"%s\",[%.3f,%.3f,%.3f,%.3f]]", i ? "," : "", i, cstr_at(e, 0x40).c_str(),
+               rd<float>(e, 0x70), rd<float>(e, 0x74), rd<float>(e, 0x78), rd<float>(e, 0x7c));
+      o += t;
+    }
+    o += "]";
+  }
+  return o + "}";
+}
+
 // ---- hiding the player ----------------------------------------------------------------------
 // Not with the game's CharacterHide mask (docs/first-person.md, "Use and pickups"): GameMode skips
 // a character's input reader (Character +0x1a0, PlayerInputReader::update 0x2a0940, which handles
@@ -480,12 +564,193 @@ void hide_restore(void* ch) {
   g_hide_restored++;
 }
 
+// ---- hide = head: the head's submeshes, left out of the main views only ----------------------
+// The player's body is one rend::Object (Character +0x2d8 render slot -> +8; 0x2afcc0) with one
+// rend::Mesh (+0x80): up to 32 submeshes (mesh +0x28[i], count +0x128), each with its own material
+// (head skin, hair, eyes, teeth, hands, jacket, hoodie, jeans...). rend::Object +0x158 is a
+// per-submesh draw mask (bit i = submesh i, all set by the ctor 0x46cd00), tested both by the
+// main-view collection (0x4cad50, reached through rend::Object vtable +0x40 = 0x46dfb0) and by the
+// shadow collection (0x4cd150). The head's submeshes are those whose bind-pose vertices all lie
+// above the neck (read from the CPU copy of the vertex buffer, as the engine's debug normal drawer
+// 0x4d0c30 does); the hook on the main collection clears their bits around the call, so they stay
+// in the shadow maps. Anything unexpected (signatures, layout, no head found) falls back to
+// hiding the body as `hide = body` does.
+constexpr uintptr_t RVA_OBJ_COLLECT = 0x4cad50;  // main-view collection (collector, ctx, rend::Object*)
+constexpr size_t kRoSubmeshMask = 0x158;          // rend::Object: bit i = draw submesh i
+using CollectFn = void(__fastcall*)(void* collector, void* ctx, void* obj);
+const Sig kHeadSigs[] = {
+    {RVA_OBJ_COLLECT, "48 8b c4 48 89 50 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8d a8 28 fd ff ff "
+                      "48 81 ec 98 03 00 00"},
+    // rend::Object vtable +0x40: if visible and a LOD weight > 0, tail-call 0x4cad50(collector, ctx, this)
+    {0x46dfb0, "80 3d ?? ?? ?? ?? 00 74 35 80 b9 70 01 00 00 00 75 2c f3 0f 10 81 78 01 00 00 0f 57 c9 0f 2f c1 "
+               "77 0d f3 0f 10 81 7c 01 00 00 0f 2f c1 76 0f 4c 8b c1 48 8b 0d ?? ?? ?? ?? e9 62 cd 05 00"},
+    {0x4cbf42, "45 85 b5 58 01 00 00 0f 84"},  // main: test [obj+0x158], submesh bit
+    {0x4cd6a5, "44 85 ae 58 01 00 00 0f 84"},  // shadow: the same mask
+    // debug normal drawer: VB = [sm+0x80], vtable +0x30 maps it; format at sm+0x10; stride
+    // [sm+0x54]; vertex count [sm+0x94]; ... unmap through vtable +0x38
+    {0x4d0c30, "40 53 55 56 57 41 55 41 56 48 81 ec e8 00 00 00 48 8b f9 48 8b f2 48 8b 89 80 00 00 00 48 8b 01 "
+               "ff 50 30 45 33 c9 48 8d 4f 10 45 33 c0 33 d2 4c 8b f0 e8 ?? ?? ?? ?? 45 33 c9 48 63 e8 33 d2 48 "
+               "8d 4f 10 45 8d 41 01 e8 ?? ?? ?? ?? 44 8b 6f 54 33 db 39 9f 94 00 00 00"},
+    {0x4d0f75, "48 8b 8f 80 00 00 00 48 8b 01 48 81 c4 e8 00 00 00 41 5e 41 5d 5f 5e 5d 5b 48 ff 60 38"},
+    // vertex format: 4-byte entries {stream, type, semantic, index}, count at +0x40
+    {0x4ba240, "48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 48 89 7c 24 20 0f b6 71 40"},
+    // rend::Mesh bones: count +0x240, array +0x238 (0x80 per bone: name, inverse bind, sphere)
+    {0x4b2499, "39 9a 40 02 00 00"},
+    {0x4b24c0, "49 8b 86 38 02 00 00"},
+};
+CollectFn g_o_collect = nullptr;
+bool g_head_ok = false;                    // signatures matched and the hook is in
+std::atomic<void*> g_head_ro{nullptr};     // the body render object whose head is left out
+std::atomic<uint32_t> g_head_bits{0};      // ... these submeshes
+std::atomic<uint64_t> g_collect_hits{0}, g_collect_other_thread{0}, g_collect_other_view{0};
+std::atomic<uint32_t> g_game_tid{0};
+struct HeadCache {
+  void* mesh = nullptr;
+  int nsub = -1;
+  uint32_t bits = 0;
+  float threshold = 0;
+} g_hc;
+
+// Lowest bind-pose vertex height (model space, metres above the feet) of a submesh.
+bool submesh_min_y(void* sm, float& mn, float& mx) {
+  if (!readable(sm, 0xa0)) return false;
+  void* vb = rd<void*>(sm, 0x80);
+  int nv = rd<int>(sm, 0x94), stride = rd<int>(sm, 0x54), voff = rd<int>(sm, 0x9c);
+  int nfmt = rd<uint8_t>(sm, 0x50);
+  if (!vb || !readable(vb, 8) || nv <= 0 || nv > 1 << 20 || stride < 12 || stride > 256 || voff < 0 || nfmt <= 0 ||
+      nfmt > 16)
+    return false;
+  // position: the float3 (type 2) element of semantic 0; its offset sums the sizes of the
+  // elements before it in the same stream (0x4ba240)
+  const uint8_t* fmt = static_cast<uint8_t*>(sm) + 0x10;
+  int stream = -1, pos = -1;
+  for (int e = 0; e < nfmt && stream < 0; e++)
+    if (fmt[e * 4 + 2] == 0 && fmt[e * 4 + 1] == 2) stream = fmt[e * 4];
+  if (stream < 0) return false;
+  static const int kSize[] = {4, 8, 12, 16, 4, 4, 4, 4, 8, 4, 8, 4, 8};  // per type, as 0x4ba240
+  for (int e = 0, off = 0; e < nfmt; e++) {
+    const uint8_t* fe = fmt + e * 4;
+    if (fe[0] != stream) continue;
+    if (fe[2] == 0 && fe[1] == 2) {
+      pos = off;
+      break;
+    }
+    off += fe[1] < 13 ? kSize[fe[1]] : 0;
+  }
+  if (pos < 0 || pos + 12 > stride) return false;
+  auto vt = *static_cast<void***>(vb);
+  auto* base = reinterpret_cast<uint8_t*(__fastcall*)(void*)>(vt[0x30 / 8])(vb);
+  bool ok = base && readable(base + voff, size_t(nv - 1) * stride + pos + 12);
+  if (ok) {
+    mn = 1e9f, mx = -1e9f;
+    for (int v = 0; v < nv; v++) {
+      float y;
+      memcpy(&y, base + voff + size_t(v) * stride + pos + 4, 4);
+      if (!(y > -100.f && y < 100.f)) {
+        ok = false;
+        break;
+      }
+      mn = y < mn ? y : mn, mx = y > mx ? y : mx;
+    }
+  }
+  reinterpret_cast<void(__fastcall*)(void*)>(vt[0x38 / 8])(vb);
+  return ok;
+}
+
+// The head's submeshes of the body's mesh (cached per mesh): 0 = none found / not classifiable.
+uint32_t head_bits(void* ro) {
+  void* mesh = readable(ro, 0x1f8) ? rd<void*>(ro, 0x80) : nullptr;
+  if (!mesh || !readable(mesh, 0x280)) return 0;
+  int nsub = rd<int>(mesh, 0x128);
+  if (mesh == g_hc.mesh && nsub == g_hc.nsub) return g_hc.bits;
+  g_hc = {mesh, nsub, 0, 0};
+  if (nsub <= 1 || nsub > 32) {
+    TB_LOG("firstperson: hide = head: body mesh has %d submeshes; hiding the body instead", nsub);
+    return 0;
+  }
+  // Neck height: the bounding sphere centre (+0x74 = y) of the "Neck0" bone, minus 0.2 m (the
+  // head-skin submesh runs down to the collar: 1.46 m for a neck at 1.61, live); without that
+  // bone, 75 % of the mesh's height.
+  float top = rd<float>(mesh, 0x278), thr = 0.75f * top;
+  int nb = rd<int>(mesh, 0x240);
+  auto* bl = rd<uint8_t*>(mesh, 0x238);
+  for (int i = 0; i < nb && i < 1024 && readable(bl + size_t(i) * 0x80, 0x80); i++) {
+    std::string n = cstr_at(bl + size_t(i) * 0x80, 0x40);
+    if (n == "Neck0" || n == "Neck") {
+      float y = rd<float>(bl + size_t(i) * 0x80, 0x74) - 0.2f;
+      if (y > 0.6f * top && y < 0.95f * top) thr = y;
+      break;
+    }
+  }
+  if (!(top > 0.5f && top < 4.f)) {
+    TB_LOG("firstperson: hide = head: body mesh height %.2f unexpected; hiding the body instead", top);
+    return 0;
+  }
+  uint32_t bits = 0;
+  std::string desc;
+  for (int i = 0; i < nsub; i++) {
+    float mn, mx;
+    void* sm = rd<void*>(mesh, 0x28 + size_t(i) * 8);
+    if (!submesh_min_y(sm, mn, mx) || mx > top + 0.05f) {
+      TB_LOG("firstperson: hide = head: submesh %d unreadable; hiding the body instead", i);
+      return 0;
+    }
+    if (mn >= thr) bits |= 1u << i;
+    char t[48];
+    snprintf(t, sizeof t, " %d:%.2f-%.2f%s", i, mn, mx, mn >= thr ? "*" : "");
+    desc += t;
+  }
+  uint32_t all = nsub == 32 ? ~0u : (1u << nsub) - 1;
+  if (!bits || bits == all) {
+    TB_LOG("firstperson: hide = head: no separate head parts (threshold %.2f m:%s); hiding the body instead", thr,
+           desc.c_str());
+    return 0;
+  }
+  g_hc.bits = bits;
+  g_hc.threshold = thr;
+  TB_LOG("firstperson: hide = head: head parts 0x%x of %d submeshes (above %.2f m; * = head:%s)", bits, nsub, thr,
+         desc.c_str());
+  return bits;
+}
+
+// Main-view collection of a rend::Object: the player's head submeshes masked out for the call.
+void __fastcall hk_collect(void* collector, void* ctx, void* obj) {
+  if (obj != g_head_ro.load(std::memory_order_relaxed)) return g_o_collect(collector, ctx, obj);
+  uint32_t bits = g_head_bits.load(std::memory_order_relaxed);
+  g_collect_hits++;
+  if (GetCurrentThreadId() != g_game_tid.load(std::memory_order_relaxed)) g_collect_other_thread++;
+  if (!G.cameraman || rd<void*>(ctx, 0x90) != *G.cameraman) g_collect_other_view++;
+  auto* m = static_cast<uint8_t*>(obj) + kRoSubmeshMask;
+  uint32_t was;
+  memcpy(&was, m, 4);
+  uint32_t now = was & ~bits;
+  memcpy(m, &now, 4);
+  g_o_collect(collector, ctx, obj);
+  memcpy(m, &was, 4);
+}
+
 // Game thread, every main-view set and render: apply or undo ours as first person starts/stops.
 void hide_sync() {
   if (!G.ok || !G.o_hide) return;
   void* ch = player();
   bool want = (g_active.load(std::memory_order_relaxed) || g_hide_test.load(std::memory_order_relaxed)) && ch;
   Params::Hide mode = want ? params().hide : Params::Hide::None;
+  void* head_ro = nullptr;
+  uint32_t hbits = 0;
+  if (mode == Params::Hide::Head) {
+    // The head's parts left out of the main views; the game hiding the character itself
+    // (scripts, cutscenes) needs nothing from us. Not available: the body is hidden instead.
+    if (game_hides(ch)) {
+      mode = Params::Hide::None;
+    } else {
+      void* ro = g_head_ok ? render_object(ch) : nullptr;
+      hbits = ro ? head_bits(ro) : 0;
+      head_ro = hbits ? ro : nullptr;
+      mode = head_ro ? Params::Hide::None : Params::Hide::Body;
+    }
+  }
+  g_head_bits.store(hbits, std::memory_order_relaxed);
+  g_head_ro.store(head_ro, std::memory_order_relaxed);
   if (mode == Params::Hide::None) want = false;
   if (g_hs.on && g_hs.ch != ch) g_hs.on = false;  // another character (level load): nothing to undo
   if (g_hs.on && (!want || g_hs.mode != mode)) {
@@ -528,9 +793,11 @@ bool fp_filter(void* view, double* m) {
   if (g_job_pending.load(std::memory_order_relaxed) && G.ok && G.cameraman && view == *G.cameraman) job_run();
   if (g_slots_req.load(std::memory_order_relaxed) && G.ok && G.cameraman && view == *G.cameraman) slots_census();
   if (g_freecam_req.load(std::memory_order_relaxed) >= 0 && G.ok) freecam_apply();
+  g_game_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
   if (!g_on.load(std::memory_order_relaxed)) {
     if (g_active.exchange(false)) g_reason = 0;
-    if (g_hs.on || g_hide_test.load(std::memory_order_relaxed)) hide_sync();
+    if (g_hs.on || g_head_ro.load(std::memory_order_relaxed) || g_hide_test.load(std::memory_order_relaxed))
+      hide_sync();
     return false;
   }
   if (!G.cameraman || view != *G.cameraman) return false;
@@ -640,19 +907,26 @@ std::string fmt3(const double* v) {
   return b;
 }
 
+const char* kHideNames[] = {"none", "head", "body", "all"};
+
 std::string status() {
   Params p = params();
-  char b[1024];
+  char b[1536];
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"ok\":%s,\"hooks\":%s,\"active\":%s,\"reason\":%s,\"camera_mode\":%d,"
            "\"eye\":%s,\"head\":%s,\"root\":%s,\"game_camera\":%s,\"filter_calls\":%llu,"
-           "\"hidden\":%s,\"hide_applied\":%llu,\"hide_restored\":%llu,\"anchor\":\"%s\",\"fov\":%.1f}",
+           "\"hidden\":%s,\"hide_applied\":%llu,\"hide_restored\":%llu,\"anchor\":\"%s\",\"fov\":%.1f,"
+           "\"hide\":\"%s\",\"head_ok\":%s,\"head_parts\":\"0x%x\",\"head_collects\":%llu,"
+           "\"head_collects_other_thread\":%llu,\"head_collects_other_view\":%llu}",
            p.first_person ? "first_person" : "third_person", G.ok ? "true" : "false",
            camera_hooked() ? "true" : "false", g_active.load() ? "true" : "false",
            json_str(kReasons[g_reason.load()]).c_str(), G.cam_mode ? *G.cam_mode : -1, fmt3(g_eye).c_str(),
            fmt3(g_head).c_str(), fmt3(g_root).c_str(), fmt3(g_cam).c_str(),
            (unsigned long long)g_filter_calls.load(), g_hs.on ? "true" : "false",
-           (unsigned long long)g_hide_applied.load(), (unsigned long long)g_hide_restored.load(), p.anchor == Anchor::Head ? "head" : "body", p.fov_deg);
+           (unsigned long long)g_hide_applied.load(), (unsigned long long)g_hide_restored.load(), p.anchor == Anchor::Head ? "head" : "body", p.fov_deg,
+           kHideNames[int(p.hide)], g_head_ok ? "true" : "false",
+           g_head_ro.load() ? g_head_bits.load() : 0u, (unsigned long long)g_collect_hits.load(),
+           (unsigned long long)g_collect_other_thread.load(), (unsigned long long)g_collect_other_view.load());
   return b;
 }
 
@@ -672,7 +946,10 @@ void firstperson_register() {
     if (id == "camera.eye_forward") g_p.eye_forward = n;
     if (id == "camera.eye_height") g_p.eye_height = n > 0.3 ? n : 1.7;
     if (id == "camera.hide")
-      g_p.hide = v == "none" ? Params::Hide::None : v == "body" ? Params::Hide::Body : Params::Hide::All;
+      g_p.hide = v == "none"   ? Params::Hide::None
+                 : v == "head" ? Params::Hide::Head
+                 : v == "body" ? Params::Hide::Body
+                               : Params::Hide::All;
     if (id == "camera.fov") g_p.fov_deg = n;
     if (id == "camera.smooth") g_p.smooth = n > 0 ? n : 0;
     if (id == "camera.aim_distance") g_p.aim_distance = n > 0 ? n : 0;
@@ -715,6 +992,71 @@ void firstperson_register() {
       double r = a.size() > 2 ? strtod(a[2].c_str(), nullptr) : 50;
       return job_call([mask, r] { return usables(mask, r); }, ok);
     }
+    if (a[0] == "parts" && G.ok) {
+      // The player's render objects: body, attachment slots, weapon, flashlight; their submeshes.
+      bool bones = a.size() > 1 && a[1] == "bones";
+      return job_call([bones] {
+        void* ch = player();
+        if (!ch) return json_str("no player");
+        std::string o = "{\"body\":" + ro_json(render_object(ch), bones) + ",\"attachments\":[";
+        auto* inv = rd<uint8_t*>(ch, kCharInventory);
+        for (int i = 0; inv && i < 8; i++) {
+          uint8_t* e = inv + 0x48 + size_t(i) * 0x40;
+          o += std::string(i ? "," : "") + (rd<uint8_t>(e, 0x28) ? ro_json(rd<void*>(e, 0x30), false) : "null");
+        }
+        o += "]";
+        void* w = rd<void*>(ch, kCharWeapon);
+        o += ",\"weapon\":" + (w && rd<uint8_t>(w, 0x30) ? ro_json(rd<void*>(w, 0x38), false) : std::string("null"));
+        void* f = rd<void*>(ch, kCharFlashlight);
+        o += ",\"flashlight\":" +
+             (f && rd<uint8_t>(f, 0xc0) ? ro_json(rd<void*>(f, 0xc8), false) : std::string("null"));
+        return o + "}";
+      }, ok);
+    }
+    if (a[0] == "give" && a.size() > 1 && G.ok) {
+      // Test aid: what the game's Developer Menu cheats "cheat_receive_weapons" /
+      // "cheat_receive_flashlight" do (MenuMode::action 0x24d8f0): WeaponHolder::give (0x340d10)
+      // the revolver, flare gun and shotgun; Flashlight::setType (0x22d6b0) + batteries (0x22d240).
+      static const Sig kGive[] = {
+          {0x340d10, "48 89 5c 24 10 48 89 6c 24 18 56 48 83 ec 20 48 8b f2 48 8b e9 33 db e8"},
+          {0x22d6b0, "48 89 5c 24 10 48 89 6c 24 18 56 48 83 ec 30 48 8b f2 48 8b e9 33 db e8"},
+          {0x22d240, "01 91 44 01 00 00 ba 14 00 00 00"},
+      };
+      for (auto& s : kGive)
+        if (!sig_ok(s.rva, s.hex)) {
+          ok = false;
+          return json_str("signature mismatch");
+        }
+      bool weapons = a[1] == "weapons";
+      return job_call([weapons] {
+        void* ch = player();
+        if (!ch) return json_str("no player");
+        if (weapons) {
+          auto give = reinterpret_cast<void(__fastcall*)(void*, const char*)>(game_image().at(0x340d10));
+          for (const char* w : {"Revolver", "Flaregun", "PumpShotgun"}) give(rd<void*>(ch, kCharWeapon), w);
+          return json_str("Revolver, Flaregun, PumpShotgun");
+        }
+        void* fl = rd<void*>(ch, kCharFlashlight);
+        reinterpret_cast<void(__fastcall*)(void*, const char*)>(game_image().at(0x22d6b0))(
+            fl, "flashlight_normal_power_large_clip_A");
+        reinterpret_cast<void(__fastcall*)(void*, int)>(game_image().at(0x22d240))(fl, 10);
+        return json_str("flashlight_normal_power_large_clip_A, 10 batteries");
+      }, ok);
+    }
+    if (a[0] == "mask" && a.size() > 1 && G.ok) {
+      // Test aid: the body render object's per-submesh draw mask (+0x158, bit i = submesh i).
+      uint32_t m = strtoul(a[1].c_str(), nullptr, 0);
+      return job_call([m] {
+        void* ch = player();
+        void* ro = ch ? render_object(ch) : nullptr;
+        if (!ro) return json_str("no player");
+        uint32_t old = rd<uint32_t>(ro, 0x158);
+        memcpy(static_cast<uint8_t*>(ro) + 0x158, &m, 4);
+        char b[64];
+        snprintf(b, sizeof b, "{\"old\":\"0x%x\",\"new\":\"0x%x\"}", old, m);
+        return std::string(b);
+      }, ok);
+    }
     if (a[0] == "hidetest" && a.size() > 1) {
       // Test aid: first person's hiding of the player whatever the camera mode (third person too).
       g_hide_test = a[1] == "on";
@@ -725,7 +1067,9 @@ void firstperson_register() {
       return json_str(a[1] == "on" ? "free camera requested" : "player camera requested");
     }
     ok = false;
-    return json_str("usage: fp [status|slots N|freecam on|off|use|usables [mask] [radius]|hidetest on|off]");
+    return json_str(
+        "usage: fp [status|slots N|parts [bones]|mask HEX|give weapons|flashlight|freecam on|off|use|"
+        "usables [mask] [radius]|hidetest on|off]");
   });
 }
 
@@ -738,6 +1082,20 @@ void firstperson_start() {
     // animation, say) is only hidden again on the next frame.
     G.o_hide = reinterpret_cast<HideMaskFn>(game_image().at(RVA_HIDE_MASK));
     TB_LOG("firstperson: hide hook failed; hiding re-applied per frame only");
+  }
+  // hide = head: the main-view collection hook (falls back to hiding the body without it).
+  g_head_ok = true;
+  for (auto& s : kHeadSigs)
+    if (!sig_ok(s.rva, s.hex)) {
+      TB_LOG("firstperson: signature mismatch at rva 0x%zx; hide = head hides the body instead", (size_t)s.rva);
+      g_head_ok = false;
+      break;
+    }
+  if (g_head_ok && !hook_fn(reinterpret_cast<void*>(game_image().at(RVA_OBJ_COLLECT)),
+                            reinterpret_cast<void*>(&hk_collect), reinterpret_cast<void**>(&g_o_collect),
+                            "rend::Object main collect")) {
+    TB_LOG("firstperson: collect hook failed; hide = head hides the body instead");
+    g_head_ok = false;
   }
   TB_LOG("firstperson: ready (rendered camera at %p)", (void*)G.cameraman);
 }
