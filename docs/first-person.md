@@ -8,8 +8,9 @@ the prototype `[camera] mode = first_person` (`src/features/firstperson.cpp`, ex
 Status in one paragraph: **it works as a render-side first-person view.** During normal gameplay
 the rendered camera sits at Alan's eyes (his animated head slot plus a small offset), looks where
 the game's own third-person camera looks (converged on that camera's centre ray at 15 m), his
-body, flashlight and gun meshes are hidden with the engine's own per-character hide mask while the
-flashlight's beam stays on, and the game is unchanged underneath: walking, mouse look, aiming the
+body, flashlight and gun meshes are hidden with the engine's render-object "hidden" flag while the
+flashlight's beam stays on (not with the per-character hide mask, which stops "use" working:
+section 5), and the game is unchanged underneath: walking, mouse look, aiming the
 flashlight, focusing it on the Taken birds all play as before because every gameplay system still
 reads the third-person camera. Cutscene, free, death and vehicle cameras and scripted shots inside
 the player camera fall back to the game's camera (and the body comes back). It composes with
@@ -40,7 +41,12 @@ aim_distance = 15     ; m, look at this point of the game camera's centre ray (0
 
 All live (`quiver lab call <i> cfg camera.mode first_person`). Lab verb: `quiver lab call <i> fp`
 (status: active or why not, eye/head/root/game-camera positions), `fp slots N` (census of the
-player's slots), `fp freecam on|off` (test aid: the debug free camera and back).
+player's slots), `fp freecam on|off` (test aid: the debug free camera and back), `fp use` (the
+game's current use target, i.e. what the interaction prompt is for, the game's hide mask on the
+player and whether ours is applied), `fp usables [mask] [radius]` (game objects of a type mask near
+the player: 4 = pickups, 0x40 = triggers incl. use triggers, 0x4d = everything "use" considers;
+for finding pickups to test with), `fp hidetest on|off` (test aid: first person's hiding of the
+player in third person too).
 
 ---
 
@@ -153,7 +159,9 @@ High/Mid/Low/Safe Pos, Switch Side Speed, Modern Central Offset Scale, Aim Speed
   physics. Bits seen at the call sites: 0x10000 (about 20 script/cutscene sites), 0x40000, 0x10,
   4, 1, and **8 = the debug panel's "Hide character"** (`DebugPanel::AnimationPage` global
   `0xaf5d78` +0x146), which every Character update re-applies (`0x17e716`). Bit 8 hides meshes
-  but keeps physics, so it is the one the prototype uses.
+  and keeps physics, but **it freezes the player's input reader** (`0x1ef6e0` "low 16 bits are 2
+  or 8", read by GameMode `0x34dcb0`), which broke "use" in first person up to 0.6.1: section 5.
+  The prototype now sets the render flags itself.
 - Near plane: `Camera:Near` 0.2 m. With `hide = none` and the eye 0.1 m ahead of the head joint the
   head is behind the camera; not pursued further (the body is hidden by default).
 
@@ -171,6 +179,7 @@ camera. Consequences (live unless marked):
 | gun | not tested (the fixture's Alan has no gun yet); same aiming path as the flashlight (static assumption) |
 | dodge / cinematic moments | stay first person (mode 0) |
 | interaction prompts, HUD, objective text | screen-space, unchanged; the red world-space threat arc still draws |
+| use, pickups (batteries, ammo, supply cases) | the game picks the target from the player's position and facing and its own aim point, as in third person; works with every `hide` setting since 0.6.2 (section 5) |
 | scripted shots in mode 0 | fall back to the game camera when it is more than 6 m from the head (live: helicopter fly-by, log "scripted shot" for 2.4 s, then "active") |
 | cover | Alan Wake has none |
 | sound | the listener stays at the third-person camera (static) |
@@ -206,14 +215,18 @@ whatever the stereo mode (off included):
   value keeping its vertical FOV for the view's aspect (so hsbs's doubled aspect still works), and
   the projection is marked dirty. Rendering another camera clears "active" (the Cameraman camera
   stops being set in other modes, so the filter alone would not notice).
-- Hide: a hook on `CharacterHide::set` ORs bit 8 into the player's every-frame debug-flag call
-  while active; right after our state is applied the flashlight's hidden flag is cleared and its
-  lights rebuilt (`hide = all`: mesh hidden, beam on), or the flashlight and gun are shown again
-  (`hide = body`). Only when ours is the only reason the character is hidden (other bits are left
-  to scripts and cutscenes). When first person stops being active the game's own next call clears
-  the bit and restores everything.
-- Inert with `mode = third_person`: the filter returns at once, the hide hook passes through, the
-  pre-render returns. Every address is behind a byte signature (`kSigs`); a mismatch disables the
+- Hide (since 0.6.2, section 5): the visual half of `CharacterHide::set` applied directly, without
+  touching the game's mask: render-object flag 8 on the body, its attachment slots, the inventory's
+  linked entity and the held throwable, plus (`hide = all`) on the weapon and flashlight meshes
+  only (the flashlight's own hidden flag, which also switches the beam off, is left alone). Not
+  while the game's mask hides the character itself (low 16 bits set: scripts, cutscenes). A
+  pass-through hook on `CharacterHide::set` puts ours back right after the game re-applies its
+  own visibility (its applied-mask cache +0xc changed: e.g. a use animation hides the gun with
+  0x10000 and shows everything after), and every main-view set checks the body, gun and
+  flashlight flags (a gun drawn later). When first person stops (or `hide` changes),
+  `CharacterHide::set` is made to re-apply the game's own mask (its cache invalidated).
+- Inert with `mode = third_person`: the filter returns at once, the hide hook passes through
+  (nothing of ours applied), the pre-render returns. Every address is behind a byte signature (`kSigs`); a mismatch disables the
   feature with a log line.
 
 ### Fallbacks, as established
@@ -229,7 +242,70 @@ whatever the stereo mode (off included):
 | driving | `Character +0x218` vehicle link set | static |
 | menus / pause | nothing special: the world behind the pause menu is whatever the camera rules give | not checked |
 
-## 5. Evidence
+## 5. Use and pickups (fixed in 0.6.2)
+
+Bug (user report, 0.6.1): in first person "use" (E, pad B) did nothing: no battery or flashlight
+pickup, no supply case opened, although the game's prompt ("[E] Pick up batteries", "B Open") was
+shown.
+
+### Cause: the hide mask freezes the player's input reader
+
+- **Reproduced live** (level 03 start area, supply case at (106.8, 118.1, -1721.9) and loose
+  pickups found with `fp usables`; `fp use` shows the game's target): the prompt and the selected
+  target are the same in third and first person, so targeting is not the problem. Pressing use:
+  third person picks up; first person with `hide = all` or `body` does nothing; first person with
+  `hide = none` opens the case; **third person with only our hide bit forced (old `fp hidetest`)
+  does nothing**. So the hide bit, not the camera, blocks use. (A shotgun-ammo pickup pressed in
+  first person was found picked up right after switching back to third person: probably the
+  latched press, handled once the reader ran again; not reproduced.)
+- **Static** (Ghidra): use is handled by `PlayerInputReader::update` `0x2a0940` (vtable
+  `0x1407694b8` +0x18; RTTI "PlayerInputReader", Character +0x1a0): it calls the target selection
+  `0x29fa40` -> `0x3220e0` (candidates of type mask 0x4d from `0x1d9190`: 4 pickups, 8, 0x40
+  triggers, 1 characters; scored by distance <= 2.5-3 m, the player's facing (45 deg) and the aim
+  point (60 deg), plus a ray check `0x321a10` from the camera position) and, when use is pressed,
+  starts the use action (Character +0x298: `0x3207a0` pickup, `0x320820` trigger). GameMode's
+  per-character pass `0x34dcb0` (from `0x34d200`) runs that reader only when
+  `0x1ef6e0(hide mask)` is false, and `0x1ef6e0` is true exactly when the mask's low 16 bits are
+  2 or 8: the debug "Hide character" bit freezes the reader, and when it is frozen `0x34dcb0`
+  calls `0x29fa40` itself, which is why the prompt kept showing. `0x1ef6c0` ("hidden", used by
+  other code) excludes mask 8, and no reader of the mask tests bit 8 for use (the use path only
+  tests 0x10000).
+- **Bisected live** (a test verb applying each effect of `CharacterHide::set` separately in third
+  person): render-object flag 8 on the body (hides Alan), the attachment slots, the inventory's
+  linked entity, the held throwable, the weapon and the flashlight hide: with each, use still
+  worked. Only the mask value blocks it. No other mask bit both hides the body and keeps the
+  player working: any low-16 value other than 0, 2 or 8 disables the character controller
+  (`0x1ef4f0` -> `0x178dc0`), and bits >= 0x10000 do not hide the body.
+
+### Fix
+
+Hiding no longer uses the mask: section 4 "Hide". RVAs used (all behind `kSigs`):
+`0x463180` RenderObject flags (8 = hidden), `0x2d8760` attachment slots (inventory +0x48),
+`0x308110` inventory +0x18 linked entity, `0x2f1420` held throwable (Character +0x240), the
+weapon's mesh at holder +0x30/+0x38 and the flashlight's at +0xc0/+0xc8 (from `0x340340`,
+`0x22cb60`), the apply sequence of `0x1ef4f0` at `0x1ef602` (pins the offsets), and the getters
+`0x17a5c0`, `0x17acb0`, `0x203220`, `0x21cad0`.
+
+### Tested (live, 0.6.2 build, lab `awr-fp`, 1920x1080)
+
+| case | result |
+|---|---|
+| first person, `hide = all`, level 03 supply case | "Open" -> case opens; Alan, gun and flashlight meshes stay hidden after the animation (`hide_applied` counted the re-apply) |
+| first person, `hide = body`, level 03 | batteries picked up |
+| first person, `hide = none`, level 03 | revolver ammo picked up, case empty |
+| first person, `hide = all`, level 15 (flashlight lit) | "Picked up batteries", HUD 2 -> 4; beam on, no flashlight mesh |
+| first person, `hide = body`, level 15 | "Picked up shotgun ammo"; flashlight mesh visible at the lower right |
+| third person (control), level 15 | "Picked up revolver ammo", Alan and flashlight visible |
+| third person with our hiding (`fp hidetest on`), level 03 | "Picked up shotgun ammo", Alan stays hidden |
+| switching first -> third person, and `hide` all -> body -> none live | body, gun and flashlight back as the game has them (`hide_restored`) |
+| walking in first person after the change | works (S for 1.2 s moved 2.2 m) |
+
+Not tested: a gamepad (the lab sends keys; the prompt shows E or pad B for the same action, and
+the frozen reader handled both), a flashlight pickup proper (the tested pickups were batteries,
+ammo and a supply case; every type-4 pickup starts through the same `0x3207a0` call, static), use while a cutscene's mask
+hides the character (ours is not applied then, by design).
+
+## 6. Evidence
 
 - Third vs first person, night (`fp-forest-third-vs-first.jpg`, top/bottom, level 15 start; two
   runs at the same spot) and day (`fp-day-third-vs-first.jpg`, level 02 ferry, toggled live).
@@ -249,10 +325,10 @@ whatever the stereo mode (off included):
 ![fallback: free camera, then first person again](img/fp-fallback-freecam.jpg)
 ![day: third person (top), first person (bottom)](img/fp-day-third-vs-first.jpg)
 
-## 6. What works, what doesn't
+## 7. What works, what doesn't
 
-Works (live): walking, mouse look, aiming and focusing the flashlight, the bird fights including
-cinematic moments, level loads, switching modes live, the free-camera fallback and back, scripted
+Works (live): walking, mouse look, aiming and focusing the flashlight, use and pickups (since
+0.6.2), the bird fights including cinematic moments, level loads, switching modes live, the free-camera fallback and back, scripted
 helicopter shot fallback, stereo sbs (hsbs) around the first-person eye.
 
 Doesn't, or not yet:
@@ -268,12 +344,12 @@ Doesn't, or not yet:
 - **DOF focus and the sound listener** stay at the third-person camera (static).
 - Probably no player shadow while hidden (render-object flag 8; not checked).
 - Not tested: guns, driving, Bink and in-engine cutscenes in first person (static reasoning only),
-  death, the hide hook on characters that scripts hide for their own reasons (we only add bit 8
-  when ours is the only bit, by design).
+  death, scripts that hide the character for their own reasons while first person is active (ours
+  stands aside while the game's mask hides the character, by design).
 - A scripted shot that stays within 6 m of the head (a close "look at" camera) is rendered first
   person, looking where that shot looks.
 
-## 7. Next steps (prioritised)
+## 8. Next steps (prioritised)
 
 1. **Aim from the eye**: find the game's aim ray (the flashlight/gun target: TailCamera aim
    state, `Aim:*` / adhesion code, "Light:Aim beam" users) and either feed it the first-person
