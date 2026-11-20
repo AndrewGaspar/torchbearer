@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -41,10 +42,16 @@ constexpr uintptr_t RVA_ACTIVE_CAM = 0x1d2430;    // CameraManager::active(withE
 constexpr uintptr_t RVA_BONE_SLOT = 0x179f10;     // Character::slotTransform(this, float out[12], slot)
 constexpr uintptr_t RVA_HAS_VEHICLE = 0x159d60;   // VehicleLink::has(link): handle resolves
 constexpr uintptr_t RVA_HIDE_MASK = 0x1ef4f0;     // CharacterHide::set(this, bool on, u32 bits)
-constexpr uintptr_t RVA_DEBUG_HIDE = 0x17e716;    // Character update: debug "Hide character" -> bit 8
-constexpr uintptr_t RVA_FL_UPDATE = 0x22f370;     // Flashlight::updateLights(this): beam on iff !this[0]
-constexpr uintptr_t RVA_FL_HIDE = 0x22cb60;       // Flashlight::setHidden(this, bool): mesh + this[0]
-constexpr uintptr_t RVA_WEAPON_HIDE = 0x340340;   // WeaponHolder::setHidden(this, bool): mesh
+constexpr uintptr_t RVA_HIDE_BODY = 0x1ef602;     // ... its "apply" sequence (the calls below)
+constexpr uintptr_t RVA_RO_FLAG = 0x463180;       // RenderObject::setFlags(this, bits, on): 8 = hidden
+constexpr uintptr_t RVA_ATT_HIDE = 0x2d8760;      // attachment slots (inventory +0x48): flag 8 on each
+constexpr uintptr_t RVA_ENT_HIDE = 0x308110;      // inventory +0x18: linked entity setHidden(this, on, release)
+constexpr uintptr_t RVA_HELD_HIDE = 0x2f1420;     // held throwable (Character +0x240) setHidden(this, on)
+constexpr uintptr_t RVA_FL_HIDE = 0x22cb60;       // Flashlight::setHidden: [+0xc0] ? flag 8 on [+0xc8]
+constexpr uintptr_t RVA_WEAPON_HIDE = 0x340340;   // WeaponHolder::setHidden: [+0x30] ? flag 8 on [+0x38]
+constexpr uintptr_t RVA_USE_MGR = 0x321e10;       // `mov rax,[rip+d]; ret`: UseTarget manager (+4 target handle)
+constexpr uintptr_t RVA_USE_TARGET = 0x321f20;    // UseTarget::target(mgr): handle at +4 -> object
+constexpr uintptr_t RVA_OBJ_QUERY = 0x1d9190;     // objects of a type mask (out, shape or null, mask, flag)
 
 constexpr int kSlotHead = 0x1d;            // head slot (FUN_14017a420 "head heading", Taken head shots)
 constexpr int kSlotGround = 30;            // straight below the root at the feet (live census)
@@ -52,7 +59,10 @@ constexpr size_t kCharTransform = 0xbc;    // float[12] world transform (rotatio
 constexpr size_t kCharVehicle = 0x218;     // vehicle link (+0xc handle, +0x8 driving)
 constexpr size_t kCharHide = 0x210;        // CharacterHide* (+0 Character*, +8 mask, +0xc applied)
 constexpr size_t kCharIsPlayer = 0x1c9;    // u8, set on the player character
-constexpr uint32_t kHideDebugBit = 8;      // the debug panel's bit: hides meshes, keeps physics
+constexpr size_t kCharInventory = 0x200;   // FUN_14017a5c0
+constexpr size_t kCharHeld = 0x240;        // held throwable or null (FUN_14017acb0)
+constexpr size_t kCharRender = 0x2a0;      // vtable slot: render slot (+0 u8 present, +8 RenderObject*)
+constexpr size_t kRoFlags = 0x24;          // RenderObject flags (u32); 8 = hidden
 // PerspectiveView parameters (floats), as in stereo/engine.h.
 constexpr size_t kViewFov = 0xcb0, kViewAspect = 0xcb8, kViewNear = 0xcbc;
 constexpr size_t kViewDirtyProj = 0x4a8, kViewDirtyWorld = 0x4a9;
@@ -70,18 +80,36 @@ const Sig kSigs[] = {
     {RVA_BONE_SLOT, "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 20 48 8b 01 41 8b f0 48 8b da 48 8b f9 ff 90 c8 02 00 00 84 c0 74 4e 48 8b 8f b8 01 00 00"},
     {RVA_HAS_VEHICLE, "8b 41 0c 85 c0 75 09 33 c0 48 85 c0 0f 95 c0 c3"},
     {RVA_HIDE_MASK, "48 89 5c 24 20 57 48 83 ec 20 48 8b d9 8b 49 08 41 8b f8 84 d2 74 05 41 0b c8 eb 06 8b c7 f7 d0"},
-    // mov rax,[rip -> AnimationPage]; cmp byte [rax+0x146],0; setnz dl; mov r8d,8;
-    // mov rcx,[rsi+0x210]; call CharacterHide::set
-    {RVA_DEBUG_HIDE, "48 8b 05 ?? ?? ?? ?? 80 b8 46 01 00 00 00 0f 95 c2 41 b8 08 00 00 00 48 8b 8e 10 02 00 00 e8"},
+    // CharacterHide::set's apply sequence, which the first-person hide mirrors: inventory
+    // (0x17a5c0) +0x18 (0x203220) -> 0x308110; inventory +0x48 (0x21cad0) -> 0x2d8760;
+    // vtable +0x2a0 -> [+8] -> RenderObject flag 8 (0x463180); Character +0x240 (0x17acb0) -> 0x2f1420
+    {RVA_HIDE_BODY, "e8 b9 af f8 ff 48 8b c8 e8 11 3c 01 00 48 8b c8 44 0f b6 c6 40 0f b6 d7 e8 f1 8a 11 00 "
+                    "48 8b 0b e8 99 af f8 ff 48 8b c8 e8 a1 d4 02 00 48 8b c8 41 0f b6 d6 e8 25 91 0e 00 "
+                    "48 8b 0b 48 8b 01 ff 90 a0 02 00 00 45 0f b6 c6 ba 08 00 00 00 48 8b 48 08 e8 27 3b 27 00 "
+                    "48 8b 0b e8 4f b6 f8 ff"},
+    {0x17a5c0, "48 8b 81 00 02 00 00 c3"},
+    {0x17acb0, "48 8b 81 40 02 00 00 c3"},
+    {0x203220, "48 8d 41 18 c3"},
+    {0x21cad0, "48 8d 41 48 c3"},
+    {RVA_RO_FLAG, "44 8b 49 24 45 84 c0 74 05 44 0b ca eb 07 8b c2 f7 d0 44 23 c8 44 89 49 24 48 8b 49 08 48 85 c9"},
+    {RVA_ATT_HIDE, "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 20 0f b6 f2 48 8d 59 30 bf 08 00 00 00"},
+    {RVA_ENT_HIDE, "40 53 48 83 ec 20 8b 41 28 48 8b d9 85 c0 74 5f"},
+    {RVA_HELD_HIDE, "40 53 48 83 ec 20 48 8b d9 88 11 48 8b 49 10 48 85 c9 74 05 e8"},
     // Character::slotTransform's helpers: pose = [rcx+8] (0x184160), joint = [pose+slot*4+0x50]
     {0x184160, "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 20 48 8b da 48 8b f1 48 8b 49 08 41 8b d0 41 8b f8 e8"},
     {0x414a30, "48 63 c2 8b 44 81 50 c3"},
     // test aid (fp freecam): free-camera toggle and CameraManager::setMode
     {0x1d2b40, "48 89 5c 24 08 57 48 83 ec 20 48 8b 05 ?? ?? ?? ?? 80 b8 1a 01 00 00 00"},
     {0x1d20f0, "40 57 48 83 ec 20 8b 05 ?? ?? ?? ?? 8b f9 83 f8 07 75 58 84 d2 75 54 e8"},
-    {RVA_FL_UPDATE,"48 8b c4 55 53 56 57 48 8d 68 a1 48 81 ec 88 00 00 00 0f 29 78 b8 40 32"},
-    {RVA_FL_HIDE, "48 89 5c 24 08 57 48 83 ec 20 80 b9 c0 00 00 00 00 0f b6 fa 48 8b d9 74"},
+    // the held items' meshes: cmp byte [rcx+0xc0],0 ... flag 8 on [rcx+0xc8] (flashlight);
+    // cmp byte [rcx+0x30],0 ... flag 8 on [rcx+0x38] (weapon)
+    {RVA_FL_HIDE, "48 89 5c 24 08 57 48 83 ec 20 80 b9 c0 00 00 00 00 0f b6 fa 48 8b d9 74 15 48 8b 89 c8 00 00 00"},
     {RVA_WEAPON_HIDE, "80 79 30 00 88 51 1c 74 12 48 8b 49 38 44 0f b6 c2 ba 08 00 00 00 e9"},
+    // diagnostics (fp use / fp usables): UseTarget manager getter, its target resolver, the
+    // object-list query by type mask
+    {RVA_USE_MGR, "48 8b 05 ?? ?? ?? ?? c3"},
+    {RVA_USE_TARGET, "8b 41 04 85 c0 75 03 33 c0 c3 8b c8 48 8d 15 ?? ?? ?? ?? 81 e1 ff 1f 00 00 c1 e8 0d"},
+    {RVA_OBJ_QUERY, "4c 8b dc 49 89 5b 10 49 89 6b 20 45 89 43 18 56 57 41 54 41 56 41 57 48 81 ec b0 00 00 00"},
 };
 
 bool sig_ok(uintptr_t rva, const char* hex) {
@@ -111,8 +139,9 @@ void* rip_target(uintptr_t insn, int dispoff, int len) {
 using BoneSlotFn = void(__fastcall*)(void* character, float* out, int slot);
 using HasVehicleFn = char(__fastcall*)(void* link);
 using HideMaskFn = void(__fastcall*)(void* hide, char on, uint32_t bits);
-using Obj1Fn = void(__fastcall*)(void* obj);
 using ObjBoolFn = void(__fastcall*)(void* obj, char on);
+using RoFlagFn = void(__fastcall*)(void* ro, uint32_t bits, char on);
+using EntHideFn = void(__fastcall*)(void* obj, char on, char release);
 constexpr size_t kCharFlashlight = 0x230;  // Flashlight* (FUN_14017a660)
 constexpr size_t kCharWeapon = 0x220;      // weapon holder (FUN_14017ae20)
 
@@ -123,10 +152,11 @@ struct Game {
   void** cameraman = nullptr;  // the "Cameraman camera" BaseCamera: the rendered camera in mode 0
   BoneSlotFn bone_slot = nullptr;
   HasVehicleFn has_vehicle = nullptr;
-  HideMaskFn o_hide = nullptr;
-  Obj1Fn fl_update = nullptr;
-  ObjBoolFn fl_hide = nullptr;
-  ObjBoolFn weapon_hide = nullptr;
+  HideMaskFn o_hide = nullptr;  // CharacterHide::set (the original, behind our hook)
+  RoFlagFn ro_flag = nullptr;
+  ObjBoolFn att_hide = nullptr;
+  EntHideFn ent_hide = nullptr;
+  ObjBoolFn held_hide = nullptr;
 } G;
 
 // ---- config --------------------------------------------------------------------------------
@@ -161,7 +191,8 @@ const char* kReasons[] = {"off", "active", "not the player camera (camera mode !
 // keeps control; the follow camera stays within about 3 m of the head (live). Beyond this, the
 // game's own shot is shown.
 constexpr double kScriptedShotDistance = 6.0;
-std::atomic<uint64_t> g_filter_calls{0}, g_hide_calls{0}, g_hide_forced{0};
+std::atomic<bool> g_hide_test{false};  // `fp hidetest on`: first-person hiding in any camera mode (test aid)
+std::atomic<uint64_t> g_filter_calls{0}, g_hide_applied{0}, g_hide_restored{0};
 uint64_t g_cache_frame = ~0ull;
 double g_eye[3], g_head[3], g_root[3], g_cam[3];
 double g_smooth_off[3];
@@ -307,12 +338,199 @@ void freecam_apply() {
   if (r == 0) reinterpret_cast<void(__fastcall*)(int, char)>(game_image().at(0x1d20f0))(0, 0);
 }
 
+// Diagnostics run on the game thread (from the filter): one job at a time, answered to the verb.
+std::mutex g_job_mu;
+std::function<std::string()> g_job;
+std::string g_job_out;
+std::atomic<bool> g_job_pending{false};
+void job_run() {
+  std::lock_guard lk(g_job_mu);
+  if (g_job) g_job_out = g_job();
+  g_job = nullptr;
+  g_job_pending = false;
+}
+std::string job_call(std::function<std::string()> fn, bool& ok) {
+  {
+    std::lock_guard lk(g_job_mu);
+    g_job = std::move(fn);
+    g_job_out.clear();
+    g_job_pending = true;
+  }
+  for (int i = 0; i < 200; i++) {
+    Sleep(10);
+    if (!g_job_pending) {
+      std::lock_guard lk(g_job_mu);
+      return g_job_out;
+    }
+  }
+  std::lock_guard lk(g_job_mu);
+  g_job = nullptr;
+  g_job_pending = false;
+  ok = false;
+  return json_str("timeout (no main-camera update: in-world?)");
+}
+
+// A game object: type (vtable +0x20), world transform (vtable +8, position at +0x24).
+std::string obj_json(void* o) {
+  if (!o) return "null";
+  auto vt = *static_cast<void***>(o);
+  int type = reinterpret_cast<int(__fastcall*)(void*)>(vt[0x20 / 8])(o);
+  const float* t = reinterpret_cast<const float*(__fastcall*)(void*)>(vt[8 / 8])(o);
+  char b[256];
+  snprintf(b, sizeof b, "{\"ptr\":\"%p\",\"vtable\":\"0x%llx\",\"type\":%d,\"pos\":[%.2f,%.2f,%.2f]}", o,
+           (unsigned long long)(reinterpret_cast<uintptr_t>(vt) - reinterpret_cast<uintptr_t>(game_image().at(0)) +
+                                0x140000000ull),
+           type, t[9], t[10], t[11]);
+  return b;
+}
+
+void* use_target() {
+  void* mgr = reinterpret_cast<void*(__fastcall*)()>(game_image().at(RVA_USE_MGR))();
+  return mgr ? reinterpret_cast<void*(__fastcall*)(void*)>(game_image().at(RVA_USE_TARGET))(mgr) : nullptr;
+}
+
+// Objects of the type mask within r metres of the player (the UseTarget query uses 0x4d).
+std::string usables(uint32_t mask, double r) {
+  void* ch = player();
+  if (!ch) return json_str("no player");
+  const float* root = reinterpret_cast<const float*>(static_cast<uint8_t*>(ch) + kCharTransform);
+  static int buf[2 + 2 * 16384];
+  reinterpret_cast<void(__fastcall*)(int*, void*, uint32_t, char)>(game_image().at(RVA_OBJ_QUERY))(buf, nullptr,
+                                                                                                    mask, 0);
+  std::string o = "[";
+  int n = buf[0] < 16384 ? buf[0] : 16384, k = 0;
+  for (int i = 0; i < n; i++) {
+    void* obj = *reinterpret_cast<void**>(&buf[2 + 2 * i]);
+    if (!obj) continue;
+    auto vt = *static_cast<void***>(obj);
+    const float* t = reinterpret_cast<const float*(__fastcall*)(void*)>(vt[1])(obj);
+    double dx = t[9] - root[9], dy = t[10] - root[10], dz = t[11] - root[11];
+    double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > r) continue;
+    char db[32];
+    snprintf(db, sizeof db, ",\"d\":%.1f}", d);
+    std::string j = obj_json(obj);
+    j.pop_back();
+    o += (k++ ? "," : "") + j + db;
+    if (k >= 200) break;
+  }
+  return o + "]";
+}
+
+// ---- hiding the player ----------------------------------------------------------------------
+// Not with the game's CharacterHide mask (docs/first-person.md, "Use and pickups"): GameMode skips
+// a character's input reader (Character +0x1a0, PlayerInputReader::update 0x2a0940, which handles
+// "use", pickups and the other action presses) whenever the mask's low 16 bits are exactly 2 or 8
+// (0x34dcb0 -> 0x1ef6e0), so with the debug "Hide character" bit the use prompt still showed but
+// pressing use did nothing. Instead the visual part of what CharacterHide::set does for a hidden
+// character is applied directly: render-object flag 8 on the body, its attachment slots, the
+// inventory's linked entity and the held throwable, and (hide = all) on the weapon and flashlight
+// meshes (only the mesh: the beam stays on). The game re-applies its own visibility whenever its
+// mask changes (CharacterHide::set's applied-mask cache, +0xc; e.g. a use animation hides the
+// weapon with 0x10000 and shows everything again after), so the hook below re-applies ours right
+// after; to stop hiding, CharacterHide::set is made to re-apply the game's own mask.
+struct HideState {
+  void* ch = nullptr;  // the character ours is applied to
+  bool on = false;
+  Params::Hide mode = Params::Hide::None;
+} g_hs;
+
+void* render_object(void* ch) {
+  auto vt = *static_cast<void***>(ch);
+  auto* r = reinterpret_cast<uint8_t*(__fastcall*)(void*)>(vt[kCharRender / 8])(ch);
+  return r && r[0] ? rd<void*>(r, 8) : nullptr;
+}
+
+// Flag 8 on a held item's mesh, as its setHidden does, without the item's own hidden state
+// (the flashlight's [0] also switches its beam off).
+void hide_mesh(void* item, size_t present, size_t ro) {
+  if (item && rd<uint8_t>(item, present)) G.ro_flag(rd<void*>(item, ro), 8, 1);
+}
+
+// The game's mask hides the whole character (scripts, cutscenes): low 16 bits set.
+bool game_hides(void* ch) {
+  void* h = rd<void*>(ch, kCharHide);
+  return !h || (rd<uint32_t>(h, 8) & 0xffff) != 0;
+}
+
+void hide_apply(void* ch, Params::Hide mode) {
+  if (game_hides(ch)) return;  // already hidden by the game, held items included
+  uint32_t mask = rd<uint32_t>(rd<void*>(ch, kCharHide), 8);
+  if (void* ro = render_object(ch)) G.ro_flag(ro, 8, 1);
+  if (auto* inv = rd<uint8_t*>(ch, kCharInventory)) {
+    G.ent_hide(inv + 0x18, 1, 0);
+    G.att_hide(inv + 0x48, 1);
+  }
+  if (void* held = rd<void*>(ch, kCharHeld)) G.held_hide(held, 1);
+  if (mode == Params::Hide::All) {
+    hide_mesh(rd<void*>(ch, kCharWeapon), 0x30, 0x38);
+    if (!(mask & 0x60000)) hide_mesh(rd<void*>(ch, kCharFlashlight), 0xc0, 0xc8);
+  }
+  g_hide_applied++;
+}
+
+// Back to the game's own visibility: make CharacterHide::set re-apply its current mask.
+void hide_restore(void* ch) {
+  void* h = rd<void*>(ch, kCharHide);
+  if (!h) return;
+  auto* hb = static_cast<uint8_t*>(h);
+  uint32_t stale = rd<uint32_t>(h, 8) ^ 0x80000000u;
+  memcpy(hb + 0xc, &stale, 4);
+  G.o_hide(h, 0, 0);
+  g_hide_restored++;
+}
+
+// Game thread, every main-view set and render: apply or undo ours as first person starts/stops.
+void hide_sync() {
+  if (!G.ok || !G.o_hide) return;
+  void* ch = player();
+  bool want = (g_active.load(std::memory_order_relaxed) || g_hide_test.load(std::memory_order_relaxed)) && ch;
+  Params::Hide mode = want ? params().hide : Params::Hide::None;
+  if (mode == Params::Hide::None) want = false;
+  if (g_hs.on && g_hs.ch != ch) g_hs.on = false;  // another character (level load): nothing to undo
+  if (g_hs.on && (!want || g_hs.mode != mode)) {
+    hide_restore(g_hs.ch);
+    g_hs.on = false;
+  }
+  if (!want) return;
+  if (!g_hs.on) {
+    hide_apply(ch, mode);
+    g_hs = {ch, true, mode};
+    return;
+  }
+  // Something showed a mesh without a mask change (a weapon drawn, a new render object, a mask
+  // change and back within one frame): apply again.
+  auto shown = [](void* item, size_t present, size_t ro) {
+    return item && rd<uint8_t>(item, present) && !(rd<uint32_t>(rd<void*>(item, ro), kRoFlags) & 8);
+  };
+  void* ro = render_object(ch);
+  bool again = ro && !(rd<uint32_t>(ro, kRoFlags) & 8);
+  if (mode == Params::Hide::All) {
+    again = again || shown(rd<void*>(ch, kCharWeapon), 0x30, 0x38);
+    if (!(rd<uint32_t>(rd<void*>(ch, kCharHide), 8) & 0x60000))
+      again = again || shown(rd<void*>(ch, kCharFlashlight), 0xc0, 0xc8);
+  }
+  if (again && !game_hides(ch)) hide_apply(ch, mode);
+}
+
+// CharacterHide::set: pass-through; when the game has just re-applied the player's visibility (its
+// applied-mask cache changed) while ours is on, ours goes back on top in the same call.
+void __fastcall hk_hide(void* hide, char on, uint32_t bits) {
+  if (!g_hs.on || !hide) return G.o_hide(hide, on, bits);
+  uint32_t before = rd<uint32_t>(hide, 0xc);
+  G.o_hide(hide, on, bits);
+  if (*static_cast<void**>(hide) == g_hs.ch && rd<uint32_t>(hide, 0xc) != before && g_hs.ch == player())
+    hide_apply(g_hs.ch, g_hs.mode);
+}
+
 // core/camera.h filter: the main view's transform -> the player's eyes.
 bool fp_filter(void* view, double* m) {
+  if (g_job_pending.load(std::memory_order_relaxed) && G.ok && G.cameraman && view == *G.cameraman) job_run();
   if (g_slots_req.load(std::memory_order_relaxed) && G.ok && G.cameraman && view == *G.cameraman) slots_census();
   if (g_freecam_req.load(std::memory_order_relaxed) >= 0 && G.ok) freecam_apply();
   if (!g_on.load(std::memory_order_relaxed)) {
     if (g_active.exchange(false)) g_reason = 0;
+    if (g_hs.on || g_hide_test.load(std::memory_order_relaxed)) hide_sync();
     return false;
   }
   if (!G.cameraman || view != *G.cameraman) return false;
@@ -331,6 +549,7 @@ bool fp_filter(void* view, double* m) {
     g_active = false;
     g_smooth_valid = false;
     g_cache_frame = ~0ull;
+    hide_sync();
     return false;
   }
   if (p.aim_distance > 0) {
@@ -349,6 +568,7 @@ bool fp_filter(void* view, double* m) {
   m[10] = g_eye[1];
   m[11] = g_eye[2];
   g_active = true;
+  hide_sync();
   return true;
 }
 
@@ -370,6 +590,7 @@ void fp_prerender(void* view) {
       g_reason = 2;
       TB_LOG("firstperson: %s", kReasons[2]);
     }
+    hide_sync();
     return;
   }
   if (!g_active.load(std::memory_order_relaxed)) return;
@@ -386,42 +607,6 @@ void fp_prerender(void* view) {
     b[kViewDirtyProj] = 0;
     b[kViewDirtyWorld] = 0;
   }
-}
-
-// CharacterHide::set: the player's Character update calls it every frame with the debug panel's
-// "Hide character" flag for bit 8; while first person is active we OR ours in. The mask hides the
-// character's meshes, its weapon and its flashlight, and the flashlight's "hidden" flag also turns
-// its beam off; the setter only does work when the mask changes (+0xc caches the applied mask), so
-// right after it applied our state the held items are put back as configured.
-void __fastcall hk_hide(void* hide, char on, uint32_t bits) {
-  if (bits != kHideDebugBit) return G.o_hide(hide, on, bits);
-  g_hide_calls++;
-  void* ch = hide ? *static_cast<void**>(hide) : nullptr;
-  if (!on && ch && g_active.load(std::memory_order_relaxed) && ch == player()) {
-    auto mode = params().hide;
-    if (mode != Params::Hide::None) {
-      auto* h = static_cast<uint8_t*>(hide);
-      uint32_t before = rd<uint32_t>(h, 0xc);
-      G.o_hide(hide, 1, bits);
-      g_hide_forced++;
-      uint32_t mask = rd<uint32_t>(h, 8);
-      // Only when ours is the only reason the character is hidden (a script or cutscene hiding it
-      // sets other bits; leave those alone).
-      if (before != mask && (mask & 0xffff) == kHideDebugBit && !(mask & 0x60000)) {
-        void* fl = rd<void*>(ch, kCharFlashlight);
-        void* wp = rd<void*>(ch, kCharWeapon);
-        if (mode == Params::Hide::Body) {
-          if (fl) G.fl_hide(fl, 0);       // flashlight mesh and beam back
-          if (wp) G.weapon_hide(wp, 0);   // weapon mesh back
-        } else if (fl && rd<uint8_t>(fl, 0)) {
-          static_cast<uint8_t*>(fl)[0] = 0;  // mesh stays hidden; the beam comes back
-          G.fl_update(fl);
-        }
-      }
-      return;
-    }
-  }
-  G.o_hide(hide, on, bits);
 }
 
 bool resolve() {
@@ -442,9 +627,10 @@ bool resolve() {
     }
   G.bone_slot = reinterpret_cast<BoneSlotFn>(img.at(RVA_BONE_SLOT));
   G.has_vehicle = reinterpret_cast<HasVehicleFn>(img.at(RVA_HAS_VEHICLE));
-  G.fl_update = reinterpret_cast<Obj1Fn>(img.at(RVA_FL_UPDATE));
-  G.fl_hide = reinterpret_cast<ObjBoolFn>(img.at(RVA_FL_HIDE));
-  G.weapon_hide = reinterpret_cast<ObjBoolFn>(img.at(RVA_WEAPON_HIDE));
+  G.ro_flag = reinterpret_cast<RoFlagFn>(img.at(RVA_RO_FLAG));
+  G.att_hide = reinterpret_cast<ObjBoolFn>(img.at(RVA_ATT_HIDE));
+  G.ent_hide = reinterpret_cast<EntHideFn>(img.at(RVA_ENT_HIDE));
+  G.held_hide = reinterpret_cast<ObjBoolFn>(img.at(RVA_HELD_HIDE));
   return true;
 }
 
@@ -460,13 +646,13 @@ std::string status() {
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"ok\":%s,\"hooks\":%s,\"active\":%s,\"reason\":%s,\"camera_mode\":%d,"
            "\"eye\":%s,\"head\":%s,\"root\":%s,\"game_camera\":%s,\"filter_calls\":%llu,"
-           "\"hide_calls\":%llu,\"hide_forced\":%llu,\"anchor\":\"%s\",\"fov\":%.1f}",
+           "\"hidden\":%s,\"hide_applied\":%llu,\"hide_restored\":%llu,\"anchor\":\"%s\",\"fov\":%.1f}",
            p.first_person ? "first_person" : "third_person", G.ok ? "true" : "false",
            camera_hooked() ? "true" : "false", g_active.load() ? "true" : "false",
            json_str(kReasons[g_reason.load()]).c_str(), G.cam_mode ? *G.cam_mode : -1, fmt3(g_eye).c_str(),
            fmt3(g_head).c_str(), fmt3(g_root).c_str(), fmt3(g_cam).c_str(),
-           (unsigned long long)g_filter_calls.load(), (unsigned long long)g_hide_calls.load(),
-           (unsigned long long)g_hide_forced.load(), p.anchor == Anchor::Head ? "head" : "body", p.fov_deg);
+           (unsigned long long)g_filter_calls.load(), g_hs.on ? "true" : "false",
+           (unsigned long long)g_hide_applied.load(), (unsigned long long)g_hide_restored.load(), p.anchor == Anchor::Head ? "head" : "body", p.fov_deg);
   return b;
 }
 
@@ -512,12 +698,34 @@ void firstperson_register() {
       ok = false;
       return json_str("timeout (no main-camera update: in-world?)");
     }
+    if (a[0] == "use" && G.ok) {
+      // The game's current use target (what "use" acts on: the interaction prompt), the game's
+      // own hide mask on the player and whether first person's hiding is applied.
+      return job_call([] {
+        void* ch = player();
+        void* h = ch ? rd<void*>(ch, kCharHide) : nullptr;
+        char b[96];
+        snprintf(b, sizeof b, ",\"hide_mask\":\"0x%x\",\"hidden\":%s}", h ? rd<uint32_t>(h, 8) : 0,
+                 g_hs.on ? "true" : "false");
+        return "{\"target\":" + obj_json(use_target()) + b;
+      }, ok);
+    }
+    if (a[0] == "usables" && G.ok) {
+      uint32_t mask = a.size() > 1 ? strtoul(a[1].c_str(), nullptr, 0) : 4;
+      double r = a.size() > 2 ? strtod(a[2].c_str(), nullptr) : 50;
+      return job_call([mask, r] { return usables(mask, r); }, ok);
+    }
+    if (a[0] == "hidetest" && a.size() > 1) {
+      // Test aid: first person's hiding of the player whatever the camera mode (third person too).
+      g_hide_test = a[1] == "on";
+      return json_str(g_hide_test ? "player hidden in any mode" : "player hidden in first person only");
+    }
     if (a[0] == "freecam" && a.size() > 1 && G.ok) {
       g_freecam_req = a[1] == "on" ? 1 : 0;
       return json_str(a[1] == "on" ? "free camera requested" : "player camera requested");
     }
     ok = false;
-    return json_str("usage: fp [status|slots N|freecam on|off]");
+    return json_str("usage: fp [status|slots N|freecam on|off|use|usables [mask] [radius]|hidetest on|off]");
   });
 }
 
@@ -525,8 +733,12 @@ void firstperson_start() {
   G.ok = resolve();
   if (!G.ok) return;
   if (!hook_fn(reinterpret_cast<void*>(game_image().at(RVA_HIDE_MASK)), reinterpret_cast<void*>(&hk_hide),
-               reinterpret_cast<void**>(&G.o_hide), "CharacterHide::set"))
-    TB_LOG("firstperson: hide hook failed; the body stays visible in first person");
+               reinterpret_cast<void**>(&G.o_hide), "CharacterHide::set")) {
+    // Without the hook the hiding still works, but a mesh the game shows again (after a use
+    // animation, say) is only hidden again on the next frame.
+    G.o_hide = reinterpret_cast<HideMaskFn>(game_image().at(RVA_HIDE_MASK));
+    TB_LOG("firstperson: hide hook failed; hiding re-applied per frame only");
+  }
   TB_LOG("firstperson: ready (rendered camera at %p)", (void*)G.cameraman);
 }
 
