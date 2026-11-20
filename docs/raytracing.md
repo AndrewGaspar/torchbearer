@@ -584,9 +584,10 @@ optionally the ray origin — the skinned close-up banding mitigation), and `cs_
 surface point through that instance's previous × inverse(current) transform (matched across
 updates by BLAS + occurrence; per-update-BLAS instances keep identity) before the previous
 camera. The eye's absolute world→clip (doubles) feeds it — the ray-query rewrite initially left
-it unwritten, which silently rejected all history. The ferry (`awr-brightfalls-day`, live r74)
-traces with motion on and no copy misses; a still cannot show temporal noise, so the ferry
-improvement itself is **not** separately measured.
+it unwritten, which silently rejected all history. On the ferry (`awr-brightfalls-day`, live
+r78, `quiver lab bench` A/B of `dev.rtao_motion`, deck/car crop): temporal noise 18.68 ± 0.40
+with motion vs 22.17 ± 1.42 without (3 rounds × 6 samples, equal mean level), about 16% lower —
+history now survives the moving platform instead of being rejected every frame.
 
 **Validation (measured, lab r64, interleaved A/B ×3 at fixed views, `validate noalpha` is the
 forced-opaque baseline).** Gameplay view: exact primary hits 1,268,572 → 1,289,435; too-near

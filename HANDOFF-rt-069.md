@@ -62,8 +62,8 @@ Written 2026-11-20 ~14:07 MST by Muse (muse-wonder-full-1.0), picking up subagen
   are floodlight/encounter-dominated and Alan has no flashlight in the apartment dream, so
   treat as consistent-with, not isolated proof. Settling it needs an armed, quiet, dark scene.
   Note `awr-rt` now has `pads=1` in its manifest.
-- Ferry temporal improvement: motion plumbing is on and the ferry renders cleanly (r74), but no
-  temporal-noise measurement (`quiver lab bench` or stepped virtual-clock frames would do it).
+- Ferry temporal improvement: measured (r78 bench A/B): temporal noise 18.68 ± 0.40 with
+  instance motion vs 22.17 ± 1.42 without. Done; no further ferry work queued.
 - Skinned close-up banding: receiver-from-hit is on by default (`dev.rtao_receiver`); no close-up
   capture was taken.
 - Flashlight cost inside the deferred-light pass not isolated (no marker); atlas still renders
