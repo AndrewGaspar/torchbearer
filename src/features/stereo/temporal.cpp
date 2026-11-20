@@ -32,6 +32,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "features/graphics.h"
 #include "core/module.h"
 #include "core/present.h"
 #include "features/stereo/engine.h"
@@ -395,7 +396,8 @@ void temporal_enter(void* r, void* view, int eye) {
     void* obj = at<void*>(r, f.renderer_off);
     if (!obj) continue;
     void* ert = at<void*>(obj, f.rt_off);
-    bool runs = *reinterpret_cast<const uint8_t*>(game_image().at(f.enable_rva)) != 0;
+    bool runs = *reinterpret_cast<const uint8_t*>(game_image().at(f.enable_rva)) != 0 ||
+                (f.enable_rva == 0xd755e0 && graphics_ssao_on());  // [graphics] ssao patches the branch
     if (eye > 0 && on && runs && ert && ensure_rt(f, ert)) {
       f.l_rt = ert;
       f.l_reset = at<uint8_t>(obj, f.reset_off);

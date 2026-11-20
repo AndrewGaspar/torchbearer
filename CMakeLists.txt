@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(torchbearer LANGUAGES C CXX)
-set(TB_VERSION "0.6.4")
+set(TB_VERSION "0.6.5")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,11 @@ add_library(torchbearer SHARED
   src/features/settings.cpp
   src/features/settings_keys.cpp
   src/features/levels.cpp
+  src/features/graphics.cpp
+  src/features/rt/rt.cpp
+  src/features/rt/census.cpp
+  src/features/rt/dxr.cpp
+  src/features/rt/dxc.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 target_include_directories(torchbearer PRIVATE src third_party)
