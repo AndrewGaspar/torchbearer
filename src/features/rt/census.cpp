@@ -142,6 +142,24 @@ struct PsoInfo {
 };
 PtrTable<PsoInfo, 16384> g_psoinfo;
 
+// A shader-resource view the game created (or copied): CPU handle -> texture and view parameters.
+// The alpha path resolves a draw's descriptor through it at record time. A plain map (the game's
+// bindless heap alone has 264192 slots, more than a fixed open-addressing table should hold).
+struct SrvInfo {
+  ID3D12Resource* res = nullptr;
+  uint16_t fmt = 0, mip0 = 0, mips = 0;
+  uint8_t dim = 0;  // D3D12_SRV_DIMENSION
+};
+std::mutex g_srv_mu;
+std::unordered_map<SIZE_T, SrvInfo> g_srvinfo;
+bool srv_lookup(SIZE_T h, SrvInfo& out) {
+  std::lock_guard lk(g_srv_mu);
+  auto it = g_srvinfo.find(h);
+  if (it == g_srvinfo.end()) return false;
+  out = it->second;
+  return true;
+}
+
 struct ListSt {
   PsoInfo* pso = nullptr;
   ID3D12PipelineState* raw_pso = nullptr;  // for the spot swap (rt_spot)
@@ -166,7 +184,7 @@ std::unordered_map<ID3D12RootSignature*, int> g_rs_cb0;     // root signature ->
 // SRV ranges (base register, space, count, offset from the table's start). Other parameters keep
 // an empty range list. Parsed in hk_rs with the versioned deserializer.
 struct RsRange {
-  uint32_t reg, space, num, off;
+  uint32_t reg, space, num, off, vis;  // vis: the parameter's D3D12_SHADER_VISIBILITY
 };
 std::unordered_map<ID3D12RootSignature*, std::vector<std::vector<RsRange>>> g_rs_tabs;
 struct HeapEnds {
@@ -643,17 +661,22 @@ void refl_loop() {
         int root = -1;
         uint16_t off = 0;
         if (mode && j.info->rs) {
+          // The pixel shader's table (the game's root signature has whole-heap SRV tables for
+          // both stages at t0; the vertex one would name a different sliding window).
           std::lock_guard lk2(g_mu);
           auto it = g_rs_tabs.find(j.info->rs);
           if (it != g_rs_tabs.end())
-            for (size_t pi = 0; pi < it->second.size() && root < 0; pi++)
-              for (auto& rg : it->second[pi])
-                if (rg.space == 0 && uint32_t(pf2.tex_reg) >= rg.reg &&
-                    (rg.num == ~0u || uint32_t(pf2.tex_reg) < rg.reg + rg.num)) {
-                  root = int(pi);
-                  off = uint16_t(rg.off + (uint32_t(pf2.tex_reg) - rg.reg));
-                  break;
-                }
+            for (uint32_t want : {uint32_t(D3D12_SHADER_VISIBILITY_PIXEL), uint32_t(D3D12_SHADER_VISIBILITY_ALL)}) {
+              for (size_t pi = 0; pi < it->second.size() && root < 0; pi++)
+                for (auto& rg : it->second[pi])
+                  if (rg.vis == want && rg.space == 0 && uint32_t(pf2.tex_reg) >= rg.reg &&
+                      (rg.num == ~0u || uint32_t(pf2.tex_reg) < rg.reg + rg.num)) {
+                    root = int(pi);
+                    off = uint16_t(rg.off + (uint32_t(pf2.tex_reg) - rg.reg));
+                    break;
+                  }
+              if (root >= 0) break;
+            }
         }
         if (mode && root >= 0 && root < 32) {
           j.info->uv_mode = uint8_t(mode);
@@ -914,7 +937,8 @@ std::vector<std::vector<RsRange>> rs_tabs(const void* blob, size_t n) {
                            : rg.OffsetInDescriptorsFromTableStart;
         append = off + (rg.NumDescriptors == ~0u ? 0 : rg.NumDescriptors);
         if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV)
-          out[i].push_back({rg.BaseShaderRegister, rg.RegisterSpace, rg.NumDescriptors, off});
+          out[i].push_back({rg.BaseShaderRegister, rg.RegisterSpace, rg.NumDescriptors, off,
+                            uint32_t(p.ShaderVisibility)});
       }
     }
   }
@@ -944,6 +968,17 @@ HRESULT STDMETHODCALLTYPE hk_rs(ID3D12Device* d, UINT mask, const void* blob, SI
   if (SUCCEEDED(hr) && out && *out && blob) {
     int i = rs_vs_cb0(blob, n);
     auto tabs = rs_tabs(blob, n);
+    static std::atomic<int> rslogged{0};
+    if (rslogged.fetch_add(1, std::memory_order_relaxed) < 3) {
+      std::string s;
+      for (size_t pi = 0; pi < tabs.size(); pi++)
+        for (auto& rg : tabs[pi]) {
+          char b[96];
+          snprintf(b, sizeof b, " [p%zu t%u s%u n%u +%u]", pi, rg.reg, rg.space, rg.num, rg.off);
+          s += b;
+        }
+      TB_LOG("rt capture: root sig %p params %zu srv ranges:%s", *out, tabs.size(), s.empty() ? " none" : s.c_str());
+    }
     std::lock_guard lk(g_mu);
     g_rs_cb0[static_cast<ID3D12RootSignature*>(*out)] = i;
     g_rs_tabs[static_cast<ID3D12RootSignature*>(*out)] = std::move(tabs);
@@ -1052,6 +1087,65 @@ void STDMETHODCALLTYPE hk_dsv(ID3D12Device* d, ID3D12Resource* r, const void* de
   std::lock_guard lk(g_mu);
   int f = desc ? int(static_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc)->Format) : -1;
   g_dsv[h.ptr] = View{r, f};
+}
+
+CreateView_t o_srvv;
+using CopyDesc_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT,
+                                            const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
+using CopyDescSimple_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+CopyDesc_t o_copyDesc;
+CopyDescSimple_t o_copyDescSimple;
+
+void STDMETHODCALLTYPE hk_srvv(ID3D12Device* d, ID3D12Resource* r, const void* desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+  o_srvv(d, r, desc, h);
+  SrvInfo info;
+  info.res = r;
+  const auto* vd = static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(desc);
+  if (vd) {
+    info.fmt = uint16_t(vd->Format);
+    info.dim = uint8_t(vd->ViewDimension);
+    if (vd->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+      info.mip0 = uint16_t(vd->Texture2D.MostDetailedMip);
+      info.mips = uint16_t(vd->Texture2D.MipLevels);
+    }
+  } else if (r) {
+    D3D12_RESOURCE_DESC rd = r->GetDesc();
+    info.fmt = uint16_t(rd.Format);
+    info.dim = uint8_t(D3D12_SRV_DIMENSION_TEXTURE2D);
+    info.mips = rd.MipLevels;
+  }
+  std::lock_guard lk(g_srv_mu);
+  g_srvinfo[h.ptr] = info;
+}
+
+void STDMETHODCALLTYPE hk_copyDescSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                         D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  o_copyDescSimple(d, n, dst, src, type);
+  if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !g_srv_inc) return;
+  std::lock_guard lk(g_srv_mu);
+  for (UINT i = 0; i < n; i++) {
+    auto it = g_srvinfo.find(src.ptr + SIZE_T(i) * g_srv_inc);
+    if (it != g_srvinfo.end()) g_srvinfo[dst.ptr + SIZE_T(i) * g_srv_inc] = it->second;
+  }
+}
+
+void STDMETHODCALLTYPE hk_copyDesc(ID3D12Device* d, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* dsts, const UINT* dsz,
+                                   UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE* srcs, const UINT* ssz,
+                                   D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  o_copyDesc(d, nd, dsts, dsz, ns, srcs, ssz, type);
+  if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !g_srv_inc || !dsts || !srcs) return;
+  // Flattened in order (a null size array means one descriptor per range).
+  std::vector<SIZE_T> from, to;
+  for (UINT i = 0; i < ns; i++)
+    for (UINT k = 0, cnt = ssz ? ssz[i] : 1; k < cnt; k++) from.push_back(srcs[i].ptr + SIZE_T(k) * g_srv_inc);
+  for (UINT i = 0; i < nd; i++)
+    for (UINT k = 0, cnt = dsz ? dsz[i] : 1; k < cnt; k++) to.push_back(dsts[i].ptr + SIZE_T(k) * g_srv_inc);
+  std::lock_guard lk(g_srv_mu);
+  for (size_t i = 0; i < from.size() && i < to.size(); i++) {
+    auto it = g_srvinfo.find(from[i]);
+    if (it != g_srvinfo.end()) g_srvinfo[to[i]] = it->second;
+  }
 }
 
 using CreateDevice_t = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
@@ -1219,18 +1313,33 @@ void scene_draw(ID3D12GraphicsCommandList* l, UINT ic, UINT n, UINT si, INT bv) 
         d.atlas_rows = p->atlas_rows;
       }
       uint64_t tab = p->tex_root >= 0 ? s->tab[p->tex_root & 31] : 0;
+      bool resolved = false;
       if (tab && s->heap_gpu0 && tab >= s->heap_gpu0 && g_srv_inc) {
         uint64_t idx = (tab - s->heap_gpu0) / g_srv_inc + p->tex_off;
         if (idx < s->heap_num) {
           d.alpha_idx = int32_t(idx);
-          d.alpha_cpu = s->heap_cpu0 + idx * g_srv_inc;
           d.alpha_heap = s->heap_gpu0;
-          g_alpha_ok.fetch_add(1, std::memory_order_relaxed);
-        } else {
-          g_alpha_miss.fetch_add(1, std::memory_order_relaxed);
+          SrvInfo si;
+          if (srv_lookup(s->heap_cpu0 + idx * g_srv_inc, si) && si.res &&
+              si.dim == D3D12_SRV_DIMENSION_TEXTURE2D) {
+            d.alpha_res = si.res;
+            d.alpha_fmt = si.fmt;
+            d.alpha_mip0 = si.mip0;
+            d.alpha_mips = si.mips;
+            resolved = true;
+          }
         }
-      } else {
-        g_alpha_miss.fetch_add(1, std::memory_order_relaxed);
+      }
+      (resolved ? g_alpha_ok : g_alpha_miss).fetch_add(1, std::memory_order_relaxed);
+      if (resolved) {
+        static std::atomic<int> alogged{0};
+        if (alogged.fetch_add(1, std::memory_order_relaxed) < 12) {
+          D3D12_RESOURCE_DESC rd = d.alpha_res->GetDesc();
+          TB_LOG("rt capture: alpha draw ps %016llx root %d+%u tab %#llx heap %#llx/%u idx %d res %p %llux%u fmt %u/%u",
+                 (unsigned long long)d.ps, p->tex_root, p->tex_off, (unsigned long long)tab,
+                 (unsigned long long)s->heap_gpu0, s->heap_num, d.alpha_idx, (void*)d.alpha_res,
+                 (unsigned long long)rd.Width, rd.Height, unsigned(rd.Format), d.alpha_fmt);
+        }
       }
     }
   }
@@ -1717,6 +1826,9 @@ void capture_device(ID3D12Device* dev) {
   int fails = !hook_slot(dev, 10, (void*)hk_gfx, (void**)&o_gfx, "CreateGraphicsPipelineState");
   fails += !hook_slot(dev, 16, (void*)hk_rs, (void**)&o_rs, "CreateRootSignature");
   fails += !hook_slot(dev, 11, (void*)hk_cs, (void**)&o_cs, "CreateComputePipelineState");
+  fails += !hook_slot(dev, 18, (void*)hk_srvv, (void**)&o_srvv, "CreateShaderResourceView");
+  fails += !hook_slot(dev, 23, (void*)hk_copyDesc, (void**)&o_copyDesc, "CopyDescriptors");
+  fails += !hook_slot(dev, 24, (void*)hk_copyDescSimple, (void**)&o_copyDescSimple, "CopyDescriptorsSimple");
   fails += !hook_slot(dev, 20, (void*)hk_rtv, (void**)&o_rtv, "CreateRenderTargetView");
   fails += !hook_slot(dev, 21, (void*)hk_dsv, (void**)&o_dsv, "CreateDepthStencilView");
   fails += !hook_slot(dev, 27, (void*)hk_committed, (void**)&o_committed, "CreateCommittedResource");

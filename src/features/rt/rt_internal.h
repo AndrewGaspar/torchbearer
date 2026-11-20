@@ -81,7 +81,11 @@ struct DrawRec {
   uint8_t atlas_rows = 0;     // mode 3: float4 rows per atlas entry
   float alpha_thresh = 0.5f;
   int32_t alpha_idx = -1;     // the alpha SRV's index in the game's bound descriptor heap
-  uint64_t alpha_cpu = 0;     // its CPU descriptor handle (copied into the mod's heap per update)
+  // The alpha texture itself, resolved at record time (the game rewrites its descriptors per
+  // draw, so a CPU handle copied later would name another draw's texture; live, r60).
+  ID3D12Resource* alpha_res = nullptr;
+  uint16_t alpha_fmt = 0;     // its SRV format and mip range, as the game created the view
+  uint16_t alpha_mip0 = 0, alpha_mips = 0;
   uint64_t alpha_heap = 0;    // that heap's GPU start (the spotlight binds it as space 10)
 };
 // Arm or disarm the capture (needs the device hooks from launch and the list hooks).

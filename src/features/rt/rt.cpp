@@ -9,7 +9,7 @@
 //   rt gpu on|off|status   GPU time of engine passes (timestamps recorded into the engine's lists)
 //   rt grab NAME WHERE     copy an engine render target at a pass boundary -> <run>/rt-grab-*.raw
 //   rt flag ssao|hbao [0|1]  force the SSAO / HBAO branch of the main pass (code patch, dev)
-//   rt scene on|off|status|validate [MASK] [img]|budget N|casters 0|1|reset
+//   rt scene on|off|status|validate [MASK] [img] [noalpha]|budget N|casters 0|1|reset
 //                          geometry capture, BLAS/TLAS and the ray passes (scene.cpp, trace.cpp)
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include "features/rt/rt.h"
@@ -538,8 +538,12 @@ std::string verb(const std::vector<std::string>& a, bool& ok) {
     }
     if (m == "validate") {
       unsigned mask = a.size() > 2 ? unsigned(strtoul(a[2].c_str(), nullptr, 0)) : 0x0f;
-      bool img = a.size() > 3 && a[3] == "img";
-      trace_validate_arm(mask, img);
+      bool img = false, alpha = true;
+      for (size_t i = 3; i < a.size(); i++) {
+        if (a[i] == "img") img = true;
+        if (a[i] == "noalpha") alpha = false;  // forced-opaque rays: the pre-alpha baseline
+      }
+      trace_validate_arm(mask, img, alpha);
       Sleep(400);  // traced at the next kick, read back kSlots submissions later
       return scene_status();
     }
