@@ -22,6 +22,7 @@
 #include <smmintrin.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -287,11 +288,13 @@ uint32_t g_tlas_instances = 0;
 
 struct Stats {
   uint64_t frames = 0, builds = 0, build_tris = 0, refits = 0, compactions = 0, evictions = 0, invalidated = 0;
+  uint32_t views_shown = 0, views_placed_shown = 0;
   uint64_t dyn_dropped = 0, dyn_clamped = 0, cam_proj_cb = 0;
   uint64_t skip_upload = 0, dyn_tris_shown = 0, dyn_tris_a_shown = 0;
   double t_draws = 0, t_build = 0, t_total = 0;
   uint64_t skipped_busy = 0, skipped_nocam = 0, rejected = 0, rej_unknown = 0, rej_upload = 0, rej_range = 0;
   uint32_t last_draws_g = 0, last_draws_s = 0, last_inst = 0, last_inst_g = 0, last_inst_s = 0, last_dup = 0;
+  uint32_t last_views = 0, last_views_placed = 0;
   uint32_t last_pending_blas = 0, last_builds = 0, last_refits = 0, last_dyn_geos = 0;
   uint64_t last_dyn_tris = 0, last_dyn_tris_a = 0;
   uint64_t last_tris_g = 0, last_tris_s = 0;
@@ -464,7 +467,7 @@ std::atomic<int> g_build_budget_tris{300000};
 std::atomic<int> g_dyn_on{3};  // bit 0 opaque, bit 1 alpha-tested  // the per-update BLAS (upload-heap meshes)
 std::atomic<int> g_dump{0};
 std::atomic<uint64_t> g_dump_ps{0};  // only draws with this pixel shader (0: any)  // log this many instances of the next update (debug)
-std::atomic<bool> g_shadow_casters{true};
+std::atomic<bool> g_shadow_casters{true};  // shadow-map draws placed by matching (above)
 
 double now_ms() {
   static LARGE_INTEGER f = [] {
@@ -516,20 +519,108 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
   uint64_t budget = uint64_t(g_build_budget_tris.load());
   uint64_t tris_g = 0, tris_s = 0;
   uint32_t ng = 0, ns = 0, dup = 0, dg = 0, dsh = 0, nblas_pending = 0;
+  // Shadow-map draws are in light views (cascades, spot lights) whose placement is not in their
+  // constants (only the rows a VS reads are written: g_mLocalToView, g_mViewToClip). Group them
+  // by view (their g_mViewToClip rows), and place each view from a mesh drawn exactly once in
+  // the G-buffer and once in that view: ViewToWorld_light = World_gbuffer * inverse(LocalToView_light).
+  std::vector<int> light_of(draws.size(), -1);
+  std::vector<std::array<double, 12>> light_v2w;
+  if (g_shadow_casters.load()) {
+    struct G {
+      int n = 0;
+      std::array<double, 12> w{};
+    };
+    std::unordered_map<uint64_t, G> gm;
+    auto mkey = [](const DrawRec& d) {
+      return (d.vb * 0x9e3779b97f4a7c15ull) ^ (d.ib * 0xbf58476d1ce4e5b9ull) ^ d.icount;
+    };
+    for (auto& d : draws) {
+      if (d.cls != DC_GBUFFER) continue;
+      G& g = gm[mkey(d)];
+      if (++g.n > 1) continue;
+      float l2v[12];
+      if (!g_cbc.read(d.cb + d.l2v, l2v, 48)) {
+        g.n = 2;
+        continue;
+      }
+      for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++) {
+          double v = c == 3 ? g_cam_v2w[r * 4 + 3] : 0;
+          for (int k = 0; k < 3; k++) v += g_cam_v2w[r * 4 + k] * l2v[k * 4 + c];
+          g.w[r * 4 + c] = v;
+        }
+    }
+    std::unordered_map<uint64_t, int> views;  // projection hash -> light index
+    struct V {
+      std::unordered_map<uint64_t, int> count;
+      std::vector<size_t> idx;
+    };
+    std::vector<V> vs;
+    for (size_t i = 0; i < draws.size(); i++) {
+      auto& d = draws[i];
+      if (d.cls != DC_SHADOW) continue;
+      float proj[16];
+      if (!g_cbc.read(d.cb + 128, proj, 64)) continue;
+      uint64_t h = 1469598103934665603ull;
+      for (float f : proj) {
+        uint32_t u;
+        memcpy(&u, &f, 4);
+        h = (h ^ u) * 1099511628211ull;
+      }
+      auto [it, fresh] = views.emplace(h, int(vs.size()));
+      if (fresh) vs.emplace_back();
+      vs[it->second].count[mkey(d)]++;
+      vs[it->second].idx.push_back(i);
+    }
+    for (auto& v : vs) {
+      int li = -1;
+      for (size_t i : v.idx) {
+        auto& d = draws[i];
+        uint64_t k = mkey(d);
+        auto g = gm.find(k);
+        if (g == gm.end() || g->second.n != 1 || v.count[k] != 1) continue;
+        float l[12];
+        if (!g_cbc.read(d.cb + d.l2v, l, 48)) continue;
+        // inverse of the affine L (3x3 R, t): R^-1, -R^-1 t (general 3x3 inverse: scale allowed)
+        double a[9] = {l[0], l[1], l[2], l[4], l[5], l[6], l[8], l[9], l[10]};
+        double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
+        if (!(std::fabs(det) > 1e-9)) continue;
+        double ia[9] = {(a[4] * a[8] - a[5] * a[7]) / det, (a[2] * a[7] - a[1] * a[8]) / det, (a[1] * a[5] - a[2] * a[4]) / det,
+                        (a[5] * a[6] - a[3] * a[8]) / det, (a[0] * a[8] - a[2] * a[6]) / det, (a[2] * a[3] - a[0] * a[5]) / det,
+                        (a[3] * a[7] - a[4] * a[6]) / det, (a[1] * a[6] - a[0] * a[7]) / det, (a[0] * a[4] - a[1] * a[3]) / det};
+        double it_[3] = {-(ia[0] * l[3] + ia[1] * l[7] + ia[2] * l[11]), -(ia[3] * l[3] + ia[4] * l[7] + ia[5] * l[11]),
+                         -(ia[6] * l[3] + ia[7] * l[7] + ia[8] * l[11])};
+        std::array<double, 12> m{};
+        const auto& w = g->second.w;
+        for (int r = 0; r < 3; r++) {
+          for (int c = 0; c < 3; c++) m[r * 4 + c] = w[r * 4] * ia[c] + w[r * 4 + 1] * ia[3 + c] + w[r * 4 + 2] * ia[6 + c];
+          m[r * 4 + 3] = w[r * 4] * it_[0] + w[r * 4 + 1] * it_[1] + w[r * 4 + 2] * it_[2] + w[r * 4 + 3];
+        }
+        li = int(light_v2w.size());
+        light_v2w.push_back(m);
+        break;
+      }
+      g_st.last_views++;
+      if (li < 0) continue;
+      g_st.last_views_placed++;
+      for (size_t i : v.idx) light_of[i] = li;
+    }
+  }
   // G-buffer draws first: a shadow-map draw of the same mesh at the same place is a duplicate.
   for (int pass = 0; pass < 2; pass++) {
     for (auto& d : draws) {
+      size_t di = size_t(&d - draws.data());
       if (d.cls == DC_SUN || (pass == 0) != (d.cls == DC_GBUFFER)) continue;
       if (pass == 1 && !g_shadow_casters.load()) continue;
       (pass ? dsh : dg)++;
       // Only the $Globals rows a shader reads are written per draw (live: g_mViewToWorld at 64
       // holds stale ring data in G-buffer draws), so the view's placement comes from the engine's
       // View; shadow-map draws are in light views whose placement is not in their constants.
-      if (pass == 1) continue;
+      if (pass == 1 && light_of[di] < 0) continue;
       float l2v[12];
       if (!g_cbc.read(d.cb + d.l2v, l2v, 48)) continue;
       float x[12];
-      affine_mul(g_cam_v2w, l2v, x, g_anchor);
+      affine_mul(pass ? light_v2w[size_t(light_of[di])].data() : g_cam_v2w, l2v, x, g_anchor);
       if (g_dump.load() > 0 && (!g_dump_ps.load() || g_dump_ps.load() == d.ps)) {
         g_dump--;
         TB_LOG("rt dump: cls %d tris %u vb %#llx stride %u vcount %u ib %#llx fmt %d l2v@%u | l2v %.3f %.3f %.3f %.3f / "
@@ -636,6 +727,9 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
 
   double t1 = now_ms();
   g_st.t_draws += t1 - t0;
+  g_st.views_shown = g_st.last_views;
+  g_st.views_placed_shown = g_st.last_views_placed;
+  g_st.last_views = g_st.last_views_placed = 0;
   // BLAS builds (one scratch region per build in this batch, one barrier after all of them).
   std::vector<std::pair<Blas*, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO>> pre;
   uint64_t scratch_total = 0;
@@ -1097,7 +1191,34 @@ void run_frame(ID3D12CommandQueue* q) {
   g_st.cpu_n++;
 }
 
+GrowBuf g_spot_cb[kSlots];
+uint64_t g_spot_frame = ~0ull;
+uint64_t g_spot_cb_va = 0;
+std::atomic<float> g_spot_bias{0.03f}, g_spot_radius{0.04f}, g_spot_rays{4}, g_spot_clear{0.35f};
+
 }  // namespace
+
+bool scene_spot_ready() { return g_on.load(std::memory_order_relaxed) && g_tlas_va && g_last_update == present_frame(); }
+
+// Game thread, at a swapped spotlight draw (after the kick: the TLAS of this update is built).
+bool scene_spot_bind(uint64_t* tlas, uint64_t* cb) {
+  if (!scene_spot_ready()) return false;
+  uint64_t f = present_frame();
+  if (f != g_spot_frame) {
+    int slot = int((g_submits + kSlots - 1) % kSlots);  // the slot of this update's submission
+    if (!g_spot_cb[slot].ensure(256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ) ||
+        !g_spot_cb[slot].cpu)
+      return false;
+    float c[8] = {float(g_anchor[0]), float(g_anchor[1]), float(g_anchor[2]), float(0x0f), g_spot_bias, g_spot_radius,
+                  g_spot_rays, g_spot_clear};
+    memcpy(g_spot_cb[slot].cpu, c, sizeof c);
+    g_spot_cb_va = g_spot_cb[slot].va();
+    g_spot_frame = f;
+  }
+  *tlas = g_tlas_va;
+  *cb = g_spot_cb_va;
+  return true;
+}
 
 // ---- census.cpp / rt.cpp callbacks --------------------------------------------------------------
 
@@ -1208,7 +1329,7 @@ std::string scene_status() {
            "\"last\":{\"draws_gbuffer\":%u,\"draws_shadow\":%u,\"instances\":%u,\"inst_gbuffer\":%u,\"inst_shadow_only\":%u,"
            "\"duplicates\":%u,\"tris_gbuffer\":%llu,\"tris_shadow_only\":%llu,\"blas_waiting\":%u,\"builds\":%u,"
            "\"refits\":%u,\"tlas_mb\":%.2f,\"per_update_geometries\":%u,\"per_update_tris\":%llu,"
-           "\"per_update_tris_alpha\":%llu,\"per_update_mb\":%.2f,\"per_update_dropped\":%llu,\"per_update_clamped\":%llu},\"cpu_ms_mean\":%.3f,\"ao_copies\":%llu,\"ao_copy_miss\":%llu,"
+           "\"per_update_tris_alpha\":%llu,\"per_update_mb\":%.2f,\"per_update_dropped\":%llu,\"per_update_clamped\":%llu,\"shadow_views\":%u,\"shadow_views_placed\":%u},\"cpu_ms_mean\":%.3f,\"ao_copies\":%llu,\"ao_copy_miss\":%llu,"
            "\"cpu_ms\":{\"instances\":%.3f,\"builds_tlas\":%.3f},\"skip_upload\":%llu,\"sun\":{\"frames\":%llu,\"dir\":[%.4f,%.4f,%.4f],\"copies\":%llu,\"copy_miss\":%llu},"
            "\"capture\":%s,\"trace\":%s}",
            g_on ? "true" : "false", scene_capture_on() ? "true" : "false", (unsigned long long)g_st.frames,
@@ -1223,7 +1344,7 @@ std::string scene_status() {
            (unsigned long long)g_st.last_tris_s, g_st.last_pending_blas, g_st.last_builds, g_st.last_refits,
            g_tlas.size / 1048576.0, g_st.last_dyn_geos, (unsigned long long)g_st.dyn_tris_shown,
            (unsigned long long)g_st.dyn_tris_a_shown, (g_dyn_as[0].size + g_dyn_as[1].size) / 1048576.0,
-           (unsigned long long)g_st.dyn_dropped, (unsigned long long)g_st.dyn_clamped, g_st.cpu_n ? g_st.cpu_ms_sum / double(g_st.cpu_n) : 0.0,
+           (unsigned long long)g_st.dyn_dropped, (unsigned long long)g_st.dyn_clamped, g_st.views_shown, g_st.views_placed_shown, g_st.cpu_n ? g_st.cpu_ms_sum / double(g_st.cpu_n) : 0.0,
            (unsigned long long)g_ao_copies.load(), (unsigned long long)g_ao_copy_miss.load(),
            g_st.cpu_n ? g_st.t_draws / double(g_st.cpu_n) : 0.0, g_st.cpu_n ? g_st.t_build / double(g_st.cpu_n) : 0.0,
            (unsigned long long)g_st.skip_upload, (unsigned long long)g_sun_frames, g_sun_world[0], g_sun_world[1], g_sun_world[2],

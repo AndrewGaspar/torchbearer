@@ -4,6 +4,7 @@
 // fields it reads, at their offsets), t0..t5 / s0..s5 as the original's.
 //
 //   TB_SHADOW_PCF  the original 10-tap Vogel-disk PCF on the shadow atlas (to verify the port)
+//   TB_SHADOW_NONE unshadowed (debugging the port)
 //   TB_SHADOW_RQ   inline ray queries (DXR 1.1, ps_6_5) against the mod's TLAS towards the light
 //                  (t0 space9) instead of the atlas; constants b0 space9
 //
@@ -108,6 +109,8 @@ float4 main(float4 pos : SV_Position, float3 ray : TEXCOORD0) : SV_Target {
   col *= g_sLightProjectionMapTex.Sample(g_sLightProjectionMap, luv).xyz;
 #ifdef TB_SHADOW_RQ
   float sh = shadow_rq(vp, N, pos.xy);
+#elif defined(TB_SHADOW_NONE)
+  float sh = 1;
 #else
   float sh = shadow_pcf(vp, pos.xy);
 #endif

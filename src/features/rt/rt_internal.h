@@ -19,7 +19,8 @@ std::string dxr_test(ID3D12Device* dev);  // BLAS/TLAS, ray query, RT pipeline, 
 // census.cpp: D3D12 capture. Device-level hooks (resources, views, pipeline states) go in when the
 // device is created (dev.rt_capture = 1 at launch) or, later, from the swapchain's device; command
 // list / queue hooks on first use. Every hook is a pass-through unless a census is running.
-void capture_early(bool full);             // hook D3D12CreateDevice (call from start); full: census too
+// Hook D3D12CreateDevice (call from start); full: census too; spot: [dev] rt_spot (census.cpp).
+void capture_early(bool full, int spot = 0);
 void capture_device(ID3D12Device* dev);    // install the device hooks (idempotent)
 bool capture_lists();                      // install command-list / queue hooks (idempotent)
 bool capture_on();                         // device hooks present
@@ -71,6 +72,7 @@ struct DrawRec {
 // Arm or disarm the capture (needs the device hooks from launch and the list hooks).
 bool scene_capture(bool on);
 bool scene_capture_on();
+void spot_enable(bool on);  // [dev] rt_spot_on: the spotlight swap live on/off
 // CPU pointer to `n` bytes at a GPU VA in an upload-heap buffer (mapped on first use), or nullptr.
 const void* cpu_at(uint64_t va, size_t n);
 // The buffer holding a GPU VA: resource, its VA and size, heap type, flags. False if unknown.
@@ -88,6 +90,10 @@ void scene_after_exec(ID3D12CommandQueue* q, unsigned n, ID3D12CommandList* cons
 void scene_invalidate(uint64_t va, uint64_t size);
 // scene.cpp, called by rt.cpp's engine markers (game thread).
 void scene_mark(int pass, int phase, void* obj);
+// The flashlight prototype ([dev] rt_spot = 2): whether this frame has a TLAS, and the root
+// arguments (TLAS VA, constants VA) to set before a swapped spotlight draw.
+bool scene_spot_ready();
+bool scene_spot_bind(uint64_t* tlas, uint64_t* cb);
 
 // rt.cpp: an engine pool render target by name (pShadowRT, pLinearDepthRT, ...), or nullptr.
 ID3D12Resource* pool_resource(const char* name);

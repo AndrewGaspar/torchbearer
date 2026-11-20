@@ -29,6 +29,7 @@
 #include "core/log.h"
 #include "features/rt/dxc.h"
 #include "features/rt/rt_internal.h"
+#include "features/rt/shaders/spotlight_dxil.h"
 
 namespace tb::rt {
 namespace {
@@ -128,6 +129,7 @@ PtrTable<PsoInfo, 16384> g_psoinfo;
 
 struct ListSt {
   PsoInfo* pso = nullptr;
+  ID3D12PipelineState* raw_pso = nullptr;  // for the spot swap (rt_spot)
   uint64_t cbv[32] = {};
   D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
   D3D12_INDEX_BUFFER_VIEW ib = {};
@@ -541,8 +543,59 @@ CreateHeap_t o_heap;
 CreatePlaced_t o_placed;
 CreateView_t o_rtv, o_dsv;
 
+// ---- shadowed spot light (flashlight) shader swap, [dev] rt_spot (prototype) -------------------
+// 1: the game's spotlightPS (aa17e58e1bd8d853, DeferredLight) replaced at pipeline creation by its
+//    HLSL port (shaders/spotlight.hlsl, the same PCF: verifies the port and the swap);
+// 2: the port with inline ray queries towards the light instead of the shadow atlas. Its TLAS and
+//    constants need two root parameters the game's root signatures don't have: every root
+//    signature the game creates gets them appended (t0 and b0 in space 9, pixel shader), and they
+//    are set right before each draw with a swapped pipeline (scene_spot_bind, scene.cpp).
+constexpr uint64_t kSpotPs = 0xaa17e58e1bd8d853ull;
+std::atomic<int> g_spot{0};
+std::atomic<bool> g_spot_on{true};
+std::unordered_map<ID3D12RootSignature*, int> g_rs_extra;          // root signature -> first extra param
+std::unordered_map<ID3D12PipelineState*, ID3D12PipelineState*> g_spot_pso;  // swapped -> original
+std::unordered_map<ID3D12PipelineState*, int> g_spot_base;        // swapped -> extra param index
+std::atomic<uint64_t> g_spot_swaps{0}, g_spot_draws{0}, g_spot_fallback{0};
+
 HRESULT STDMETHODCALLTYPE hk_gfx(ID3D12Device* d, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid, void** out) {
   HRESULT hr = o_gfx(d, desc, iid, out);
+  if (SUCCEEDED(hr) && out && *out && desc && g_spot.load() && desc->PS.pShaderBytecode &&
+      fnv(desc->PS.pShaderBytecode, desc->PS.BytecodeLength) == kSpotPs) {
+    int mode = g_spot.load(), base = -1;
+    {
+      std::lock_guard lk(g_mu);
+      auto it = g_rs_extra.find(desc->pRootSignature);
+      if (it != g_rs_extra.end()) base = it->second;
+    }
+    if (mode != 2 || base >= 0) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC d2 = *desc;
+      d2.PS.pShaderBytecode = mode == 2 ? kSpotRqDxil : mode == 3 ? kSpotNoneDxil : kSpotPcfDxil;
+      d2.PS.BytecodeLength = mode == 2 ? sizeof kSpotRqDxil : mode == 3 ? sizeof kSpotNoneDxil : sizeof kSpotPcfDxil;
+      static std::vector<uint8_t> rt_ps;  // mode 4: the PCF port compiled by the game's DXC 1.4
+      if (mode == 4) {
+        std::string err;
+        std::string src = std::string("#define TB_SHADOW_PCF 1\n") + kSpotHlsl;
+        if (rt_ps.empty() && !dxc_compile(src.c_str(), L"main", L"ps_6_0", rt_ps, err))
+          TB_LOG("rt spot: in-process compile failed: %s", err.c_str());
+        d2.PS.pShaderBytecode = rt_ps.data();
+        d2.PS.BytecodeLength = rt_ps.size();
+      }
+      ID3D12PipelineState* sw = nullptr;
+      HRESULT h2 = o_gfx(d, &d2, iid, (void**)&sw);
+      if (SUCCEEDED(h2) && sw) {
+        std::lock_guard lk(g_mu);
+        g_spot_pso[sw] = static_cast<ID3D12PipelineState*>(*out);  // keeps the original alive (fallback)
+        g_spot_base[sw] = base;
+        *out = sw;
+        g_spot_swaps++;
+        TB_LOG("rt spot: spotlightPS swapped (%s), pipeline %p (original %p)", mode == 2 ? "ray query" : "PCF port",
+               (void*)sw, (void*)g_spot_pso[sw]);
+      } else {
+        TB_LOG("rt spot: the swapped pipeline failed (hr %#lx)", (unsigned long)h2);
+      }
+    }
+  }
   if (SUCCEEDED(hr) && out && *out && desc) {
     auto hash = [](const D3D12_SHADER_BYTECODE& b) {
       return b.pShaderBytecode ? fnv(b.pShaderBytecode, b.BytecodeLength) : 0ull;
@@ -559,7 +612,64 @@ HRESULT STDMETHODCALLTYPE hk_gfx(ID3D12Device* d, const D3D12_GRAPHICS_PIPELINE_
 
 using CreateRS_t = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
 CreateRS_t o_rs;
+
+using SerializeVRS_t = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+using CreateVDeser_t = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
+
+// The game's root signature with the two parameters appended, or an empty vector.
+std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
+  HMODULE m = GetModuleHandleW(L"d3d12.dll");
+  auto deser = m ? reinterpret_cast<CreateVDeser_t>(GetProcAddress(m, "D3D12CreateVersionedRootSignatureDeserializer")) : nullptr;
+  auto ser = m ? reinterpret_cast<SerializeVRS_t>(GetProcAddress(m, "D3D12SerializeVersionedRootSignature")) : nullptr;
+  std::vector<uint8_t> out;
+  if (!deser || !ser) return out;
+  ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
+  if (FAILED(deser(blob, n, __uuidof(ID3D12VersionedRootSignatureDeserializer), (void**)&ds)) || !ds) return out;
+  const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
+  if (SUCCEEDED(ds->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &vd)) && vd) {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC d = *vd;
+    std::vector<D3D12_ROOT_PARAMETER1> ps(d.Desc_1_1.pParameters, d.Desc_1_1.pParameters + d.Desc_1_1.NumParameters);
+    *base = int(ps.size());
+    D3D12_ROOT_PARAMETER1 a{}, b{};
+    a.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    a.Descriptor.ShaderRegister = 0;
+    a.Descriptor.RegisterSpace = 9;
+    a.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    a.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    b = a;
+    b.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    ps.push_back(a);
+    ps.push_back(b);
+    d.Desc_1_1.NumParameters = UINT(ps.size());
+    d.Desc_1_1.pParameters = ps.data();
+    ID3DBlob *o = nullptr, *e = nullptr;
+    if (SUCCEEDED(ser(&d, &o, &e)) && o) {
+      auto* p = static_cast<const uint8_t*>(o->GetBufferPointer());
+      out.assign(p, p + o->GetBufferSize());
+    }
+    if (o) o->Release();
+    if (e) e->Release();
+  }
+  ds->Release();
+  return out;
+}
+
 HRESULT STDMETHODCALLTYPE hk_rs(ID3D12Device* d, UINT mask, const void* blob, SIZE_T n, REFIID iid, void** out) {
+  if (g_spot.load() == 2 && blob) {
+    int base = -1;
+    std::vector<uint8_t> ext = rs_extend(blob, n, &base);
+    if (!ext.empty()) {
+      HRESULT hr = o_rs(d, mask, ext.data(), ext.size(), iid, out);
+      if (SUCCEEDED(hr) && out && *out) {
+        int i = rs_vs_cb0(blob, n);
+        std::lock_guard lk(g_mu);
+        g_rs_cb0[static_cast<ID3D12RootSignature*>(*out)] = i;
+        g_rs_extra[static_cast<ID3D12RootSignature*>(*out)] = base;
+        return hr;
+      }
+      TB_LOG("rt spot: the extended root signature failed (hr %#lx); the game's own instead", (unsigned long)hr);
+    }
+  }
   HRESULT hr = o_rs(d, mask, blob, n, iid, out);
   if (SUCCEEDED(hr) && out && *out && blob) {
     int i = rs_vs_cb0(blob, n);
@@ -847,6 +957,19 @@ HRESULT STDMETHODCALLTYPE hk_close(ID3D12GraphicsCommandList* l) {
 }
 
 void STDMETHODCALLTYPE hk_setPso(ID3D12GraphicsCommandList* l, ID3D12PipelineState* p) {
+  ListSt* sp = g_spot.load() ? list_st(l) : nullptr;
+  if (sp) {
+    sp->raw_pso = p;
+    // Swap off ([dev] rt_spot_on = 0), or no TLAS this frame for the ray-query one: the original
+    // pipeline (shadow atlas).
+    std::lock_guard lk(g_mu);
+    auto it = g_spot_pso.find(p);
+    if (it != g_spot_pso.end() && (!g_spot_on.load() || (g_spot.load() == 2 && !scene_spot_ready()))) {
+      p = it->second;
+      sp->raw_pso = p;
+      g_spot_fallback++;
+    }
+  }
   o_setPso(l, p);
   t_cur = l;
   if (g_scene.load(std::memory_order_relaxed)) list_st(l)->pso = p ? g_psoinfo.find(p) : nullptr;
@@ -865,7 +988,26 @@ void STDMETHODCALLTYPE hk_topo(ID3D12GraphicsCommandList* l, D3D12_PRIMITIVE_TOP
   }
 }
 
+void spot_bind(ID3D12GraphicsCommandList* l) {
+  if (g_spot.load() != 2) return;
+  ListSt* s = g_lists_st.find(l);
+  if (!s || !s->raw_pso) return;
+  int base;
+  {
+    std::lock_guard lk(g_mu);
+    auto it = g_spot_base.find(s->raw_pso);
+    if (it == g_spot_base.end()) return;
+    base = it->second;
+  }
+  uint64_t tlas = 0, cb = 0;
+  if (base < 0 || !scene_spot_bind(&tlas, &cb)) return;
+  o_gSrv(l, UINT(base), tlas);
+  o_gCbv(l, UINT(base + 1), cb);
+  g_spot_draws++;
+}
+
 void STDMETHODCALLTYPE hk_drawI(ID3D12GraphicsCommandList* l, UINT v, UINT i, UINT sv, UINT si) {
+  spot_bind(l);
   o_drawI(l, v, i, sv, si);
   t_cur = l;
   if (g_scene.load(std::memory_order_relaxed)) {
@@ -890,6 +1032,7 @@ void STDMETHODCALLTYPE hk_drawI(ID3D12GraphicsCommandList* l, UINT v, UINT i, UI
 }
 
 void STDMETHODCALLTYPE hk_drawII(ID3D12GraphicsCommandList* l, UINT ic, UINT n, UINT si, INT bv, UINT sinst) {
+  spot_bind(l);
   o_drawII(l, ic, n, si, bv, sinst);
   t_cur = l;
   if (g_scene.load(std::memory_order_relaxed)) scene_draw(l, ic, n, si, bv);
@@ -1202,8 +1345,9 @@ std::string out_dir() {
   return std::string(p.begin(), p.end());
 }
 
-void capture_early(bool full) {
+void capture_early(bool full, int spot) {
   if (full) g_full = true;
+  g_spot = spot;
   HMODULE m = GetModuleHandleW(L"d3d12.dll");
   void* fn = m ? (void*)GetProcAddress(m, "D3D12CreateDevice") : nullptr;
   if (!fn) {
@@ -1401,6 +1545,7 @@ bool scene_capture(bool on) {
   return true;
 }
 bool scene_capture_on() { return g_scene; }
+void spot_enable(bool on) { g_spot_on = on; }
 
 const void* cpu_at(uint64_t va, size_t n) {
   std::lock_guard lk(g_mu);
@@ -1454,12 +1599,14 @@ std::string scene_capture_status() {
   snprintf(b, sizeof b,
            "{\"on\":%s,\"draws_seen\":%llu,\"draws_kept\":%llu,\"skipped_instanced\":%llu,\"skipped_topology\":%llu,"
            "\"skipped_reflection_pending\":%llu,\"pso_reflected\":%llu,\"pso_rejected\":%llu,\"no_binding\":%llu,"
-           "\"out_of_range\":%llu,\"non_indexed\":%llu}",
+           "\"out_of_range\":%llu,\"non_indexed\":%llu,\"spot_swaps\":%llu,\"spot_draws\":%llu,"
+           "\"spot_fallback\":%llu}",
            g_scene ? "true" : "false", (unsigned long long)g_draws_seen.load(), (unsigned long long)g_draws_kept.load(),
            (unsigned long long)g_draws_inst.load(), (unsigned long long)g_draws_topo.load(),
            (unsigned long long)g_draws_pending.load(), (unsigned long long)g_refl_ok.load(),
            (unsigned long long)g_refl_rej.load(), (unsigned long long)g_draws_nobind.load(),
-           (unsigned long long)g_draws_range.load(), (unsigned long long)g_draws_nonidx.load());
+           (unsigned long long)g_draws_range.load(), (unsigned long long)g_draws_nonidx.load(), (unsigned long long)g_spot_swaps.load(),
+           (unsigned long long)g_spot_draws.load(), (unsigned long long)g_spot_fallback.load());
   return b;
 }
 

@@ -584,6 +584,7 @@ void register_feature() {
   lab_verb("rt", verb);
   cfg_listen("dev.", [](const std::string& id, const std::string& v) {
     if (id.rfind("dev.rtao_", 0) == 0 || id.rfind("dev.rt_sun", 0) == 0) trace_config(id, v);
+    if (id == "dev.rt_spot_on") spot_enable(v != "0");
   });
   present_on([](IDXGISwapChain* sc, uint64_t) {
     g_sc = sc;
@@ -599,7 +600,9 @@ void start() {
   // created): for the census ([dev] rt_capture) and for the ray-traced passes ([graphics] ao =
   // rtao, or [dev] rt_scene = 1 for the lab verbs). Otherwise nothing is hooked.
   bool full = cfg_bool("dev.rt_capture", false);
-  if (full || cfg_str("graphics.ao") == "rtao" || cfg_bool("dev.rt_scene", false)) capture_early(full);
+  int spot = int(cfg_num("dev.rt_spot", 0));
+  if (full || cfg_str("graphics.ao") == "rtao" || cfg_bool("dev.rt_scene", false) || spot)
+    capture_early(full, spot);
 }
 
 }  // namespace tb::rt
