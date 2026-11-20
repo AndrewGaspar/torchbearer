@@ -14,8 +14,9 @@
 //  - all of it, and the ray passes (trace.cpp), go into one list of ours submitted right after
 //    the kick on the game's queue, so in GPU order it runs after the G-buffer and before the
 //    lighting.
-// Alpha-tested draws (PS discard or alpha-to-coverage) are kept, opaque, in their own instance
-// mask bits so a pass can include or exclude them (no any-hit alpha yet).
+// Alpha-tested draws (PS discard or alpha-to-coverage) are kept in their own instance mask bits
+// so a pass can include or exclude them; their geometry is non-opaque and tested against its own
+// texture by the ray passes (the alpha buffer and UV gather below; shaders/alpha.hlsli).
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
@@ -238,15 +239,17 @@ struct Key {
   uint64_t vb, ib;
   uint32_t stride, vcount, icount;
   uint8_t ifmt, vfmt;
+  bool alpha = false;  // non-opaque geometry (the flag is baked into the BLAS: keyed apart)
   bool operator==(const Key& o) const {
     return vb == o.vb && ib == o.ib && stride == o.stride && vcount == o.vcount && icount == o.icount &&
-           ifmt == o.ifmt && vfmt == o.vfmt;
+           ifmt == o.ifmt && vfmt == o.vfmt && alpha == o.alpha;
   }
 };
 struct KeyHash {
   size_t operator()(const Key& k) const {
     uint64_t h = k.vb * 0x9e3779b97f4a7c15ull ^ (k.ib + 0x632be59bd9b4e019ull) * 0xbf58476d1ce4e5b9ull;
-    h ^= (uint64_t(k.stride) << 40) ^ (uint64_t(k.vcount) << 20) ^ k.icount ^ (uint64_t(k.ifmt) << 56);
+    h ^= (uint64_t(k.stride) << 40) ^ (uint64_t(k.vcount) << 20) ^ k.icount ^ (uint64_t(k.ifmt) << 56) ^
+         (k.alpha ? 0x100000001b3ull : 0);
     return size_t(h ^ (h >> 31));
   }
 };
@@ -285,6 +288,30 @@ uint64_t g_last_update = ~0ull;
 double g_anchor[3] = {};
 uint64_t g_tlas_va = 0;
 uint32_t g_tlas_instances = 0;
+
+// The alpha path and instance motion of the current update (EyeInputs; shared by both eyes).
+GrowBuf g_alpha_buf[kSlots];   // records + gathered UVs (default heap)
+unsigned g_alpha_st[kSlots] = {};  // its tracked state per slot (0 = as created, UAV)
+GrowBuf g_alpha_up[kSlots];    // records + gather jobs + groups (upload)
+GrowBuf g_motion_buf[kSlots];  // per TLAS instance: previous * inverse(current), 3x4 (upload)
+uint64_t g_alpha_va = 0, g_motion_va = 0;
+int g_alpha_slot = -1;
+struct PrevX {
+  float x[12];
+  double anchor[3];
+};
+std::unordered_map<uint64_t, PrevX> g_prev_x;  // last update's instance transforms, by identity
+struct AlphaStats {
+  uint32_t records = 0, jobs = 0, tex = 0, bufs = 0, fallback = 0;
+  uint64_t uv_bytes = 0;
+} g_ast;
+// One TLAS instance of an update, for the alpha records and the motion buffer.
+struct Blas;
+struct InstMeta {
+  Blas* b = nullptr;  // null: a per-update BLAS instance (identity motion)
+  float x[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+  uint32_t geo0 = 0, ngeo = 0;  // its geometries in the update's geo_src (record geo0 + g)
+};
 
 struct Stats {
   uint64_t frames = 0, builds = 0, build_tris = 0, refits = 0, compactions = 0, evictions = 0, invalidated = 0;
@@ -444,7 +471,7 @@ void evict(uint64_t frame) {
 D3D12_RAYTRACING_GEOMETRY_DESC geo_of(const Blas& b) {
   D3D12_RAYTRACING_GEOMETRY_DESC g{};
   g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-  g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+  g.Flags = b.key.alpha ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE : D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
   g.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;  // also for R32G32B32A32 (xyz read, stride)
   g.Triangles.VertexCount = b.key.vcount;
   g.Triangles.VertexBuffer.StartAddress = b.key.vb;
@@ -478,6 +505,213 @@ double now_ms() {
   LARGE_INTEGER t;
   QueryPerformanceCounter(&t);
   return double(t.QuadPart) * 1000.0 / double(f.QuadPart);
+}
+
+// The update's alpha buffer and instance motion (after the TLAS, same list): per geometry a
+// record (alpha.hlsli), the alpha textures copied into the trace heap's slot region, raw views
+// of the game's vertex / index / constant buffers for the UV gather (cs_gather), and per TLAS
+// instance previous * inverse(current) for the temporal reprojection (cs_temporal). Instances
+// are matched across updates by (BLAS, occurrence); the per-update BLAS instances keep identity
+// motion (their transforms are per geometry). Unresolved geometries keep an opaque record.
+void build_alpha(ID3D12GraphicsCommandList4* l, int slot, const std::vector<InstMeta>& meta,
+                 const std::vector<DrawRec>& geos) {
+  g_alpha_va = 0;
+  g_motion_va = 0;
+  g_alpha_slot = -1;
+  g_ast = {};
+  const uint32_t nrec = uint32_t(geos.size()), ninst = uint32_t(meta.size());
+  g_ast.records = nrec;
+  // Motion.
+  std::unordered_map<uint64_t, PrevX> next;
+  next.reserve(ninst * 2 + 16);
+  if (ninst && g_motion_buf[slot].ensure(uint64_t(ninst) * 48, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                         D3D12_RESOURCE_STATE_GENERIC_READ) &&
+      g_motion_buf[slot].cpu) {
+    float* out = static_cast<float*>(g_motion_buf[slot].cpu);
+    std::unordered_map<Blas*, int> occ;
+    for (uint32_t i = 0; i < ninst; i++) {
+      const InstMeta& m = meta[i];
+      float* o = out + size_t(i) * 12;
+      static const float kI[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+      memcpy(o, kI, sizeof kI);
+      if (!m.b) continue;
+      uint64_t key = (uint64_t(uintptr_t(m.b)) << 6) ^ uint64_t(occ[m.b]++) ^ 0x9e3779b97f4a7c15ull;
+      PrevX px;
+      memcpy(px.x, m.x, sizeof px.x);
+      memcpy(px.anchor, g_anchor, sizeof px.anchor);
+      next.emplace(key, px);
+      auto it = g_prev_x.find(key);
+      if (it == g_prev_x.end()) continue;
+      const float* c = m.x;
+      const float* p = it->second.x;
+      double a[9] = {c[0], c[1], c[2], c[4], c[5], c[6], c[8], c[9], c[10]};
+      double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) +
+                   a[2] * (a[3] * a[7] - a[4] * a[6]);
+      if (!(std::fabs(det) > 1e-12)) continue;
+      double ia[9] = {(a[4] * a[8] - a[5] * a[7]) / det,  (a[2] * a[7] - a[1] * a[8]) / det,
+                      (a[1] * a[5] - a[2] * a[4]) / det,  (a[5] * a[6] - a[3] * a[8]) / det,
+                      (a[0] * a[8] - a[2] * a[6]) / det,  (a[2] * a[3] - a[0] * a[5]) / det,
+                      (a[3] * a[7] - a[4] * a[6]) / det,  (a[1] * a[6] - a[0] * a[7]) / det,
+                      (a[0] * a[4] - a[1] * a[3]) / det};
+      double tc[3] = {c[3], c[7], c[11]}, tp[3] = {p[3], p[7], p[11]};
+      // M = prev * inverse(current), points in this update's anchor-relative world:
+      // R = R_prev R_cur^-1, t = -R_prev (R_cur^-1 t_cur) + t_prev + (anchor_prev - anchor).
+      double it3[3] = {ia[0] * tc[0] + ia[1] * tc[1] + ia[2] * tc[2],
+                       ia[3] * tc[0] + ia[4] * tc[1] + ia[5] * tc[2],
+                       ia[6] * tc[0] + ia[7] * tc[1] + ia[8] * tc[2]};
+      for (int r = 0; r < 3; r++) {
+        for (int cc = 0; cc < 3; cc++)
+          o[r * 4 + cc] = float(p[r * 4] * ia[cc] + p[r * 4 + 1] * ia[3 + cc] + p[r * 4 + 2] * ia[6 + cc]);
+        o[r * 4 + 3] = float(-(p[r * 4] * it3[0] + p[r * 4 + 1] * it3[1] + p[r * 4 + 2] * it3[2]) + tp[r] +
+                             (it->second.anchor[r] - g_anchor[r]));
+      }
+    }
+    g_motion_va = g_motion_buf[slot].va();
+  }
+  g_prev_x.swap(next);
+  if (!nrec) return;
+  // Alpha records and gather jobs.
+  uint64_t tex_cpu = 0, buf_cpu = 0;
+  unsigned inc = 0;
+  if (!trace_alpha_heap(slot, &tex_cpu, &buf_cpu, &inc) || !inc) return;
+  struct Job {
+    uint32_t v[16];
+  };
+  std::vector<Job> jobs;
+  std::vector<std::pair<uint32_t, uint32_t>> groups;
+  std::vector<uint32_t> rec(size_t(nrec) * 4);
+  for (uint32_t i = 0; i < nrec; i++) rec[size_t(i) * 4] = ~0u;  // opaque
+  const uint32_t rec_bytes = nrec * 16, uv_base = (rec_bytes + 255) & ~255u;
+  uint32_t uv_cur = uv_base;
+  std::unordered_map<uint64_t, int> texmap;  // (resource, view) -> index in the mod's heap region
+  struct BufSlot {
+    int idx;
+    uint64_t base;
+  };
+  std::unordered_map<ID3D12Resource*, BufSlot> bufmap;
+  auto buf_slot = [&](uint64_t va, uint64_t* base) -> int {
+    ID3D12Resource* res = nullptr;
+    uint64_t b = 0, sz = 0;
+    if (!buf_at(va, &res, &b, &sz, nullptr, nullptr) || !res) return -1;
+    *base = b;
+    auto it = bufmap.find(res);
+    if (it != bufmap.end()) return it->second.idx;
+    int idx = -1;
+    // The gather reads the buffer as an SRV in compute, in whatever state the game's barriers
+    // left it (the BLAS builds above already read the same buffers the same way, after the
+    // list's opening UAV barrier; never transition the game's resources here).
+    if (int(bufmap.size()) < kGatherBufs) {
+      idx = int(bufmap.size());
+      D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+      d.Format = DXGI_FORMAT_R32_TYPELESS;
+      d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      d.Buffer.NumElements = UINT(sz / 4);
+      d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+      D3D12_CPU_DESCRIPTOR_HANDLE h{size_t(buf_cpu + uint64_t(idx) * inc)};
+      g_dev->CreateShaderResourceView(res, &d, h);
+    }
+    bufmap.emplace(res, BufSlot{idx, b});
+    return idx;
+  };
+  for (uint32_t g = 0; g < nrec; g++) {
+    const DrawRec& d = geos[g];
+    uint32_t tris = d.icount / 3;
+    if (!d.uv_mode || d.alpha_idx < 0 || !d.alpha_res || !tris) continue;
+    uint64_t ib_base = 0, vb_base = 0, cb_base = 0;
+    int ib_s = buf_slot(d.ib, &ib_base), vb_s = buf_slot(d.uv_vb, &vb_base);
+    int cb_s = d.uv_mode == 3 ? buf_slot(d.cb, &cb_base) : 0;
+    int tex_i = -1;
+    uint64_t tkey = (uint64_t(uintptr_t(d.alpha_res)) * 0x9e3779b97f4a7c15ull) ^ d.alpha_fmt ^
+                    (uint64_t(d.alpha_mip0) << 20) ^ (uint64_t(d.alpha_mips) << 36);
+    auto ti = texmap.find(tkey);
+    if (ti != texmap.end()) {
+      tex_i = ti->second;
+    } else if (int(texmap.size()) < kAlphaTex) {
+      tex_i = int(texmap.size());
+      D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
+      vd.Format = DXGI_FORMAT(d.alpha_fmt);
+      vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      vd.Texture2D.MostDetailedMip = d.alpha_mip0;
+      vd.Texture2D.MipLevels = d.alpha_mips == 0xffff ? ~0u : d.alpha_mips;
+      D3D12_CPU_DESCRIPTOR_HANDLE dst{size_t(tex_cpu + uint64_t(tex_i) * inc)};
+      g_dev->CreateShaderResourceView(d.alpha_res, &vd, dst);
+      texmap.emplace(tkey, tex_i);
+    }
+    if (ib_s < 0 || vb_s < 0 || cb_s < 0 || tex_i < 0 || d.ib - ib_base > 0xffffffffull ||
+        d.uv_vb - vb_base > 0xffffffffull) {
+      g_ast.fallback++;
+      static std::atomic<int> flogged{0};
+      if (flogged.fetch_add(1, std::memory_order_relaxed) < 6)
+        TB_LOG("rt scene: alpha job skipped mode %d ib %d vb %d cb %d tex %d (ib %#llx vb %#llx)", d.uv_mode, ib_s, vb_s,
+               cb_s, tex_i, (unsigned long long)d.ib, (unsigned long long)d.uv_vb);
+      continue;
+    }
+    uint32_t job_i = uint32_t(jobs.size());
+    Job j{};
+    j.v[0] = uint32_t(ib_s);
+    j.v[1] = uint32_t(d.ib - ib_base);
+    j.v[2] = tris;
+    j.v[3] = uv_cur;
+    j.v[4] = uint32_t(vb_s);
+    j.v[5] = uint32_t(d.uv_vb - vb_base);
+    j.v[6] = d.uv_stride;
+    j.v[7] = uint32_t(d.uv_mode) | (uint32_t(d.uv_fmt_a) << 8) | (uint32_t(d.uv_fmt_b) << 16) |
+             (uint32_t(d.uv_comp_a) << 24);
+    j.v[8] = uint32_t(d.uv_off_a) | (uint32_t(d.uv_off_b) << 16);
+    memcpy(&j.v[9], &d.uv_scale, 4);
+    j.v[10] = uint32_t(cb_s);
+    j.v[11] = d.uv_mode == 3 ? uint32_t(d.cb - cb_base) + d.atlas_off : 0;
+    j.v[12] = d.atlas_rows;
+    j.v[13] = d.ifmt == 42 ? 4 : 2;
+    jobs.push_back(j);
+    for (uint32_t t0 = 0; t0 < tris; t0 += 64) groups.emplace_back(job_i, t0);
+    rec[size_t(g) * 4 + 0] = uv_cur;
+    rec[size_t(g) * 4 + 1] = uint32_t(tex_i);
+    rec[size_t(g) * 4 + 2] = uint32_t(d.alpha_idx);
+    memcpy(&rec[size_t(g) * 4 + 3], &d.alpha_thresh, 4);
+    uv_cur += tris * 24;
+  }
+  g_ast.jobs = uint32_t(jobs.size());
+  g_ast.tex = uint32_t(texmap.size());
+  g_ast.bufs = uint32_t(bufmap.size());
+  g_ast.uv_bytes = uv_cur > uv_base ? uv_cur - uv_base : 0;
+  if (jobs.empty()) return;
+  const uint64_t jobs_bytes = jobs.size() * 64, groups_bytes = groups.size() * 8;
+  if (!g_alpha_up[slot].ensure(rec_bytes + jobs_bytes + groups_bytes, D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ) ||
+      !g_alpha_up[slot].cpu)
+    return;
+  auto* up = static_cast<uint8_t*>(g_alpha_up[slot].cpu);
+  memcpy(up, rec.data(), rec_bytes);
+  memcpy(up + rec_bytes, jobs.data(), jobs_bytes);
+  memcpy(up + rec_bytes + jobs_bytes, groups.data(), groups_bytes);
+  ID3D12Resource* old_r = g_alpha_buf[slot].r;
+  if (!g_alpha_buf[slot].ensure(uv_cur, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    return;
+  if (g_alpha_buf[slot].r != old_r) g_alpha_st[slot] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  auto trans = [&](unsigned to) {
+    if (g_alpha_st[slot] == to) return;
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = g_alpha_buf[slot].r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATES(g_alpha_st[slot]);
+    b.Transition.StateAfter = D3D12_RESOURCE_STATES(to);
+    l->ResourceBarrier(1, &b);
+    g_alpha_st[slot] = to;
+  };
+  trans(D3D12_RESOURCE_STATE_COPY_DEST);
+  l->CopyBufferRegion(g_alpha_buf[slot].r, 0, g_alpha_up[slot].r, 0, rec_bytes);
+  trans(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  trace_gather(l, slot, g_alpha_up[slot].va() + rec_bytes, uint32_t(jobs_bytes), uint32_t(groups.size()),
+               g_alpha_buf[slot].va());
+  trace_mark(l, slot, 7);
+  trans(D3D12_RESOURCE_STATE_GENERIC_READ);
+  g_alpha_va = g_alpha_buf[slot].va();
+  g_alpha_slot = slot;
 }
 
 // One update's acceleration structures: BLAS builds/refits/compactions, then the TLAS.
@@ -514,6 +748,13 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
   // Instances.
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> inst;
   inst.reserve(draws.size());
+  // Per instance, for the alpha records and the motion buffer: its geometries' draws (in
+  // geometry order: one for a cached BLAS, the per-update BLAS's draws for dyn), its transform
+  // and its identity across updates (the BLAS and its occurrence among that BLAS's instances).
+  std::vector<InstMeta> meta;
+  std::vector<DrawRec> geo_src;
+  meta.reserve(draws.size());
+  geo_src.reserve(draws.size());
   std::unordered_set<uint64_t> seen, at_xform;
   std::vector<Blas*> to_build, to_refit;
   uint64_t budget = uint64_t(g_build_budget_tris.load());
@@ -639,7 +880,7 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
         dup++;
         continue;
       }
-      Key k{d.vb, d.ib, d.stride, d.vcount, d.icount, d.ifmt, d.vfmt};
+      Key k{d.vb, d.ib, d.stride, d.vcount, d.icount, d.ifmt, d.vfmt, (d.flags & DF_ALPHA) != 0};
       auto it = g_blas.find(k);
       Blas* b;
       if (it == g_blas.end() && g_upload_vb.count(d.vb_view)) {
@@ -716,9 +957,18 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
       memcpy(id.Transform, x, sizeof x);
       bool alpha = d.flags & DF_ALPHA;
       id.InstanceMask = pass == 0 ? (alpha ? 2 : 1) : (alpha ? 8 : 4);
-      id.InstanceID = uint32_t(inst.size()) & 0xffffff;
+      id.InstanceID = 0;  // patched below: the instance's first alpha record
       id.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
       inst.push_back(id);
+      {
+        InstMeta m;
+        m.b = b;
+        memcpy(m.x, x, sizeof x);
+        m.geo0 = uint32_t(geo_src.size());
+        m.ngeo = 1;
+        meta.push_back(m);
+        geo_src.push_back(d);
+      }
       inst.back().AccelerationStructure = uint64_t(uintptr_t(b));  // patched to the address below
       (pass ? ns : ng)++;
       (pass ? tris_s : tris_g) += tris;
@@ -847,6 +1097,7 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
       std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geo;
       uint64_t sizes[2] = {}, scratch[2] = {};
       std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geos[2];
+      std::vector<DrawRec> dyn_src[2];  // geos[k]'s draws, same order (the alpha records)
       for (int k = 0; k < 2; k++) {
         for (auto& g : g_dyn[k]) {
           // Keep the build inside the buffers: the vertex count to the vertex buffer's end, and
@@ -870,7 +1121,7 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
           memcpy(static_cast<uint8_t*>(g_xf[slot].cpu) + xi * 48, g.x, 48);
           D3D12_RAYTRACING_GEOMETRY_DESC gd{};
           gd.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-          gd.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+          gd.Flags = k ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE : D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
           gd.Triangles.Transform3x4 = g_xf[slot].va() + xi * 48;
           gd.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
           gd.Triangles.VertexCount = g.d.vcount;
@@ -880,6 +1131,7 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
           gd.Triangles.IndexCount = g.d.icount;
           gd.Triangles.IndexBuffer = g.d.ib;
           geos[k].push_back(gd);
+          dyn_src[k].push_back(g.d);
           xi++;
           (k ? g_st.last_dyn_tris_a : g_st.last_dyn_tris) += g.d.icount / 3;
         }
@@ -914,10 +1166,17 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
         D3D12_RAYTRACING_INSTANCE_DESC id{};
         id.Transform[0][0] = id.Transform[1][1] = id.Transform[2][2] = 1;
         id.InstanceMask = k ? 2 : 1;
-        id.InstanceID = uint32_t(inst.size()) & 0xffffff;
+        id.InstanceID = 0;  // patched below: the instance's first alpha record
         id.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         id.AccelerationStructure = ~0ull;  // marker: the address is final
         inst.push_back(id);
+        {
+          InstMeta m;
+          m.geo0 = uint32_t(geo_src.size());
+          m.ngeo = uint32_t(dyn_src[k].size());
+          meta.push_back(m);
+          geo_src.insert(geo_src.end(), dyn_src[k].begin(), dyn_src[k].end());
+        }
         inst.back().AccelerationStructure = g_dyn_as[k].va() | 1ull << 63;
       }
       if (ok) uav_barrier(l);
@@ -927,21 +1186,38 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
     g_dyn[1].clear();
   }
 
-  // Instance addresses (BLAS not built or failed: dropped), then the TLAS.
-  size_t w = 0;
-  for (auto& id : inst) {
-    uint64_t va;
-    if (id.AccelerationStructure >> 63) {
-      va = id.AccelerationStructure & ~(1ull << 63);
-    } else {
-      Blas* b = reinterpret_cast<Blas*>(uintptr_t(id.AccelerationStructure));
-      va = b->va();
+  // Instance addresses (BLAS not built or failed: dropped), then the TLAS. InstanceID becomes
+  // the instance's first alpha record (CandidateInstanceID + geometry index, alpha.hlsli).
+  {
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> kept;
+    std::vector<InstMeta> kept_meta;
+    std::vector<DrawRec> kept_geo;
+    kept.reserve(inst.size());
+    kept_meta.reserve(inst.size());
+    kept_geo.reserve(geo_src.size());
+    for (size_t i = 0; i < inst.size(); i++) {
+      auto id = inst[i];
+      uint64_t va;
+      if (id.AccelerationStructure >> 63) {
+        va = id.AccelerationStructure & ~(1ull << 63);
+      } else {
+        Blas* b = reinterpret_cast<Blas*>(uintptr_t(id.AccelerationStructure));
+        va = b->va();
+      }
+      if (!va) continue;
+      id.AccelerationStructure = va;
+      id.InstanceID = uint32_t(kept_geo.size()) & 0xffffff;
+      InstMeta m = meta[i];
+      uint32_t g0 = uint32_t(kept_geo.size());
+      for (uint32_t g = 0; g < m.ngeo; g++) kept_geo.push_back(geo_src[size_t(m.geo0) + g]);
+      m.geo0 = g0;
+      kept.push_back(id);
+      kept_meta.push_back(m);
     }
-    if (!va) continue;
-    id.AccelerationStructure = va;
-    inst[w++] = id;
+    inst.swap(kept);
+    meta.swap(kept_meta);
+    geo_src.swap(kept_geo);
   }
-  inst.resize(w);
   g_tlas_va = 0;
   g_tlas_instances = uint32_t(inst.size());
   if (!inst.empty() &&
@@ -969,6 +1245,14 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
       uav_barrier(l);
       g_tlas_va = g_tlas.va();
     }
+  }
+  if (g_tlas_va) {
+    build_alpha(l, slot, meta, geo_src);
+  } else {
+    g_alpha_va = 0;
+    g_motion_va = 0;
+    g_alpha_slot = -1;
+    g_prev_x.clear();
   }
   g_st.t_build += now_ms() - t1;
   g_st.last_draws_g = dg;
@@ -1048,7 +1332,7 @@ void mul4(const double* a, const double* b, double* o) {
 // vectors: right, up, forward, position; docs/stereo.md section 1), as the eye renders it; the
 // (jittered) projection g_mViewToClip from the G-buffer draw's constants (rows 8-11, which the
 // G-buffer VS reads, so they are written). Everything else derived in doubles.
-bool read_camera(uint64_t cb, Camera& c, double* v2w_out) {
+bool read_camera(uint64_t cb, Camera& c, double* v2w_out, double* w2c_out) {
   void* view = stereo::main_view();
   MEMORY_BASIC_INFORMATION mi;
   if (!view || !VirtualQuery(static_cast<uint8_t*>(view) + 0x248, &mi, sizeof mi) || mi.State != MEM_COMMIT) return false;
@@ -1089,6 +1373,7 @@ bool read_camera(uint64_t cb, Camera& c, double* v2w_out) {
   f(w2c, c.w2c);
   f(c2w, c.c2w);
   for (int i = 0; i < 12; i++) v2w_out[i] = v2w[i];
+  if (w2c_out) memcpy(w2c_out, w2c, sizeof w2c);  // absolute world -> clip, for history reprojection
   if (g_dump.load() > 0) {
     auto m = [](const char* n, const float* f) {
       TB_LOG("rt dump cam %s: %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f", n, f[0],
@@ -1132,7 +1417,7 @@ void run_frame(ID3D12CommandQueue* q) {
       break;
     }
   double v2w[12];
-  if (!first || !read_camera(first->cb, in.cam, v2w)) {
+  if (!first || !read_camera(first->cb, in.cam, v2w, in.w2c)) {
     g_st.skipped_nocam++;
     return;
   }
@@ -1172,6 +1457,9 @@ void run_frame(ID3D12CommandQueue* q) {
   in.normal_state = gpu_state(in.normal);
   in.tlas = g_tlas_va;
   in.frame = frame;
+  in.alpha = g_alpha_va;
+  in.alpha_slot = g_alpha_slot;
+  in.motion = g_motion_va;
   trace_record(g_list, in, slot);
   if (FAILED(g_list->Close())) {
     TB_LOG("rt scene: our command list failed to close; ray-traced passes off");
@@ -1195,13 +1483,15 @@ GrowBuf g_spot_cb[kSlots];
 uint64_t g_spot_frame = ~0ull;
 uint64_t g_spot_cb_va = 0;
 std::atomic<float> g_spot_bias{0.03f}, g_spot_radius{0.04f}, g_spot_rays{4}, g_spot_clear{0.35f};
+std::atomic<float> g_spot_maxdist{3.0f}, g_spot_mincos{0.5f};
+std::atomic<int> g_spot_all{0};
 
 }  // namespace
 
 bool scene_spot_ready() { return g_on.load(std::memory_order_relaxed) && g_tlas_va && g_last_update == present_frame(); }
 
 // Game thread, at a swapped spotlight draw (after the kick: the TLAS of this update is built).
-bool scene_spot_bind(uint64_t* tlas, uint64_t* cb) {
+bool scene_spot_bind(uint64_t* tlas, uint64_t* cb, uint64_t* alpha) {
   if (!scene_spot_ready()) return false;
   uint64_t f = present_frame();
   if (f != g_spot_frame) {
@@ -1209,15 +1499,29 @@ bool scene_spot_bind(uint64_t* tlas, uint64_t* cb) {
     if (!g_spot_cb[slot].ensure(256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ) ||
         !g_spot_cb[slot].cpu)
       return false;
-    float c[8] = {float(g_anchor[0]), float(g_anchor[1]), float(g_anchor[2]), float(0x0f), g_spot_bias, g_spot_radius,
-                  g_spot_rays, g_spot_clear};
+    float c[12] = {float(g_anchor[0]), float(g_anchor[1]), float(g_anchor[2]), float(0x0f), g_spot_bias, g_spot_radius,
+                   g_spot_rays, g_spot_clear, g_alpha_va ? 1.0f : 0.0f, g_spot_maxdist, g_spot_mincos,
+                   float(g_spot_all.load())};
     memcpy(g_spot_cb[slot].cpu, c, sizeof c);
     g_spot_cb_va = g_spot_cb[slot].va();
     g_spot_frame = f;
   }
   *tlas = g_tlas_va;
   *cb = g_spot_cb_va;
+  *alpha = g_alpha_va ? g_alpha_va : g_tlas_va;  // unread while tb_q.x is 0, but never null
   return true;
+}
+
+void scene_spot_config(const std::string& id, const std::string& v) {
+  double x = atof(v.c_str());
+  if (id == "dev.rt_spot_bias" && !v.empty()) g_spot_bias = float(x);
+  else if (id == "dev.rt_spot_radius" && !v.empty()) g_spot_radius = float(x);
+  else if (id == "dev.rt_spot_rays" && !v.empty()) g_spot_rays = float(x);
+  else if (id == "dev.rt_spot_clear" && !v.empty()) g_spot_clear = float(x);
+  else if (id == "dev.rt_spot_maxdist" && !v.empty()) g_spot_maxdist = float(x);
+  else if (id == "dev.rt_spot_mincos" && !v.empty()) g_spot_mincos = float(x);
+  else if (id == "dev.rt_spot_all" && !v.empty()) g_spot_all = x != 0 ? 1 : 0;
+  g_spot_frame = ~0ull;  // rewrite the constants at the next swapped draw
 }
 
 // ---- census.cpp / rt.cpp callbacks --------------------------------------------------------------
@@ -1319,7 +1623,7 @@ std::string scene_status() {
     if (b->dynamic) dyn++;
     tris += b->tris;
   }
-  char buf[3072];
+  char buf[8192];
   snprintf(buf, sizeof buf,
            "{\"on\":%s,\"capture\":%s,\"frames\":%llu,\"skipped_busy\":%llu,\"skipped_nocam\":%llu,\"cam_proj_from_cb\":%llu,"
            "\"blas\":{\"entries\":%llu,\"with_as\":%llu,\"dynamic\":%llu,\"tris\":%llu,\"rejected\":%llu,\"rejected_unknown\":%llu,\"rejected_upload\":%llu,\"rejected_range\":%llu,"
@@ -1331,6 +1635,7 @@ std::string scene_status() {
            "\"refits\":%u,\"tlas_mb\":%.2f,\"per_update_geometries\":%u,\"per_update_tris\":%llu,"
            "\"per_update_tris_alpha\":%llu,\"per_update_mb\":%.2f,\"per_update_dropped\":%llu,\"per_update_clamped\":%llu,\"shadow_views\":%u,\"shadow_views_placed\":%u},\"cpu_ms_mean\":%.3f,\"ao_copies\":%llu,\"ao_copy_miss\":%llu,"
            "\"cpu_ms\":{\"instances\":%.3f,\"builds_tlas\":%.3f},\"skip_upload\":%llu,\"sun\":{\"frames\":%llu,\"dir\":[%.4f,%.4f,%.4f],\"copies\":%llu,\"copy_miss\":%llu},"
+           "\"alpha\":{\"records\":%u,\"jobs\":%u,\"tex\":%u,\"bufs\":%u,\"fallback\":%u,\"uv_mb\":%.2f},"
            "\"capture\":%s,\"trace\":%s}",
            g_on ? "true" : "false", scene_capture_on() ? "true" : "false", (unsigned long long)g_st.frames,
            (unsigned long long)g_st.skipped_busy, (unsigned long long)g_st.skipped_nocam, (unsigned long long)g_st.cam_proj_cb, (unsigned long long)blas_n,
@@ -1349,6 +1654,7 @@ std::string scene_status() {
            g_st.cpu_n ? g_st.t_draws / double(g_st.cpu_n) : 0.0, g_st.cpu_n ? g_st.t_build / double(g_st.cpu_n) : 0.0,
            (unsigned long long)g_st.skip_upload, (unsigned long long)g_sun_frames, g_sun_world[0], g_sun_world[1], g_sun_world[2],
            (unsigned long long)g_sun_copies.load(), (unsigned long long)g_sun_copy_miss.load(),
+           g_ast.records, g_ast.jobs, g_ast.tex, g_ast.bufs, g_ast.fallback, g_ast.uv_bytes / 1048576.0,
            scene_capture_status().c_str(), trace_status().c_str());
   return buf;
 }

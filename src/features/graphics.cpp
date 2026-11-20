@@ -44,16 +44,17 @@ bool sig_ok(const Branch (&br)[2]) {
   return true;
 }
 
+void write1(const Branch& b, uint16_t v) {
+  auto* p = reinterpret_cast<uint16_t*>(game_image().at(b.jz));
+  if (*p == v) return;
+  DWORD old;
+  VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old);
+  __atomic_store_n(p, v, __ATOMIC_SEQ_CST);  // one store: never a half-patched jz
+  VirtualProtect(p, 2, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), p, 2);
+}
 void write(const Branch (&br)[2], uint16_t v) {
-  for (auto& b : br) {
-    auto* p = reinterpret_cast<uint16_t*>(game_image().at(b.jz));
-    if (*p == v) continue;
-    DWORD old;
-    VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old);
-    __atomic_store_n(p, v, __ATOMIC_SEQ_CST);  // one store: never a half-patched jz
-    VirtualProtect(p, 2, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 2);
-  }
+  for (auto& b : br) write1(b, v);
 }
 
 bool g_ok_ssao = false, g_ok_hbao = false;
@@ -66,7 +67,8 @@ int ao_mode() {
 }
 // Wanted branch modes (-1 game, 1 run, 0 skip), applied on the game thread at present.
 std::atomic<int> g_dev_ssao{-2}, g_dev_hbao{-2};  // dev overrides from rt flag (-2: none)
-int g_have_ssao = -1, g_have_hbao = -1;
+std::atomic<bool> g_flash_cfg{false};             // [graphics] flashlight_shadows = rt
+int g_have_ssao = -1, g_have_hbao = -1, g_have_hbao_r = -1;  // HBAO: apply state, render state
 
 uint16_t code(int mode) { return mode < 0 ? kJz : mode ? kNops : kJmp; }
 
@@ -77,6 +79,10 @@ void on_present(IDXGISwapChain*, uint64_t) {
   static int last_mode = -1;  // on changes only: `rt scene on/off` (lab) may switch it meanwhile
   if (mode != last_mode) rt::set_rtao(mode == 2);
   last_mode = mode;
+  static int last_flash = -1;
+  int flash = g_flash_cfg.load() ? 1 : 0;
+  if (flash != last_flash) rt::set_flashlight_rt(flash != 0);
+  last_flash = flash;
   int ws = g_dev_ssao.load() != -2 ? g_dev_ssao.load() : (mode == 1 ? 1 : -1);
   if (g_ok_ssao && ws != g_have_ssao) {
     write(kSsao, code(ws));
@@ -84,12 +90,21 @@ void on_present(IDXGISwapChain*, uint64_t) {
     TB_LOG("graphics: SSAO branch %s", ws < 0 ? "the game's" : ws ? "forced on" : "forced off");
   }
   // HBAO's apply overwrites the shadow buffer's AO channel after SSAO's (measured), so SSAO only
-  // shows with HBAO skipped: the option replaces one with the other.
-  int wh = g_dev_hbao.load() != -2 ? g_dev_hbao.load() : (mode == 1 ? 0 : -1);
+  // shows with HBAO skipped: the option replaces one with the other. With RTAO both branches
+  // stay the game's: the apply is the delivery path, and skipping only the render starves it
+  // (its source buffer is the render's pick; live: every AO copy missed with the render off).
+  int devh = g_dev_hbao.load();
+  int wh = devh != -2 ? devh : (mode == 1 ? 0 : -1);   // apply (kHbao[1])
+  int whr = devh != -2 ? devh : (mode == 1 ? 0 : -1);  // render (kHbao[0])
   if (g_ok_hbao && wh != g_have_hbao) {
-    write(kHbao, code(wh));
+    write1(kHbao[1], code(wh));
     g_have_hbao = wh;
-    TB_LOG("graphics: HBAO branch %s", wh < 0 ? "the game's" : wh ? "forced on" : "forced off");
+    TB_LOG("graphics: HBAO apply branch %s", wh < 0 ? "the game's" : wh ? "forced on" : "forced off");
+  }
+  if (g_ok_hbao && whr != g_have_hbao_r) {
+    write1(kHbao[0], code(whr));
+    g_have_hbao_r = whr;
+    TB_LOG("graphics: HBAO render branch %s", whr < 0 ? "the game's" : whr ? "forced on" : "forced off");
   }
 }
 
@@ -101,6 +116,11 @@ void graphics_register() {
     if (id == "graphics.ao") {
       g_ao_cfg = v == "game" ? 0 : v == "ssao" ? 1 : v == "rtao" ? 2 : -1;
       if (!v.empty() && g_ao_cfg.load() < 0) TB_LOG("graphics: unknown ao = %s (game, ssao or rtao)", v.c_str());
+    }
+    if (id == "graphics.flashlight_shadows") {
+      g_flash_cfg = v == "rt";
+      if (!v.empty() && v != "game" && v != "rt")
+        TB_LOG("graphics: unknown flashlight_shadows = %s (game or rt)", v.c_str());
     }
   });
 }

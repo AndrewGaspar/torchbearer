@@ -114,6 +114,12 @@ struct PtrTable {
   }
 };
 
+// One input-layout element the alpha UV gather may read (TEXCOORD0/1, COLOR0).
+struct UvElem {
+  uint8_t slot = 0xff, fmt = 0;
+  uint16_t off = 0;
+};
+
 // A graphics pipeline state the scene capture may record draws of.
 struct PsoInfo {
   uint8_t cls = DC_NONE;
@@ -124,13 +130,43 @@ struct PsoInfo {
   uint8_t flags = 0;
   int8_t cb_root = -1;  // root parameter of the VS's b0 (space 0)
   uint64_t vs = 0, ps = 0;
+  UvElem el_tc0, el_tc1, el_col0;
+  ID3D12RootSignature* rs = nullptr;
+  // Alpha path (DrawRec), resolved by reflection before ready = 1; uv_mode 0 = opaque for rays.
+  uint8_t uv_mode = 0;
+  int8_t tex_root = -1;    // root parameter (descriptor table) of the alpha texture
+  uint16_t tex_off = 0;    // its descriptor offset from the table's start
+  float alpha_thresh = 0.5f;
+  uint32_t atlas_off = 0;  // mode 3: byte offset of the atlas table in $Globals
+  uint8_t atlas_rows = 0;
 };
 PtrTable<PsoInfo, 16384> g_psoinfo;
+
+// A shader-resource view the game created (or copied): CPU handle -> texture and view parameters.
+// The alpha path resolves a draw's descriptor through it at record time. A plain map (the game's
+// bindless heap alone has 264192 slots, more than a fixed open-addressing table should hold).
+struct SrvInfo {
+  ID3D12Resource* res = nullptr;
+  uint16_t fmt = 0, mip0 = 0, mips = 0;
+  uint8_t dim = 0;  // D3D12_SRV_DIMENSION
+};
+std::mutex g_srv_mu;
+std::unordered_map<SIZE_T, SrvInfo> g_srvinfo;
+bool srv_lookup(SIZE_T h, SrvInfo& out) {
+  std::lock_guard lk(g_srv_mu);
+  auto it = g_srvinfo.find(h);
+  if (it == g_srvinfo.end()) return false;
+  out = it->second;
+  return true;
+}
 
 struct ListSt {
   PsoInfo* pso = nullptr;
   ID3D12PipelineState* raw_pso = nullptr;  // for the spot swap (rt_spot)
   uint64_t cbv[32] = {};
+  uint64_t tab[32] = {};  // SetGraphicsRootDescriptorTable handles (GPU ptrs)
+  uint64_t heap_cpu0 = 0, heap_gpu0 = 0;  // the bound CBV/SRV/UAV heap's starts
+  uint32_t heap_num = 0;
   D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
   D3D12_INDEX_BUFFER_VIEW ib = {};
   int topo = 0;
@@ -144,6 +180,20 @@ std::mutex g_lists_mu;  // creating ListSt entries
 std::atomic<bool> g_scene{false};
 std::atomic<bool> g_full{false};  // dev census bookkeeping (rt_capture) as well as the scene's
 std::unordered_map<ID3D12RootSignature*, int> g_rs_cb0;     // root signature -> VS b0 | PS b0 << 8
+// Root signature descriptor tables (for the alpha texture's root parameter): per parameter, its
+// SRV ranges (base register, space, count, offset from the table's start). Other parameters keep
+// an empty range list. Parsed in hk_rs with the versioned deserializer.
+struct RsRange {
+  uint32_t reg, space, num, off, vis;  // vis: the parameter's D3D12_SHADER_VISIBILITY
+};
+std::unordered_map<ID3D12RootSignature*, std::vector<std::vector<RsRange>>> g_rs_tabs;
+struct HeapEnds {
+  uint64_t cpu0, gpu0;
+  uint32_t num;
+};
+std::unordered_map<ID3D12DescriptorHeap*, HeapEnds> g_dheaps;  // shader-visible CBV/SRV/UAV heaps
+UINT g_srv_inc = 0;
+std::atomic<uint64_t> g_alpha_ok{0}, g_alpha_miss{0};  // alpha draws with / without a texture resolved
 std::unordered_map<ID3D12Resource*, void*> g_mapped;        // upload buffers we mapped
 std::unordered_map<ID3D12Resource*, unsigned> g_gpu_state;  // state in submission order
 std::atomic<uint64_t> g_draws_seen{0}, g_draws_kept{0}, g_draws_inst{0}, g_draws_topo{0}, g_draws_pending{0};
@@ -356,8 +406,20 @@ struct ReflJob {
 std::mutex g_refl_mu;
 std::condition_variable g_refl_cv;
 std::deque<ReflJob> g_refl_q;
-std::unordered_map<uint64_t, int> g_vs_cache;  // vs hash -> l2v offset, or -1 rejected
-std::unordered_map<uint64_t, int> g_ps_cache;  // ps hash -> flags
+struct VsRefl {
+  int l2v = -1;           // g_mLocalToView offset, or -1 rejected
+  bool scale_const = false;  // UVs scaled by 1/4095 (R16G16_SINT texcoords; cs_gather mode 1)
+  int atlas_row = -1;     // grass: first $Globals float4 row of the atlas table (mode 3)
+  int atlas_rows = 0;     // grass: rows per atlas entry
+};
+struct PsRefl {
+  int flags = 0;          // DF_ALPHA, or 0x80 (alpha texture without a test; the A2C rule)
+  int tex_reg = -1;       // shader register of the alpha texture (tN, space 0)
+  float thresh = 0.5f;    // pass where sampled alpha >= thresh
+  bool thresh_ok = false; // a constant threshold was found by the sampled alpha
+};
+std::unordered_map<uint64_t, VsRefl> g_vs_cache;  // vs hash -> reflection
+std::unordered_map<uint64_t, PsRefl> g_ps_cache;  // ps hash -> reflection
 bool g_refl_thread = false;
 
 int find_offset(const std::string& t, const char* var) {
@@ -369,28 +431,166 @@ int find_offset(const std::string& t, const char* var) {
   return -1;
 }
 
-int reflect_vs(const std::vector<uint8_t>& b) {
+VsRefl reflect_vs(const std::vector<uint8_t>& b) {
+  VsRefl r;
   std::string t;
-  if (!dxc_disassemble(b.data(), b.size(), t)) return -1;
+  if (!dxc_disassemble(b.data(), b.size(), t)) return r;
   int l2v = find_offset(t, " g_mLocalToView;");
   int v2w = find_offset(t, " g_mViewToWorld;");
-  if (l2v < 0 || v2w != 64) return -1;
+  if (l2v < 0 || v2w != 64) return r;
   for (size_t p = t.find(" x [3 x <4 x float>]]"); p != std::string::npos; p = t.find(" x [3 x <4 x float>]]", p + 1)) {
     size_t s0 = t.rfind('[', p);
-    if (s0 != std::string::npos && atoi(t.c_str() + s0 + 1) >= 20) return -1;  // bone palette
+    if (s0 != std::string::npos && atoi(t.c_str() + s0 + 1) >= 20) return r;  // bone palette
   }
-  return l2v;
+  r.l2v = l2v;
+  // The alpha UV forms (static: the captured shaders, re/scripts uvtree analysis): texcoords are
+  // R16G16_SINT scaled by this constant (1/4095), or grass cards index an atlas table in
+  // $Globals by int(TEXCOORD0.x * 255 + 0.1), two float4 rows per entry from row 142.
+  r.scale_const = t.find("0x3F30010020000000") != std::string::npos;
+  size_t m255 = t.find("2.550000e+02");
+  if (m255 != std::string::npos) {
+    size_t sh = t.find("shl i32", m255);
+    size_t c1 = sh == std::string::npos ? sh : t.find(", ", sh);
+    int shl = c1 == std::string::npos ? -1 : atoi(t.c_str() + c1 + 2);
+    // Several tables are indexed by the same entry; the UV one (offset.xy, scale.zw in one
+    // float4) is the load whose components 2 and 3 are also extracted (static: row 142, the
+    // row before it feeds only components 0 and 1 elsewhere).
+    for (size_t ad = sh == std::string::npos ? std::string::npos : t.find("add i32", sh); ad != std::string::npos;
+         ad = t.find("add i32", ad + 1)) {
+      size_t ls = t.rfind('\n', ad), eq = t.find(" = ", ls), c2 = t.find(", ", ad);
+      if (eq == std::string::npos || eq > ad || c2 == std::string::npos) continue;
+      std::string var = t.substr(ls + 1, eq - ls - 1);
+      size_t w0 = var.find_first_not_of(" \t");
+      if (w0 != std::string::npos) var = var.substr(w0);
+      std::string load = "cbufferLoadLegacy.f32(i32 59, %dx.types.Handle %\"$Globals_cbuffer\", i32 " + var + ")";
+      size_t lp = t.find(load, ad);
+      if (lp == std::string::npos) continue;
+      size_t ll = t.rfind('\n', lp), leq = t.find(" = ", ll);
+      if (leq == std::string::npos || leq > lp) continue;
+      std::string cv = t.substr(ll + 1, leq - ll - 1);
+      w0 = cv.find_first_not_of(" \t");
+      if (w0 != std::string::npos) cv = cv.substr(w0);
+      if (t.find("extractvalue %dx.types.CBufRet.f32 " + cv + ", 3", lp) == std::string::npos) continue;
+      int base = atoi(t.c_str() + c2 + 2);
+      if (shl >= 0 && shl < 8 && base > 0 && base < 4096) {
+        r.atlas_row = base;
+        r.atlas_rows = 1 << shl;
+      }
+      break;
+    }
+  }
+  return r;
 }
 
-int reflect_ps(const std::vector<uint8_t>& b) {
+// A float literal of the disassembly: decimal, or a hex double bit pattern.
+bool lit_float(const std::string& s, float& out) {
+  if (s.rfind("0x", 0) == 0 && s.size() > 10) {
+    uint64_t bits = strtoull(s.c_str(), nullptr, 16);
+    double d;
+    memcpy(&d, &bits, 8);
+    out = float(d);
+    return true;
+  }
+  char* e = nullptr;
+  double d = strtod(s.c_str(), &e);
+  if (e == s.c_str()) return false;
+  out = float(d);
+  return true;
+}
+
+PsRefl reflect_ps(const std::vector<uint8_t>& b) {
+  PsRefl r;
   std::string t;
-  if (b.empty() || !dxc_disassemble(b.data(), b.size(), t)) return 0;
+  if (b.empty() || !dxc_disassemble(b.data(), b.size(), t)) return r;
   // Alpha-tested: the material's alpha-test texture or a foliage card (grass, branches). Neither
   // `discard` (the standard opaque material discards for its dissolve fade) nor alpha-to-coverage
   // (the terrain uses it) alone is one (static: the captured shaders).
   bool tex = t.find("g_sAlphaTestSampler") != std::string::npos || t.find("g_sFoliageNoiseMap") != std::string::npos;
   bool test = t.find("@dx.op.discard") != std::string::npos;
-  return tex && test ? DF_ALPHA : tex ? 0x80 : 0;
+  r.flags = tex && test ? DF_ALPHA : tex ? 0x80 : 0;
+  if (!tex) return r;
+  // The alpha texture and its register (resource bindings comment), and the threshold: the
+  // sampled alpha (extractvalue 3 of its sample) shifted by a constant (the forms are
+  // alpha - 0.2 in the shadow depth shaders, derivative-scaled alpha - 0.5 in the G-buffer,
+  // alpha - 0.6 for grass; static, the captured shaders). No constant (a $Globals threshold,
+  // one shader) leaves thresh_ok false and the geometry opaque for rays.
+  const char* name = t.find("g_sAlphaTestSamplerTex") != std::string::npos ? "g_sAlphaTestSamplerTex" : "g_sColorMapTex";
+  size_t bp = t.find(std::string("\n; ") + name);
+  if (bp != std::string::npos) {
+    // The bindings line ends "... T0             t0     1": the register token.
+    size_t eol = t.find('\n', bp + 1);
+    for (size_t tp = t.find(" t", bp); tp != std::string::npos && tp < eol; tp = t.find(" t", tp + 1))
+      if (tp + 2 < eol && isdigit(uint8_t(t[tp + 2])) && (tp < 1 || t[tp - 1] != 'x')) {
+        r.tex_reg = atoi(t.c_str() + tp + 2);
+        break;
+      }
+  }
+  std::string handle = std::string("%") + name + "_texture_2d, ";
+  size_t sp = std::string::npos;
+  for (size_t q = t.find(handle); q != std::string::npos; q = t.find(handle, q + 1)) {
+    size_t ls2 = t.rfind('\n', q), le2 = t.find('\n', q);
+    if (t.find("@dx.op.sample", ls2) < le2) {  // not getDimensions and friends
+      sp = q;
+      break;
+    }
+  }
+  if (sp == std::string::npos) return r;
+  size_t ls = t.rfind('\n', sp);
+  size_t eq = t.find(" = ", ls);
+  if (eq == std::string::npos || eq > sp) return r;
+  std::string res = t.substr(ls + 1, eq - ls - 1);
+  size_t ws = res.find_first_not_of(" \t");
+  if (ws != std::string::npos) res = res.substr(ws);
+  std::string ext = "extractvalue %dx.types.ResRet.f32 " + res + ", 3";
+  size_t ep = t.find(ext, sp);
+  if (ep == std::string::npos) return r;
+  size_t el = t.rfind('\n', ep);
+  size_t eeq = t.find(" = ", el);
+  if (eeq == std::string::npos || eeq > ep) return r;
+  std::string av = t.substr(el + 1, eeq - el - 1);
+  ws = av.find_first_not_of(" \t");
+  if (ws != std::string::npos) av = av.substr(ws);
+  std::vector<std::string> chain{av};
+  size_t pos = ep;
+  for (int lines = 0; lines < 60 && !r.thresh_ok; lines++) {
+    size_t nl = t.find('\n', pos);
+    if (nl == std::string::npos) break;
+    std::string line = t.substr(pos, nl - pos);
+    pos = nl + 1;
+    size_t a = line.find(" = f");
+    if (a == std::string::npos) continue;
+    std::string dst = line.substr(0, a);
+    ws = dst.find_first_not_of(" \t");
+    if (ws != std::string::npos) dst = dst.substr(ws);
+    std::string op = line.substr(a + 3, 4);  // fadd / fsub / fmul
+    if (op != "fadd" && op != "fsub" && op != "fmul") continue;
+    size_t cm = line.find(", ", a);
+    if (cm == std::string::npos) continue;
+    std::string x = line.substr(a, cm - a), y = line.substr(cm + 2);
+    size_t sp2 = x.rfind(' ');
+    x = sp2 == std::string::npos ? x : x.substr(sp2 + 1);
+    size_t ye = y.find_first_of(" \t\n");
+    if (ye != std::string::npos) y = y.substr(0, ye);
+    auto in_chain = [&](const std::string& v) {
+      for (auto& c : chain)
+        if (c == v) return true;
+      return false;
+    };
+    bool xc = in_chain(x), yc = in_chain(y);
+    if (!xc && !yc) continue;
+    const std::string& other = xc ? y : x;
+    float cst;
+    if (lit_float(other, cst)) {
+      if (op == "fmul") continue;              // a scale on the alpha itself: not the shift
+      r.thresh = op == "fadd" ? -cst : cst;    // alpha + c (c < 0), or alpha - c
+      if (r.thresh > -0.25f && r.thresh < 1.25f) r.thresh_ok = true;
+    } else if (op == "fmul" && chain.size() < 4) {
+      chain.push_back(dst);  // derivative scaling before the shift
+    } else {
+      break;  // a cbuffer value (or an unrecognised form): opaque for rays
+    }
+  }
+  return r;
 }
 
 // The sun / moon shadow resolve (0x52cb40, PS 3fd4eb73c302e5b7 at the captured quality): a pixel
@@ -424,24 +624,76 @@ void refl_loop() {
       }
       continue;
     }
+    VsRefl vf;
+    PsRefl pf2;
+    bool have_v = false, have_p = false;
     {
       std::unique_lock lk(g_refl_mu);
       auto a = g_vs_cache.find(j.info->vs);
       auto b = g_ps_cache.find(j.info->ps);
-      l2v = a != g_vs_cache.end() ? a->second : -2;
-      pf = b != g_ps_cache.end() ? b->second : -2;
+      if (a != g_vs_cache.end()) (vf = a->second), have_v = true;
+      if (b != g_ps_cache.end()) (pf2 = b->second), have_p = true;
     }
-    if (l2v == -2) l2v = reflect_vs(j.vs);
-    if (pf == -2) pf = reflect_ps(j.ps);
+    if (!have_v) vf = reflect_vs(j.vs);
+    if (!have_p) pf2 = reflect_ps(j.ps);
     {
       std::unique_lock lk(g_refl_mu);
-      g_vs_cache[j.info->vs] = l2v;
-      g_ps_cache[j.info->ps] = pf;
+      g_vs_cache[j.info->vs] = vf;
+      g_ps_cache[j.info->ps] = pf2;
     }
+    l2v = vf.l2v;
+    pf = pf2.flags;
     if (l2v >= 0) {
       j.info->l2v = uint16_t(l2v);
       j.info->flags |= uint8_t(pf & DF_ALPHA);
       if ((j.info->flags & DF_A2C) && (pf & 0x80)) j.info->flags |= DF_ALPHA;
+      // The alpha path (DrawRec): a recognised UV form for this layout, a constant threshold,
+      // and the alpha texture's root parameter. Anything missing leaves uv_mode 0 (opaque).
+      if ((j.info->flags & DF_ALPHA) && pf2.thresh_ok && pf2.tex_reg >= 0) {
+        int mode = 0;
+        if (j.info->el_tc0.slot != 0xff && j.info->el_tc0.fmt == 38 && vf.scale_const)
+          mode = 1;
+        else if (j.info->el_tc0.slot != 0xff && j.info->el_tc0.fmt == 87 && j.info->el_tc1.slot != 0xff &&
+                 vf.atlas_row >= 0)
+          mode = 3;
+        else if (j.info->el_tc0.slot == 0xff && j.info->el_col0.slot != 0xff)
+          mode = 2;
+        int root = -1;
+        uint16_t off = 0;
+        if (mode && j.info->rs) {
+          // The pixel shader's table (the game's root signature has whole-heap SRV tables for
+          // both stages at t0; the vertex one would name a different sliding window).
+          std::lock_guard lk2(g_mu);
+          auto it = g_rs_tabs.find(j.info->rs);
+          if (it != g_rs_tabs.end())
+            for (uint32_t want : {uint32_t(D3D12_SHADER_VISIBILITY_PIXEL), uint32_t(D3D12_SHADER_VISIBILITY_ALL)}) {
+              for (size_t pi = 0; pi < it->second.size() && root < 0; pi++)
+                for (auto& rg : it->second[pi])
+                  if (rg.vis == want && rg.space == 0 && uint32_t(pf2.tex_reg) >= rg.reg &&
+                      (rg.num == ~0u || uint32_t(pf2.tex_reg) < rg.reg + rg.num)) {
+                    root = int(pi);
+                    off = uint16_t(rg.off + (uint32_t(pf2.tex_reg) - rg.reg));
+                    break;
+                  }
+              if (root >= 0) break;
+            }
+        }
+        if (mode && root >= 0 && root < 32) {
+          j.info->uv_mode = uint8_t(mode);
+          j.info->tex_root = int8_t(root);
+          j.info->tex_off = off;
+          j.info->alpha_thresh = pf2.thresh;
+          if (mode == 3) {
+            j.info->atlas_off = uint32_t(vf.atlas_row) * 16;
+            j.info->atlas_rows = uint8_t(vf.atlas_rows);
+          }
+          static std::atomic<int> logged{0};
+          if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+            TB_LOG("rt capture: alpha path vs %016llx ps %016llx mode %d t%d root %d+%u thresh %.3f",
+                   (unsigned long long)j.info->vs, (unsigned long long)j.info->ps, mode, pf2.tex_reg, root, off,
+                   double(pf2.thresh));
+        }
+      }
       j.info->ready.store(1, std::memory_order_release);
       g_refl_ok++;
     } else {
@@ -493,6 +745,7 @@ void scene_pso(ID3D12PipelineState* p, const D3D12_GRAPHICS_PIPELINE_STATE_DESC&
   info->cls = cls;
   info->vs = vsh;
   info->ps = psh;
+  info->rs = d.pRootSignature;
   if (d.BlendState.AlphaToCoverageEnable) info->flags |= DF_A2C;
   bool pos = false;
   for (UINT i = 0; i < d.InputLayout.NumElements && d.InputLayout.pInputElementDescs; i++) {
@@ -509,6 +762,14 @@ void scene_pso(ID3D12PipelineState* p, const D3D12_GRAPHICS_PIPELINE_STATE_DESC&
     // Pre-skinned vertices (the Skinning pass's output, rewritten every update) keep the bone
     // indices in their layout (docs/raytracing.md section 5).
     if (e.SemanticName && !_stricmp(e.SemanticName, "BLENDINDICES")) info->flags |= DF_SKINNED;
+    // The elements the alpha UV gather reads (per-vertex, explicit offsets).
+    if (e.SemanticName && e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA && e.InputSlot < 8 &&
+        e.AlignedByteOffset != D3D12_APPEND_ALIGNED_ELEMENT) {
+      UvElem el{uint8_t(e.InputSlot), uint8_t(e.Format), uint16_t(e.AlignedByteOffset)};
+      if (!_stricmp(e.SemanticName, "TEXCOORD") && e.SemanticIndex == 0) info->el_tc0 = el;
+      if (!_stricmp(e.SemanticName, "TEXCOORD") && e.SemanticIndex == 1) info->el_tc1 = el;
+      if (!_stricmp(e.SemanticName, "COLOR") && e.SemanticIndex == 0) info->el_col0 = el;
+    }
   }
   {
     std::lock_guard lk(g_mu);
@@ -616,7 +877,10 @@ CreateRS_t o_rs;
 using SerializeVRS_t = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 using CreateVDeser_t = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
 
-// The game's root signature with the two parameters appended, or an empty vector.
+// The game's root signature with the spotlight's parameters appended (spotlight.hlsl: SRV t0
+// space9 TLAS, CBV b0 space9, SRV t1 space9 alpha buffer, a descriptor table over the game's
+// own heap at t0 space10, static sampler s0 space9), or an empty vector. Appended at the end,
+// so every original index keeps its meaning; only installed with the RT flashlight on.
 std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
   HMODULE m = GetModuleHandleW(L"d3d12.dll");
   auto deser = m ? reinterpret_cast<CreateVDeser_t>(GetProcAddress(m, "D3D12CreateVersionedRootSignatureDeserializer")) : nullptr;
@@ -630,7 +894,7 @@ std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC d = *vd;
     std::vector<D3D12_ROOT_PARAMETER1> ps(d.Desc_1_1.pParameters, d.Desc_1_1.pParameters + d.Desc_1_1.NumParameters);
     *base = int(ps.size());
-    D3D12_ROOT_PARAMETER1 a{}, b{};
+    D3D12_ROOT_PARAMETER1 a{}, b{}, c{}, t4{};
     a.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     a.Descriptor.ShaderRegister = 0;
     a.Descriptor.RegisterSpace = 9;
@@ -638,10 +902,32 @@ std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
     a.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     b = a;
     b.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    c = a;
+    c.Descriptor.ShaderRegister = 1;
+    static const D3D12_DESCRIPTOR_RANGE1 kHeapRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, ~0u, 0, 10,
+                                                    D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+    t4.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    t4.DescriptorTable.NumDescriptorRanges = 1;
+    t4.DescriptorTable.pDescriptorRanges = &kHeapRange;
+    t4.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     ps.push_back(a);
     ps.push_back(b);
+    ps.push_back(c);
+    ps.push_back(t4);
     d.Desc_1_1.NumParameters = UINT(ps.size());
     d.Desc_1_1.pParameters = ps.data();
+    std::vector<D3D12_STATIC_SAMPLER_DESC> ss(d.Desc_1_1.pStaticSamplers,
+                                              d.Desc_1_1.pStaticSamplers + d.Desc_1_1.NumStaticSamplers);
+    D3D12_STATIC_SAMPLER_DESC wrap{};
+    wrap.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    wrap.AddressU = wrap.AddressV = wrap.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    wrap.MaxLOD = D3D12_FLOAT32_MAX;
+    wrap.ShaderRegister = 0;
+    wrap.RegisterSpace = 9;
+    wrap.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    ss.push_back(wrap);
+    d.Desc_1_1.NumStaticSamplers = UINT(ss.size());
+    d.Desc_1_1.pStaticSamplers = ss.data();
     ID3DBlob *o = nullptr, *e = nullptr;
     if (SUCCEEDED(ser(&d, &o, &e)) && o) {
       auto* p = static_cast<const uint8_t*>(o->GetBufferPointer());
@@ -649,6 +935,37 @@ std::vector<uint8_t> rs_extend(const void* blob, size_t n, int* base) {
     }
     if (o) o->Release();
     if (e) e->Release();
+  }
+  ds->Release();
+  return out;
+}
+
+// The root signature's descriptor-table SRV ranges, per root parameter (g_rs_tabs).
+std::vector<std::vector<RsRange>> rs_tabs(const void* blob, size_t n) {
+  std::vector<std::vector<RsRange>> out;
+  HMODULE m = GetModuleHandleW(L"d3d12.dll");
+  auto deser = m ? reinterpret_cast<CreateVDeser_t>(GetProcAddress(m, "D3D12CreateVersionedRootSignatureDeserializer")) : nullptr;
+  if (!deser) return out;
+  ID3D12VersionedRootSignatureDeserializer* ds = nullptr;
+  if (FAILED(deser(blob, n, __uuidof(ID3D12VersionedRootSignatureDeserializer), (void**)&ds)) || !ds) return out;
+  const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* vd = nullptr;
+  if (SUCCEEDED(ds->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &vd)) && vd) {
+    out.resize(vd->Desc_1_1.NumParameters);
+    for (UINT i = 0; i < vd->Desc_1_1.NumParameters; i++) {
+      const auto& p = vd->Desc_1_1.pParameters[i];
+      if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+      uint32_t append = 0;
+      for (UINT k = 0; k < p.DescriptorTable.NumDescriptorRanges; k++) {
+        const auto& rg = p.DescriptorTable.pDescriptorRanges[k];
+        uint32_t off = rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                           ? append
+                           : rg.OffsetInDescriptorsFromTableStart;
+        append = off + (rg.NumDescriptors == ~0u ? 0 : rg.NumDescriptors);
+        if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV)
+          out[i].push_back({rg.BaseShaderRegister, rg.RegisterSpace, rg.NumDescriptors, off,
+                            uint32_t(p.ShaderVisibility)});
+      }
+    }
   }
   ds->Release();
   return out;
@@ -662,8 +979,10 @@ HRESULT STDMETHODCALLTYPE hk_rs(ID3D12Device* d, UINT mask, const void* blob, SI
       HRESULT hr = o_rs(d, mask, ext.data(), ext.size(), iid, out);
       if (SUCCEEDED(hr) && out && *out) {
         int i = rs_vs_cb0(blob, n);
+        auto tabs = rs_tabs(blob, n);
         std::lock_guard lk(g_mu);
         g_rs_cb0[static_cast<ID3D12RootSignature*>(*out)] = i;
+        g_rs_tabs[static_cast<ID3D12RootSignature*>(*out)] = std::move(tabs);
         g_rs_extra[static_cast<ID3D12RootSignature*>(*out)] = base;
         return hr;
       }
@@ -673,8 +992,21 @@ HRESULT STDMETHODCALLTYPE hk_rs(ID3D12Device* d, UINT mask, const void* blob, SI
   HRESULT hr = o_rs(d, mask, blob, n, iid, out);
   if (SUCCEEDED(hr) && out && *out && blob) {
     int i = rs_vs_cb0(blob, n);
+    auto tabs = rs_tabs(blob, n);
+    static std::atomic<int> rslogged{0};
+    if (rslogged.fetch_add(1, std::memory_order_relaxed) < 3) {
+      std::string s;
+      for (size_t pi = 0; pi < tabs.size(); pi++)
+        for (auto& rg : tabs[pi]) {
+          char b[96];
+          snprintf(b, sizeof b, " [p%zu t%u s%u n%u +%u]", pi, rg.reg, rg.space, rg.num, rg.off);
+          s += b;
+        }
+      TB_LOG("rt capture: root sig %p params %zu srv ranges:%s", *out, tabs.size(), s.empty() ? " none" : s.c_str());
+    }
     std::lock_guard lk(g_mu);
     g_rs_cb0[static_cast<ID3D12RootSignature*>(*out)] = i;
+    g_rs_tabs[static_cast<ID3D12RootSignature*>(*out)] = std::move(tabs);
   }
   return hr;
 }
@@ -782,6 +1114,65 @@ void STDMETHODCALLTYPE hk_dsv(ID3D12Device* d, ID3D12Resource* r, const void* de
   g_dsv[h.ptr] = View{r, f};
 }
 
+CreateView_t o_srvv;
+using CopyDesc_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, UINT,
+                                            const D3D12_CPU_DESCRIPTOR_HANDLE*, const UINT*, D3D12_DESCRIPTOR_HEAP_TYPE);
+using CopyDescSimple_t = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+CopyDesc_t o_copyDesc;
+CopyDescSimple_t o_copyDescSimple;
+
+void STDMETHODCALLTYPE hk_srvv(ID3D12Device* d, ID3D12Resource* r, const void* desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+  o_srvv(d, r, desc, h);
+  SrvInfo info;
+  info.res = r;
+  const auto* vd = static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(desc);
+  if (vd) {
+    info.fmt = uint16_t(vd->Format);
+    info.dim = uint8_t(vd->ViewDimension);
+    if (vd->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+      info.mip0 = uint16_t(vd->Texture2D.MostDetailedMip);
+      info.mips = uint16_t(vd->Texture2D.MipLevels);
+    }
+  } else if (r) {
+    D3D12_RESOURCE_DESC rd = r->GetDesc();
+    info.fmt = uint16_t(rd.Format);
+    info.dim = uint8_t(D3D12_SRV_DIMENSION_TEXTURE2D);
+    info.mips = rd.MipLevels;
+  }
+  std::lock_guard lk(g_srv_mu);
+  g_srvinfo[h.ptr] = info;
+}
+
+void STDMETHODCALLTYPE hk_copyDescSimple(ID3D12Device* d, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                         D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  o_copyDescSimple(d, n, dst, src, type);
+  if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !g_srv_inc) return;
+  std::lock_guard lk(g_srv_mu);
+  for (UINT i = 0; i < n; i++) {
+    auto it = g_srvinfo.find(src.ptr + SIZE_T(i) * g_srv_inc);
+    if (it != g_srvinfo.end()) g_srvinfo[dst.ptr + SIZE_T(i) * g_srv_inc] = it->second;
+  }
+}
+
+void STDMETHODCALLTYPE hk_copyDesc(ID3D12Device* d, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* dsts, const UINT* dsz,
+                                   UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE* srcs, const UINT* ssz,
+                                   D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  o_copyDesc(d, nd, dsts, dsz, ns, srcs, ssz, type);
+  if (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !g_srv_inc || !dsts || !srcs) return;
+  // Flattened in order (a null size array means one descriptor per range).
+  std::vector<SIZE_T> from, to;
+  for (UINT i = 0; i < ns; i++)
+    for (UINT k = 0, cnt = ssz ? ssz[i] : 1; k < cnt; k++) from.push_back(srcs[i].ptr + SIZE_T(k) * g_srv_inc);
+  for (UINT i = 0; i < nd; i++)
+    for (UINT k = 0, cnt = dsz ? dsz[i] : 1; k < cnt; k++) to.push_back(dsts[i].ptr + SIZE_T(k) * g_srv_inc);
+  std::lock_guard lk(g_srv_mu);
+  for (size_t i = 0; i < from.size() && i < to.size(); i++) {
+    auto it = g_srvinfo.find(from[i]);
+    if (it != g_srvinfo.end()) g_srvinfo[to[i]] = it->second;
+  }
+}
+
 using CreateDevice_t = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 CreateDevice_t o_createDevice;
 HRESULT WINAPI hk_createDevice(IUnknown* a, D3D_FEATURE_LEVEL fl, REFIID iid, void** out) {
@@ -834,6 +1225,7 @@ using CopyTex_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D
 using CopyBuf_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64,
                                            UINT64);
 using Exec_t = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+using SetHeaps_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
 
 Close_t o_close;
 Reset_t o_reset;
@@ -855,6 +1247,7 @@ ClearRT_t o_clearRT;
 Event_t o_beginEvent, o_setMarker;
 EndEvent_t o_endEvent;
 ExecIndirect_t o_execIndirect;
+SetHeaps_t o_setHeaps;
 CopyRes_t o_copyRes;
 CopyTex_t o_copyTex;
 CopyBuf_t o_copyBuf;
@@ -922,6 +1315,59 @@ void scene_draw(ID3D12GraphicsCommandList* l, UINT ic, UINT n, UINT si, INT bv) 
   d.l2v = p->l2v;
   d.cb = cb;
   d.ps = p->ps;
+  // The alpha path (DrawRec): the UV stream this draw's alpha sample reads, and its texture's
+  // descriptor in the heap bound on this list. Anything unresolved leaves uv_mode / alpha_idx
+  // unset and the instance opaque for rays.
+  if ((p->flags & DF_ALPHA) && p->uv_mode) {
+    const UvElem& ea = p->uv_mode == 2 ? p->el_col0 : p->el_tc0;
+    const auto& uvb = s->vb[ea.slot & 7];
+    bool slots_ok = p->uv_mode != 3 || (p->el_tc1.slot == p->el_tc0.slot);
+    if (slots_ok && uvb.BufferLocation && uvb.StrideInBytes &&
+        uint64_t(bv) * uvb.StrideInBytes + ea.off + 4 <= uvb.SizeInBytes) {
+      d.uv_mode = p->uv_mode;
+      d.uv_fmt_a = ea.fmt;
+      d.uv_off_a = ea.off;
+      d.uv_vb = uvb.BufferLocation + uint64_t(bv) * uvb.StrideInBytes;
+      d.uv_stride = uvb.StrideInBytes;
+      d.uv_scale = 0.00024420026f;  // mode 1: the VS's constant (1/4095, static)
+      d.alpha_thresh = p->alpha_thresh;
+      if (p->uv_mode == 3) {
+        d.uv_fmt_b = p->el_tc1.fmt;
+        d.uv_off_b = p->el_tc1.off;
+        d.atlas_off = p->atlas_off;
+        d.atlas_rows = p->atlas_rows;
+      }
+      uint64_t tab = p->tex_root >= 0 ? s->tab[p->tex_root & 31] : 0;
+      bool resolved = false;
+      if (tab && s->heap_gpu0 && tab >= s->heap_gpu0 && g_srv_inc) {
+        uint64_t idx = (tab - s->heap_gpu0) / g_srv_inc + p->tex_off;
+        if (idx < s->heap_num) {
+          d.alpha_idx = int32_t(idx);
+          d.alpha_heap = s->heap_gpu0;
+          SrvInfo si;
+          if (srv_lookup(s->heap_cpu0 + idx * g_srv_inc, si) && si.res &&
+              si.dim == D3D12_SRV_DIMENSION_TEXTURE2D) {
+            d.alpha_res = si.res;
+            d.alpha_fmt = si.fmt;
+            d.alpha_mip0 = si.mip0;
+            d.alpha_mips = si.mips;
+            resolved = true;
+          }
+        }
+      }
+      (resolved ? g_alpha_ok : g_alpha_miss).fetch_add(1, std::memory_order_relaxed);
+      if (resolved) {
+        static std::atomic<int> alogged{0};
+        if (alogged.fetch_add(1, std::memory_order_relaxed) < 12) {
+          D3D12_RESOURCE_DESC rd = d.alpha_res->GetDesc();
+          TB_LOG("rt capture: alpha draw ps %016llx root %d+%u tab %#llx heap %#llx/%u idx %d res %p %llux%u fmt %u/%u",
+                 (unsigned long long)d.ps, p->tex_root, p->tex_off, (unsigned long long)tab,
+                 (unsigned long long)s->heap_gpu0, s->heap_num, d.alpha_idx, (void*)d.alpha_res,
+                 (unsigned long long)rd.Width, rd.Height, unsigned(rd.Format), d.alpha_fmt);
+        }
+      }
+    }
+  }
   if (p->cls == DC_GBUFFER) {
     d.rt0 = s->rt[0];
     d.rt1 = s->rt[1];
@@ -938,6 +1384,9 @@ HRESULT STDMETHODCALLTYPE hk_reset(ID3D12GraphicsCommandList* l, ID3D12CommandAl
     s->trans.clear();
     s->pso = p ? g_psoinfo.find(p) : nullptr;
     s->rt[0] = s->rt[1] = nullptr;
+    memset(s->tab, 0, sizeof s->tab);  // Reset clears the root arguments and bound heaps
+    s->heap_cpu0 = s->heap_gpu0 = 0;
+    s->heap_num = 0;
   }
   if (on()) {
     std::lock_guard lk(g_mu);
@@ -988,6 +1437,36 @@ void STDMETHODCALLTYPE hk_topo(ID3D12GraphicsCommandList* l, D3D12_PRIMITIVE_TOP
   }
 }
 
+void STDMETHODCALLTYPE hk_setHeaps(ID3D12GraphicsCommandList* l, UINT n, ID3D12DescriptorHeap* const* hs) {
+  o_setHeaps(l, n, hs);
+  if (!g_scene.load(std::memory_order_relaxed)) return;
+  ListSt* s = list_st(l);
+  s->heap_cpu0 = s->heap_gpu0 = 0;
+  s->heap_num = 0;
+  for (UINT i = 0; i < n && hs; i++) {
+    ID3D12DescriptorHeap* h = hs[i];
+    if (!h) continue;
+    D3D12_DESCRIPTOR_HEAP_DESC d = h->GetDesc();
+    if (d.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !(d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+      continue;
+    HeapEnds e;
+    {
+      std::lock_guard lk(g_mu);
+      auto it = g_dheaps.find(h);
+      if (it != g_dheaps.end()) {
+        e = it->second;
+      } else {
+        e = {h->GetCPUDescriptorHandleForHeapStart().ptr, h->GetGPUDescriptorHandleForHeapStart().ptr,
+             d.NumDescriptors};
+        g_dheaps[h] = e;
+      }
+    }
+    s->heap_cpu0 = e.cpu0;
+    s->heap_gpu0 = e.gpu0;
+    s->heap_num = e.num;
+  }
+}
+
 void spot_bind(ID3D12GraphicsCommandList* l) {
   if (g_spot.load() != 2) return;
   ListSt* s = g_lists_st.find(l);
@@ -999,10 +1478,15 @@ void spot_bind(ID3D12GraphicsCommandList* l) {
     if (it == g_spot_base.end()) return;
     base = it->second;
   }
-  uint64_t tlas = 0, cb = 0;
-  if (base < 0 || !scene_spot_bind(&tlas, &cb)) return;
+  uint64_t tlas = 0, cb = 0, alpha = 0;
+  if (base < 0 || !scene_spot_bind(&tlas, &cb, &alpha)) return;
   o_gSrv(l, UINT(base), tlas);
   o_gCbv(l, UINT(base + 1), cb);
+  o_gSrv(l, UINT(base + 2), alpha);
+  if (s->heap_gpu0) {
+    D3D12_GPU_DESCRIPTOR_HANDLE h{s->heap_gpu0};  // t0 space10: the game's heap, by heap index
+    o_gTab(l, UINT(base + 3), h);
+  }
   g_spot_draws++;
 }
 
@@ -1095,7 +1579,14 @@ ROOT_HOOK(hk_gUav, o_gUav, uav, D3D12_GPU_VIRTUAL_ADDRESS, "U")
 ROOT_HOOK(hk_cCbv, o_cCbv, cbv, D3D12_GPU_VIRTUAL_ADDRESS, "C")
 ROOT_HOOK(hk_cSrv, o_cSrv, srv, D3D12_GPU_VIRTUAL_ADDRESS, "S")
 ROOT_HOOK(hk_cUav, o_cUav, uav, D3D12_GPU_VIRTUAL_ADDRESS, "U")
-ROOT_HOOK(hk_gTab, o_gTab, tab, D3D12_GPU_DESCRIPTOR_HANDLE, "T")
+void STDMETHODCALLTYPE hk_gTab(ID3D12GraphicsCommandList* l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE v) {
+  o_gTab(l, i, v);
+  if (g_scene.load(std::memory_order_relaxed) && i < 32) list_st(l)->tab[i] = v.ptr;
+  if (on()) {
+    std::lock_guard lk(g_mu);
+    g_counts[l].tab++;
+  }
+}
 ROOT_HOOK(hk_cTab, o_cTab, tab, D3D12_GPU_DESCRIPTOR_HANDLE, "T")
 #undef ROOT_HOOK
 
@@ -1365,6 +1856,9 @@ void capture_device(ID3D12Device* dev) {
   int fails = !hook_slot(dev, 10, (void*)hk_gfx, (void**)&o_gfx, "CreateGraphicsPipelineState");
   fails += !hook_slot(dev, 16, (void*)hk_rs, (void**)&o_rs, "CreateRootSignature");
   fails += !hook_slot(dev, 11, (void*)hk_cs, (void**)&o_cs, "CreateComputePipelineState");
+  fails += !hook_slot(dev, 18, (void*)hk_srvv, (void**)&o_srvv, "CreateShaderResourceView");
+  fails += !hook_slot(dev, 23, (void*)hk_copyDesc, (void**)&o_copyDesc, "CopyDescriptors");
+  fails += !hook_slot(dev, 24, (void*)hk_copyDescSimple, (void**)&o_copyDescSimple, "CopyDescriptorsSimple");
   fails += !hook_slot(dev, 20, (void*)hk_rtv, (void**)&o_rtv, "CreateRenderTargetView");
   fails += !hook_slot(dev, 21, (void*)hk_dsv, (void**)&o_dsv, "CreateDepthStencilView");
   fails += !hook_slot(dev, 27, (void*)hk_committed, (void**)&o_committed, "CreateCommittedResource");
@@ -1377,6 +1871,7 @@ void capture_device(ID3D12Device* dev) {
     d2->Release();
   }
   g_rtv_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  g_srv_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   hook_batch_end();
   bool ok = fails == 0;
   TB_LOG("rt: device %p hooks %s", (void*)dev, ok ? "installed" : "PARTLY FAILED");
@@ -1411,6 +1906,7 @@ bool capture_lists() {
     fails += !hook_slot(l, 20, (void*)hk_topo, (void**)&o_topo, "cl IASetPrimitiveTopology");
     fails += !hook_slot(l, 25, (void*)hk_setPso, (void**)&o_setPso, "cl SetPipelineState");
     fails += !hook_slot(l, 26, (void*)hk_barrier, (void**)&o_barrier, "cl ResourceBarrier");
+    fails += !hook_slot(l, 28, (void*)hk_setHeaps, (void**)&o_setHeaps, "cl SetDescriptorHeaps");
     fails += !hook_slot(l, 31, (void*)hk_cTab, (void**)&o_cTab, "cl SetComputeRootDescriptorTable");
     fails += !hook_slot(l, 32, (void*)hk_gTab, (void**)&o_gTab, "cl SetGraphicsRootDescriptorTable");
     fails += !hook_slot(l, 33, (void*)hk_c32, (void**)&o_c32, "cl SetComputeRoot32BitConstant");
@@ -1595,17 +2091,18 @@ void exec_lists(ID3D12CommandQueue* q, unsigned n, ID3D12CommandList* const* ls)
 }
 
 std::string scene_capture_status() {
-  char b[768];
+  char b[896];
   snprintf(b, sizeof b,
            "{\"on\":%s,\"draws_seen\":%llu,\"draws_kept\":%llu,\"skipped_instanced\":%llu,\"skipped_topology\":%llu,"
            "\"skipped_reflection_pending\":%llu,\"pso_reflected\":%llu,\"pso_rejected\":%llu,\"no_binding\":%llu,"
-           "\"out_of_range\":%llu,\"non_indexed\":%llu,\"spot_swaps\":%llu,\"spot_draws\":%llu,"
+           "\"out_of_range\":%llu,\"non_indexed\":%llu,\"alpha_tex\":%llu,\"alpha_tex_miss\":%llu,\"spot_swaps\":%llu,\"spot_draws\":%llu,"
            "\"spot_fallback\":%llu}",
            g_scene ? "true" : "false", (unsigned long long)g_draws_seen.load(), (unsigned long long)g_draws_kept.load(),
            (unsigned long long)g_draws_inst.load(), (unsigned long long)g_draws_topo.load(),
            (unsigned long long)g_draws_pending.load(), (unsigned long long)g_refl_ok.load(),
            (unsigned long long)g_refl_rej.load(), (unsigned long long)g_draws_nobind.load(),
-           (unsigned long long)g_draws_range.load(), (unsigned long long)g_draws_nonidx.load(), (unsigned long long)g_spot_swaps.load(),
+           (unsigned long long)g_draws_range.load(), (unsigned long long)g_draws_nonidx.load(), (unsigned long long)g_alpha_ok.load(),
+           (unsigned long long)g_alpha_miss.load(), (unsigned long long)g_spot_swaps.load(),
            (unsigned long long)g_spot_draws.load(), (unsigned long long)g_spot_fallback.load());
   return b;
 }

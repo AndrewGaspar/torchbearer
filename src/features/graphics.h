@@ -12,8 +12,11 @@ namespace tb {
 //    restores the game's own branches. Applied between frames.
 //  - [graphics] ao = game, ssao or rtao: the ambient occlusion. game = the remaster's HBAO, ssao =
 //    the above, rtao = ray-traced AO (rt/trace.cpp) written where HBAO's result goes. Set, it
-//    takes precedence over `ssao`; unset (empty), `ssao` decides. rtao needs the D3D12 capture,
-//    installed at launch only when the game starts with ao = rtao.
+//    takes precedence over `ssao`; unset
+//    (empty), `ssao` decides. rtao needs the D3D12 capture, installed at launch only when the
+//    game starts with ao = rtao.
+//  - [graphics] flashlight_shadows = game or rt: ray-traced flashlight shadows (rt/scene.cpp,
+//    shaders/spotlight.hlsl) instead of its shadow-map PCF. Also launch-only (the capture).
 void graphics_register();
 void graphics_start();
 

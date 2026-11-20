@@ -9,7 +9,7 @@
 //   rt gpu on|off|status   GPU time of engine passes (timestamps recorded into the engine's lists)
 //   rt grab NAME WHERE     copy an engine render target at a pass boundary -> <run>/rt-grab-*.raw
 //   rt flag ssao|hbao [0|1]  force the SSAO / HBAO branch of the main pass (code patch, dev)
-//   rt scene on|off|status|validate [MASK] [img]|budget N|casters 0|1|reset
+//   rt scene on|off|status|validate [MASK] [img] [noalpha]|budget N|casters 0|1|reset
 //                          geometry capture, BLAS/TLAS and the ray passes (scene.cpp, trace.cpp)
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include "features/rt/rt.h"
@@ -403,6 +403,7 @@ std::atomic<bool> g_engine_hooked{false};
 // Scene + ray passes, wanted by [graphics] ao = rtao or `rt scene on`; switched at present (game
 // thread): it needs the device (hooks from launch), the list hooks and the engine markers.
 std::atomic<int> g_want_scene{0};
+std::atomic<int> g_want_flash{0};  // [graphics] flashlight_shadows = rt (TLAS without the AO chain)
 int g_have_scene = 0;
 bool g_scene_failed_logged = false;
 
@@ -538,8 +539,12 @@ std::string verb(const std::vector<std::string>& a, bool& ok) {
     }
     if (m == "validate") {
       unsigned mask = a.size() > 2 ? unsigned(strtoul(a[2].c_str(), nullptr, 0)) : 0x0f;
-      bool img = a.size() > 3 && a[3] == "img";
-      trace_validate_arm(mask, img);
+      bool img = false, alpha = true;
+      for (size_t i = 3; i < a.size(); i++) {
+        if (a[i] == "img") img = true;
+        if (a[i] == "noalpha") alpha = false;  // forced-opaque rays: the pre-alpha baseline
+      }
+      trace_validate_arm(mask, img, alpha);
       Sleep(400);  // traced at the next kick, read back kSlots submissions later
       return scene_status();
     }
@@ -558,7 +563,15 @@ ID3D12Resource* pool_resource(const char* name) { return pool_res(name); }
 namespace {
 
 void apply_scene() {
-  int want = g_want_scene.load();
+  // The AO chain runs for ao=rtao (and for lab `rt scene on`), not when the scene is wanted
+  // only for the flashlight's TLAS.
+  static int have_ao = -1;
+  int want_ao = g_want_scene.load() ? 1 : (g_want_flash.load() ? 0 : 1);
+  if (want_ao != have_ao) {
+    trace_config("dev.rtao_ao", want_ao ? "1" : "0");
+    have_ao = want_ao;
+  }
+  int want = (g_want_scene.load() || g_want_flash.load()) ? 1 : 0;
   if (want == g_have_scene) return;
   if (!want) {
     scene_enable(false);
@@ -579,12 +592,14 @@ void apply_scene() {
 
 void set_rtao(bool on) { g_want_scene = on ? 1 : 0; }
 bool rtao_active() { return g_have_scene == 1 && scene_enabled(); }
+void set_flashlight_rt(bool on) { g_want_flash = on ? 1 : 0; }
 
 void register_feature() {
   lab_verb("rt", verb);
   cfg_listen("dev.", [](const std::string& id, const std::string& v) {
-    if (id.rfind("dev.rtao_", 0) == 0 || id.rfind("dev.rt_sun", 0) == 0) trace_config(id, v);
+    if (id.rfind("dev.rtao_", 0) == 0 || id.rfind("dev.rt_sun", 0) == 0 || id == "dev.rt_alpha") trace_config(id, v);
     if (id == "dev.rt_spot_on") spot_enable(v != "0");
+    else if (id.rfind("dev.rt_spot_", 0) == 0) scene_spot_config(id, v);
   });
   present_on([](IDXGISwapChain* sc, uint64_t) {
     g_sc = sc;
@@ -598,10 +613,13 @@ void register_feature() {
 void start() {
   // The D3D12 capture goes in at launch (it tracks resources and pipeline states as they are
   // created): for the census ([dev] rt_capture) and for the ray-traced passes ([graphics] ao =
-  // rtao, or [dev] rt_scene = 1 for the lab verbs). Otherwise nothing is hooked.
+  // rtao, [graphics] flashlight_shadows = rt, or [dev] rt_scene = 1 for the lab verbs).
+  // Otherwise nothing is hooked.
   bool full = cfg_bool("dev.rt_capture", false);
+  bool flash = cfg_str("graphics.flashlight_shadows") == "rt";
   int spot = int(cfg_num("dev.rt_spot", 0));
-  if (full || cfg_str("graphics.ao") == "rtao" || cfg_bool("dev.rt_scene", false) || spot)
+  if (!spot && flash) spot = 2;
+  if (full || cfg_str("graphics.ao") == "rtao" || flash || cfg_bool("dev.rt_scene", false) || spot)
     capture_early(full, spot);
 }
 

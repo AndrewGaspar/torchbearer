@@ -68,6 +68,25 @@ struct DrawRec {
   ID3D12Resource* rt0 = nullptr;  // G-buffer: render targets 0 (device depth) and 1 (normals)
   ID3D12Resource* rt1 = nullptr;
   uint64_t ps = 0;       // pixel shader hash
+  // Alpha-tested draws (DF_ALPHA; shaders/alpha.hlsli, rays.hlsl cs_gather): how the draw's own
+  // shaders compute the alpha sample's UVs, and which texture it samples. uv_mode 0 = not
+  // resolved (the geometry stays opaque for rays); alpha_idx < 0 likewise.
+  uint8_t uv_mode = 0;        // 1 UV = A.xy * scale, 2 UV = A.xy, 3 atlas (grass cards)
+  uint8_t uv_fmt_a = 0, uv_fmt_b = 0, uv_comp_a = 0;
+  uint16_t uv_off_a = 0, uv_off_b = 0;  // attribute byte offsets in the UV stream's vertex
+  uint64_t uv_vb = 0;         // VA of BaseVertexLocation's vertex in the UV stream's buffer view
+  uint32_t uv_stride = 0;
+  float uv_scale = 1.0f;      // mode 1
+  uint32_t atlas_off = 0;     // mode 3: byte offset of the atlas table in $Globals
+  uint8_t atlas_rows = 0;     // mode 3: float4 rows per atlas entry
+  float alpha_thresh = 0.5f;
+  int32_t alpha_idx = -1;     // the alpha SRV's index in the game's bound descriptor heap
+  // The alpha texture itself, resolved at record time (the game rewrites its descriptors per
+  // draw, so a CPU handle copied later would name another draw's texture; live, r60).
+  ID3D12Resource* alpha_res = nullptr;
+  uint16_t alpha_fmt = 0;     // its SRV format and mip range, as the game created the view
+  uint16_t alpha_mip0 = 0, alpha_mips = 0;
+  uint64_t alpha_heap = 0;    // that heap's GPU start (the spotlight binds it as space 10)
 };
 // Arm or disarm the capture (needs the device hooks from launch and the list hooks).
 bool scene_capture(bool on);
@@ -90,10 +109,11 @@ void scene_after_exec(ID3D12CommandQueue* q, unsigned n, ID3D12CommandList* cons
 void scene_invalidate(uint64_t va, uint64_t size);
 // scene.cpp, called by rt.cpp's engine markers (game thread).
 void scene_mark(int pass, int phase, void* obj);
-// The flashlight prototype ([dev] rt_spot = 2): whether this frame has a TLAS, and the root
-// arguments (TLAS VA, constants VA) to set before a swapped spotlight draw.
+// The flashlight ([dev] rt_spot = 2 / flashlight_shadows = rt): whether this frame has a TLAS,
+// and the root arguments (TLAS VA, constants VA, alpha buffer VA) for a swapped spotlight draw.
 bool scene_spot_ready();
-bool scene_spot_bind(uint64_t* tlas, uint64_t* cb);
+bool scene_spot_bind(uint64_t* tlas, uint64_t* cb, uint64_t* alpha);
+void scene_spot_config(const std::string& id, const std::string& value);  // [dev] rt_spot_* tuning
 
 // rt.cpp: an engine pool render target by name (pShadowRT, pLinearDepthRT, ...), or nullptr.
 ID3D12Resource* pool_resource(const char* name);
