@@ -3,11 +3,18 @@
 Written 2026-11-20 ~14:07 MST by Muse (muse-wonder-full-1.0), picking up subagent
 `a05b775f5244f01c0`, which the weekly limit stopped mid-edit at 19:53Z. Delete this file once read.
 
+Release update, 2026-11-20 ~14:42 MST: the user authorized Muse to commit, push, and publish.
+The branch was merged to `master` in `0679d67`, the merged tree was rebuilt and lab-smoked
+(r79), and Quiver Torchbearer **0.6.9 (`vx8mzgd`, mod revision 27) was published and is
+current**. A Git push could not be completed because this repository has **no remotes
+configured** (`git remote -v` is empty); no remote was guessed or added.
+
 ## Where things are
 
-- Worktree: this folder (`.claude/worktrees/agent-a05b775f5244f01c0`), branch
-  `worktree-agent-a05b775f5244f01c0`, clean. Master is untouched at 0.6.8 (`d66c088`). Nothing
-  merged, nothing pushed, **0.6.9 not published** (no `quiver mods ... version add` was run).
+- The work was developed in `.claude/worktrees/agent-a05b775f5244f01c0` on branch
+  `worktree-agent-a05b775f5244f01c0`, then merged to `master` in `0679d67`. The merge and later
+  Muse release commits carry `Co-Authored-By: Muse Wonder Full 1.0`; the earlier branch
+  commits were not rewritten.
 - Commits on this branch (oldest first):
   - `dca0d43` — your subagent's recovered WIP, committed as found (ray-query trace rewrite,
     `rays.hlsl`/`alpha.hlsli`, spotlight bindings in shader only). It built and traced, but the
@@ -21,6 +28,8 @@ Written 2026-11-20 ~14:07 MST by Muse (muse-wonder-full-1.0), picking up subagen
   - `d8f48ba` — `[graphics] flashlight_shadows = game|rt` (restart), AO-chain gating for
     flashlight-only, HBAO branch writes split.
   - `68460d9` — docs sections 13–14 + version 0.6.9.
+  - `ab3dad7`, `41ca286`, `1ca8811` — stereo/ferry measurement notes in the docs.
+  - `0679d67` — annotated merge to `master` for the published 0.6.9 build.
 - Lab: `awr-rt` is **down**, fixture `awr-forest-night` re-installed. Its manifest no longer has
   `VKD3D_CONFIG=single_queue` / `VKD3D_DEBUG=warn` (removed per your brief; everything below ran
   without them). Staged test mods used: `/tmp/tb-wip-rtao` (ao=rtao + dev rt_spot=2),
@@ -76,5 +85,6 @@ Written 2026-11-20 ~14:07 MST by Muse (muse-wonder-full-1.0), picking up subagen
 
 SendMessage the subagent (`a05b775f5244f01c0`) rather than starting a new one, per the limit
 notice — but its context predates all of the above, so point it at this file and the commit list
-first. Suggested next steps, in order: review/merge this branch (watch the usual version-line
-conflict), publish 0.6.9, stereo aimed-spot A/B, ferry bench, then sun/moon placement.
+first. The branch is already merged and 0.6.9 is published/current in Quiver. Suggested next
+steps, in order: configure the intended Git remote and push `master` if desired, run a quiet
+armed dark-scene stereo-spot test, then sun/moon placement.
