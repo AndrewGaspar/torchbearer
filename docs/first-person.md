@@ -18,9 +18,12 @@ reads the third-person camera. Cutscene, free, death and vehicle cameras and scr
 the player camera fall back to the game's camera (and the body comes back). It composes with
 stereo: first person is a camera filter that runs before the stereo eye offset, so `sbs` renders
 both eyes around the first-person eye point (measured depth-dependent disparity). What it is not
-yet: a first-person game (the arms are the third-person animation's: the hands come into view
-when aiming or looking down, not when walking with the flashlight low; aim parallax at close
-range, DOF focus and sound listener still at the third-person camera, head bob only low-passed).
+yet: a first-person game in every respect (aim parallax at close range, DOF focus and sound
+listener still at the third-person camera, head bob only low-passed). Since 0.6.4 (`framing =
+close`, the default, section 10) the arms are re-posed as a viewmodel: the flashlight in the
+left hand at the lower left, the gun in the right hand at the lower right, the beam from the hand
+to the screen centre, and a two-handed sight picture when aiming; `framing = classic` keeps the
+third-person arms of 0.6.3 (they show only when aiming or looking down).
 
 Addresses are RVAs (image base 0x140000000) of `Game_f_x64_EOS.exe` (Epic, 2026-11). "static" =
 read in Ghidra (`re/scripts/Serve.java`), "live" = observed in the lab (instance `awr-fp`,
@@ -35,6 +38,13 @@ read in Ghidra (`re/scripts/Serve.java`), "live" = observed in the lab (instance
 mode = first_person   ; third_person = the game's camera (inert)
 fov = 0               ; horizontal degrees at 16:9 in first person, 0 = the game's (game.fov)
 hide = head           ; head (default: arms, body, held items visible) | all | body | none
+framing = close       ; close (default: viewmodel arms, section 10) | classic (0.6.3's arms)
+hands_forward = 0.34  ; close: resting wrists this far ahead of the eye (m)
+hands_drop = 0.65     ; ... this fraction of the half-height below the centre
+hands_side = 0.40     ; ... this fraction of the half-width out to their side
+hands_sight = 0.60    ; aiming: the gun hand this fraction of the half-height below the centre
+hands_motion = 0.5    ; how much of the animation's own hand motion shows on top of the pose
+hands_sway = 0.06     ; s: the hands trail the view's turns
 anchor = head         ; head (animated) | body (root + eye_height)
 smooth = 0.1          ; s, low-pass on the head's motion relative to the body
 eye_up = 0.05         ; m above the head slot
@@ -52,7 +62,12 @@ for finding pickups to test with), `fp hidetest on|off` (test aid: first person'
 player in third person too), `fp parts [bones]` (the player's render objects, their submeshes with
 material effect and bind-pose height range, and with `bones` the skeleton's bone names),
 `fp mask HEX` (test aid: the body's per-submesh draw mask), `fp give weapons|flashlight` (test aid:
-what the game's Developer Menu cheats do: revolver, flare gun, shotgun; flashlight and batteries).
+what the game's Developer Menu cheats do: revolver, flare gun, shotgun; flashlight and batteries),
+`fp vm` (framing = close: the wrists and their targets in camera space, aim factors, counters),
+`fp vmtest on|off` (test aid: pose the arms in third person too, for an eye looking along Alan's
+facing), `fp skel` (the animation skeleton: joints, parents, positions, slot table, render-bone
+map), `fp slotm S...` (world transforms of slots), `fp peek ADDR [N]` (RE aid: bytes at an RVA or
+address).
 
 ---
 
@@ -514,9 +529,8 @@ Doesn't, or not yet:
 
 - **Aim parallax**: the game aims from its third-person camera; the screen centre matches the
   aim point only at `aim_distance`. Close targets (a Taken at 3 m) will be off by ~10 deg.
-- **Arms only where the animation puts them**: with `hide = head` the hands are the third-person
-  animation's, so they show when aiming (flashlight or gun) or looking down 40 deg or more, not
-  while walking with the flashlight held low (it lights the scene from below the frame). With
+- **Arms**: fixed in 0.6.4 by `framing = close` (section 10). With `framing = classic` the hands
+  are the third-person animation's (they show when aiming or looking down 40 deg or more). With
   `hide = all` only the beam shows; `hide = body` keeps the flashlight and gun floating.
 - **Head motion**: the walk-start dip (25 cm) and sway come straight from the animation;
   `smooth = 0.1` softens it but does not remove it; `anchor = body` is steady but ignores
@@ -540,8 +554,7 @@ Doesn't, or not yet:
 2. **Head and body**: done in 0.6.3 (`hide = head`, section 6). Left: the torso and legs are below
    the frame even at the pitch limit; see section 6 "Next steps" (a first-person pitch range, a
    camera-relative arm pose).
-3. **Viewmodel**: the arms of the body mesh hold the flashlight and gun (section 6). For hands in
-   view while walking: a modest `fov` (90-100) or a viewmodel pose (section 6).
+3. **Viewmodel**: done in 0.6.4 (`framing = close`, section 10). Left: section 10 "Rough edges".
 4. **Cutscenes**: verify mode 3 and Bink fallback in a real in-engine cinematic; blend between the
    game's shot and the eye instead of cutting (a 0.3-0.5 s blend on mode changes); decide per
    scripted-shot type (Reveal vs Attached) instead of the 6 m rule.
@@ -552,3 +565,152 @@ Doesn't, or not yet:
    interior) or stay third person (current).
 7. Gun recoil and camera shake: they are in the game camera's rotation, so they reach first person
    as rotation only; check they feel right.
+
+## 10. Close framing: the arms as a viewmodel (0.6.4)
+
+Goal (user request): Resident Evil 7 / Village / Requiem style first person: hands, flashlight and
+gun always in frame and close to the lens (flashlight hand lower left, gun hand lower right, both
+together when aiming), a moderate field of view, the beam visibly from the hand in view, a sight
+picture when aiming, subtle bob and sway. Result: `[camera] framing = close` (the new default);
+`classic` is 0.6.3's framing. Lab instance `awr-fp`, 1920x1080, build 0.6.4, virtual clock 62.5 Hz.
+
+![idle, level 15 (flashlight lit, revolver): classic (left), close (right)](img/fp-close-idle.jpg)
+![aiming the revolver with the flashlight: classic (left), close (right)](img/fp-close-aim.jpg)
+
+### Camera only? (measured, ruled out)
+
+- The resting animation holds the flashlight hand ~0.55 m below the eye and the gun hand hanging
+  at the hip, 0.1-0.4 m *behind* the eye plane (live, `fp vm`, wrists in camera space, x right,
+  y up, z ahead, level 15: left (-0.21, -0.53, +0.27), right (+0.31, -0.53, -0.39) m). The game's
+  view is 79 deg wide at 16:9 (tan of the vertical half-angle 0.465, live), so the bottom edge is
+  25 deg below the centre; the wrists are 55-65 deg below it and the gun hand is behind the lens.
+- Lowering the eye 0.3 m and widening to 95 deg (`eye_up = -0.3`, `eye_forward = -0.05`,
+  `fov = 95`, live) brings a sleeve to the bottom edge, not the hands, and puts the eye in the
+  chest. Pitching the view relative to the aim ray would move the screen centre off the aim
+  point. So the arms have to move: a viewmodel pose.
+
+### Where the pose comes from (static, Ghidra, and live)
+
+- **Animation and its outputs.** `Character::updateAnimation` `0x17f600` animates in place or
+  (global byte `0xaf9b30` = 1, live: the asynchronous path is the one used) queues a
+  `CharacterAnimationGameJob` (vtable `0x754ec0`, run `0x17c220`). The result goes out in
+  `Character::postAnimation` `0x17c080` (in the synchronous path: inline in `0x17f600`):
+  1. `0x184080(anim, buf, 0x100)` (`lea r8,[rcx+0x48f8]; mov rcx,[rcx+8]; jmp 0x414a40`) writes the
+     model-space pose of every render bone, `buf[i] = model[map[i]]` (map: int array at anim
+     +0x48f8, count +0x4900; each 3x4 built from the joint's 0x30-byte qs-transform by
+     `0x59521c`);
+  2. `BoneArray::setBone` `0x168a50` copies them into the render BoneArray (Character +0x2e8, +8
+     the bone matrices) and marks the render object dirty; the skinning palette is
+     `inverse bind x bone` (`0x4b2390`, from `0x46d740` / `0x46dff0`);
+  3. the flashlight update `0x22e590` and the weapon update `0x341890` read
+     `Character::slotTransform` `0x179f10` (slot 0 = flashlight, 9 = weapon) and place their
+     meshes, the flashlight's lights (+0x10 light, +0x18 / +0x20 spot lights, +0x28 beam volume)
+     and **the light-damage cone** `0x22c3e0`, built from the same slot-0 transform (position
+     +0x24 and axes; objects in the cone get light through `0x315070` after a visibility ray). The
+     beam is slot 0's forward row (live: within 3 deg of the camera's forward when idle,
+     `fp slotm 0`); the barrel is slot 9's forward row to ~15 deg (live, aiming).
+- **Skeleton** (live, `fp skel`): the animation's skeleton instance is [Character +0x1b8] +8; its
+  +0x50 is the slot table (int joint per slot), its [+8] the pose, whose [+0] is the skeleton:
+  +8 int16 parent indices, +0x10 joint count (157 for Alan), +0x28 reference pose. Names come
+  from the render bones (mesh +0x238 through the render map): `L_Shoulder` 5 -> `L_UpperArm` 6
+  (`L_UpperArmTwist` 7) -> `L_ForeArm` 8 (`L_ForeArmTwist` 9) -> `L_Hand` 30 (fingers 31-46);
+  `R_Shoulder` 10 -> `R_UpperArm` 11 (12) -> `R_ForeArm` 13 (14) -> `R_Hand` 47 (48-64);
+  `SpineThorax` 4, `Neck0` 15, `Head` 17; jacket panels `Jkt_L/R_Shoulder` 127 / 142 (children of
+  the chest) with Front / Back / Rib chains. Slots used (semantic, live): 0 flashlight (joint 31),
+  1 left hand (30), 4 left forearm (8), 6 left upper arm (6), 9 weapon (48), 11 right hand (47),
+  14 right forearm (13), 16 right upper arm (11), 0x1d head (17).
+- `Character::jointTransform` `0x179e30` (a joint's world transform), the controller height
+  (Character +0x1c0 -> +0xd0, `0x4083f0`, subtracted by both getters) and the game's frame time
+  (`0x1df650`; all first-person smoothing uses it since 0.6.4, so it follows game time and the
+  lab's virtual clock) complete what the pose needs.
+
+### What `framing = close` does (`src/features/firstperson.cpp`, "framing")
+
+The pose itself is not rewritten; its two outputs are, with the same rigid per-segment deltas
+(upper arm, forearm, hand, clavicle, jacket panel, per side), computed once per animation update:
+
+1. **Hook `0x184080`** (pose export): after the original, for the player's animation only, each
+   render bone of an arm segment is multiplied by its delta (model space).
+2. **Hook `0x179f10`** (slot transform): the player's slots whose joint lies in an arm segment
+   (flashlight, weapon, hands) get the delta in world space, so the flashlight mesh, its lights and
+   beam, the light-damage cone, the gun and its muzzle flash follow the posed hands.
+3. **The deltas** (`vm_compute`, at the export): the hands' frame is the first-person camera of the
+   last main-view set (kept relative to the character so walking does not leave the hands behind,
+   low-passed by `hands_sway`, its pitch limited to [-70, +30] deg). Per arm that holds its item
+   (flashlight / weapon mesh shown; an empty or game-hidden hand fades back to the animation in
+   0.15 s, so use and pickup gestures play as animated):
+   - **wrist target**: the animated wrist is split into a slow part (0.25 s low-pass) and a fast
+     part. The slow part is replaced by a pose, "rest" (`hands_forward`, `hands_drop`,
+     `hands_side`) or "aim" (the gun hand at `hands_sight` below the centre; the flashlight hand
+     keeps its animated offset from the gun hand, so the two-handed grip stays), blended by how
+     far the animation has raised that arm (wrist height above the shoulder / arm length: -0.62
+     to -0.95 at rest, -0.07 to 0 aiming, live). The fast part (recoil, reload, the walk's swing)
+     is added back, scaled by `hands_motion`, at most 5 cm;
+   - **shrug**: the clavicle takes 35 % of the arm's swing;
+   - **two-bone IK**: shoulder fixed; the elbow on the side of the animated elbow swung rigidly
+     with the arm; the upper arm maps the arm's plane onto the new one and the forearm only bends
+     (a shortest-arc turn per bone twisted the elbow, live);
+   - **hand orientation**: the flashlight hand keeps its animated orientation (the animation
+     already points the beam at the camera's target), the gun hand turns with the forearm; then
+     each turns towards its aim, measured on the low-passed item direction so a recoil kick still
+     shows: the flashlight to the view's aim point (the game camera's centre ray at
+     `aim_distance`, where the screen centre converges), at most 75 deg; the gun to the aim point
+     when aiming and to a "ready" direction ~11 deg lower when not, at most 80 deg;
+   - **jacket**: the `Jkt_*_Shoulder` panels follow half the upper arm's turn (they are skinned up
+     into the armpits).
+4. **Near plane** 0.05 m instead of the game's 0.2 m (`Camera:Near`, PerspectiveView +0xcbc) while
+   first person is active with `close`: the sleeves come within 0.2 m of the eye and the near
+   plane cut them open (the inside of a cut sleeve showed as a hollow ribbon of cloth, live). The
+   game's value goes back when first person stops (live: 0.05 in close, 0.2 in classic and third
+   person).
+5. **Field of view and eye**: the game's own FOV (79 deg at 16:9, live) is already moderate and
+   stays (`fov` still overrides it); the eye stays at Alan's eyes; head bob is the head's own
+   motion low-passed as before (`smooth = 0.1`).
+6. **Fallback / inert**: `kVmSigs` (`0x184080`, `0x414a40`, `0x179e30`, `0x4083f0`, `0x184680`)
+   and a skeleton check (each side upper arm -> forearm -> hand, attachment below the hand) must
+   pass, else `close` keeps the animated arms (0.6.3's framing) with a log line. Third person and
+   `classic`: the export hook compares one pointer and returns, the slot hook compares one pointer
+   (live: no computes or applies over 120 frames in either, near plane 0.2).
+
+### Tested (live, 0.6.4 build)
+
+| case | result |
+|---|---|
+| idle, level 15 (flashlight lit, revolver from `fp give weapons`) | flashlight hand lower left, beam from it to the centre, revolver lower right (`fp-close-idle.jpg`) |
+| walking (W, frames 16 apart) | hands stay in the lower frame, swinging a few cm with the walk; the view bobs with the head (`fp-close-walk.jpg`) |
+| aiming flashlight + revolver | two-handed, flashlight under the revolver, rear sight below the centre, beam along the barrel; classic shows the revolver at the bottom edge (`fp-close-aim.jpg`) |
+| firing (revolver, 3 shots, 42 -> 39) | muzzle flash at the posed muzzle; recoil kicks the gun hand up (`fp-close-fire.jpg`, top) |
+| reload (R) | the gun hand comes in to the centre and back (`fp-close-fire.jpg`, bottom) |
+| use / pickup, level 03 supply case | "Open" opens the case, "Pick up batteries" 10 -> 12; the game hides the gun during the gesture, so the right arm plays its animated reach into the case (`fp-close-pickup.jpg`) |
+| looking down (pitch limit) | both hands, the beam's spot, the revolver; classic shows the flashlight's end (`fp-close-look.jpg`, top) |
+| looking up | the hands drop out at the bottom (hands' frame capped at +30 deg); the beam from below (`fp-close-look.jpg`, bottom) |
+| "[F] Focus" on the bird swarm, level 15 | the prompt shows with the beam on the birds, as in classic |
+| stereo `sbs`, `hsbs` | both eyes show the same posed hands (one pose per update) (`fp-close-stereo-hsbs.jpg`) |
+| `classic`, third person | no computes or applies, near plane 0.2 (counters, live) |
+
+![walking: four frames 16 apart (close)](img/fp-close-walk.jpg)
+![firing (muzzle flash, recoil) and reloading (close)](img/fp-close-fire.jpg)
+![use: open the supply case, reach, "Picked up batteries" (close)](img/fp-close-pickup.jpg)
+![looking down (top) and up (bottom): classic (left), close (right)](img/fp-close-look.jpg)
+![stereo hsbs with close framing](img/fp-close-stereo-hsbs.jpg)
+
+### Rough edges
+
+- **Light damage follows the posed beam** (static: `0x22e590` passes the slot-0 transform it got
+  from `0x179f10`, now posed, to the damage cone `0x22c3e0`; live: the slot hook applies every
+  frame and the beam ends at the screen centre). Not measured: damage against a Taken. The
+  flashlight aims at the convergence point (`aim_distance`), so section 3's parallax applies to
+  the beam as to the reticle.
+- **Shadow**: the arms' shadow is posed too (main and shadow passes share the skinned vertices):
+  Alan's shadow holds his arms up in front.
+- **Big swings**: in level 15's combat idle the gun hand hangs ~0.4 m behind the eye, so the arm
+  swings ~150 deg; the sleeves stay whole (near plane, plane-keeping IK, shrug, jacket panels),
+  but the revolver points steeply up-forward in the lower right (`fp-close-idle.jpg`) and the
+  wrist bends visibly when a hand is turned far.
+- **Recoil** shows strongly (the animation's kick plus the hand's turn); `hands_motion` scales
+  only the translation.
+- Dodges, cinematic moments and the bird attacks' slow motion go through the same pose; nothing
+  special-cases them. The hands leave the frame when looking up past +30 deg.
+- Not tested: the shotgun and flare gun (the left hand keeps its animated offset from the right,
+  so it should hold the fore-end), throwables (thrown from the posed hand), a gamepad, damage
+  numbers.
