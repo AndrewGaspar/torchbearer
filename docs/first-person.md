@@ -971,3 +971,16 @@ section 5, measured there):
 
 Recommendation: (a) when the shadow matters enough; gameplay is unaffected either way (the light
 cone and the shots use the converged first-person values, section 11).
+
+### Pad mapping checked with a virtual controller (0.6.7, live)
+
+Quiver's lab virtual pad (Xbox 360, XInput slot 0; `quiver lab pad`), first person, `controls = deliberate`,
+level 15, read through `fpc state`, the HUD and `fp aim`:
+- LT held: gun drawn and aiming (`drawn`, `aim_raw`); LT + RB: boost while aiming (`boost`).
+- RT while drawn: fires (HUD revolver ammo 42 -> 40 after two pulls; `fp aim` origin at the eye).
+- LT released: holstered after the delay (`holsters` 1 after 4 s).
+- RB alone: boost without drawing (`drawn` false, `boost` true).
+- D-pad up: flashlight off / on (`toggles` 1, 2; `flashlight_off_by_us` true, then false).
+- Left-stick click: long gun selected (HUD switched to the pump shotgun; LT then drew it,
+  `docs/img/fp-pad-longgun.jpg`).
+- Right-stick click (throw): not checked; the fixture had no flares or flashbangs.
