@@ -49,6 +49,11 @@ add_library(torchbearer SHARED
   src/features/rt/dxc.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
+# Dev only: embeds vkd3d-proton's LGPL ray-query test shader for `rt dxrtest` (docs/raytracing.md).
+option(TB_RT_RAYQUERY_TEST "Include vkd3d-proton's ray-query test shader (LGPL; dev builds only)" OFF)
+if(TB_RT_RAYQUERY_TEST)
+  target_compile_definitions(torchbearer PRIVATE TB_RT_RAYQUERY_TEST)
+endif()
 target_include_directories(torchbearer PRIVATE src third_party)
 target_compile_definitions(torchbearer PRIVATE TB_VERSION="${TB_VERSION}" WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
   __USE_MINGW_ANSI_STDIO=1)

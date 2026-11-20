@@ -16,7 +16,11 @@
 #include "core/log.h"
 #include "features/rt/dxc.h"
 #include "features/rt/rt_internal.h"
+// vkd3d-proton's precompiled ray-query test shader is LGPL: only in dev builds
+// (cmake -DTB_RT_RAYQUERY_TEST=ON), never in the shipped DLL.
+#ifdef TB_RT_RAYQUERY_TEST
 #include "vkd3d-proton-tests/rayquery_dxil.h"
+#endif
 
 namespace tb::rt {
 namespace {
@@ -427,7 +431,11 @@ std::string run_test(ID3D12Device5* dev) {
   // Shaders: the DXR 1.0 libraries are compiled here with the game's dxcompiler.dll (1.4.1907: no
   // inline ray queries), the ray-query test is vkd3d-proton's precompiled DXIL.
   std::vector<uint8_t> lib, rate;
+#ifdef TB_RT_RAYQUERY_TEST
   std::vector<uint8_t> rq(rayquery_code_dxil, rayquery_code_dxil + sizeof rayquery_code_dxil);
+#else
+  std::vector<uint8_t> rq;  // not in this build: the ray-query part reports "rayquery_pso": "not built"
+#endif
   bool c2 = dxc_compile(kLibHlsl, L"", L"lib_6_3", lib, err);
   add("compile_lib_6_3", c2 ? "true" : json_str(err));
   bool c3 = dxc_compile(kRateHlsl, L"", L"lib_6_3", rate, err);
@@ -489,8 +497,8 @@ std::string run_test(ID3D12Device5* dev) {
     g.l->ResourceBarrier(1, &b);
   }
   // 2. Inline ray query (DXR 1.1).
-  ID3D12PipelineState* pso = compute_pso(dev, rqrs, rq);
-  add("rayquery_pso", pso ? "true" : "false");
+  ID3D12PipelineState* pso = rq.empty() ? nullptr : compute_pso(dev, rqrs, rq);
+  add("rayquery_pso", rq.empty() ? "\"not built\"" : pso ? "true" : "false");
   if (pso) {
     struct {
       float miss[2];

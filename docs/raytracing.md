@@ -64,7 +64,7 @@ Shaders for an RT pass: the game ships **DXC 1.4.1907** (`dxcompiler.dll`, July 
 itself. The probe compiled its `lib_6_3` raygen/closest-hit/miss libraries with it in-process
 (live), so DXR 1.0 shaders can be built at run time from HLSL in the mod. That DXC predates
 `RayQuery` (compile error, live); the ray-query test used vkd3d-proton's precompiled test DXIL
-(`third_party/vkd3d-proton-tests`, LGPL, dev only). A shipped inline-RT shader would need a
+(`third_party/vkd3d-proton-tests`, LGPL, dev only: compiled in only with `cmake -DTB_RT_RAYQUERY_TEST=ON`, otherwise `rt dxrtest` reports the ray-query part as "not built"). A shipped inline-RT shader would need a
 newer DXC in the build (precompiled DXIL embedded in the DLL).
 
 Measured on the game's device (in-world, the game rendering at the same time; `quiver lab gpu`,
