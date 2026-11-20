@@ -1,12 +1,17 @@
 // The game's shadowed spot light pixel shader (DeferredLight, PS aa17e58e1bd8d853, "spotlightPS":
 // the flashlight and the other shadow-casting spots), re-written in HLSL from its DXIL disassembly
-// (docs/raytracing.md section 9). Binding-compatible with the original: $Globals at b0 (only the
-// fields it reads, at their offsets), t0..t5 / s0..s5 as the original's.
+// (docs/raytracing.md sections 11 and 14). Binding-compatible with the original: $Globals at b0
+// (only the fields it reads, at their offsets), t0..t5 / s0..s5 as the original's.
 //
 //   TB_SHADOW_PCF  the original 10-tap Vogel-disk PCF on the shadow atlas (to verify the port)
 //   TB_SHADOW_NONE unshadowed (debugging the port)
-//   TB_SHADOW_RQ   inline ray queries (DXR 1.1, ps_6_5) against the mod's TLAS towards the light
-//                  (t0 space9) instead of the atlas; constants b0 space9
+//   TB_SHADOW_RQ   [graphics] flashlight_shadows = rt: the flashlight's shadow by inline ray queries
+//                  (DXR 1.1, ps_6_5) against the mod's TLAS towards a disc the size of its bulb
+//                  (soft penumbra), alpha-tested foliage included; every other shadowed spot keeps
+//                  the PCF on the atlas. Extra bindings, in a copy of the pipeline's root signature
+//                  made for this shader only (census.cpp): t0 space9 TLAS, b0 space9 constants,
+//                  t1 space9 the alpha buffer, t0.. space10 the game's own descriptor heap (the
+//                  alpha textures by heap index), s0 space9 a wrap sampler.
 //
 // Built at dev time with a current DXC (scripts/build_shaders), embedded as DXIL.
 
@@ -40,8 +45,18 @@ SamplerState g_sLightProjectionMap : register(s5);
 RaytracingAccelerationStructure g_tlas : register(t0, space9);
 cbuffer TbRt : register(b0, space9) {
   float4 tb_anchor;  // xyz: the TLAS origin in world space; w: instance mask
-  float4 tb_p;       // x: normal bias (m), y: light radius (m), z: rays, w: distance kept clear at the light (m)
+  float4 tb_p;       // x: normal bias (m), y: bulb radius (m), z: rays, w: distance kept clear at the light (m)
+  float4 tb_q;       // x: alpha-tested geometry on, y: flashlight: max distance from the eye (m),
+                     // z: min cos(light axis, view axis), w: 1 = every shadowed spot (dev)
 };
+ByteAddressBuffer g_tb_alpha : register(t1, space9);
+Texture2D<float4> g_tb_heap[] : register(t0, space10);
+SamplerState g_tb_wrap : register(s0, space9);
+#define TB_ALPHA_BUF g_tb_alpha
+#define TB_ALPHA_TEX g_tb_heap
+#define TB_ALPHA_SMP g_tb_wrap
+#define TB_ALPHA_GAME_HEAP 1
+#include "alpha.hlsli"
 #endif
 
 static const float kInvPi = 0.31830987;
@@ -62,7 +77,18 @@ float shadow_pcf(float3 vp, float2 spos) {
 }
 
 #ifdef TB_SHADOW_RQ
-// Rays from the surface towards points on the light's disc (radius tb_p.y) around its position.
+// The player's flashlight among the shadowed spots: near the eye and aimed along the view (its
+// beam follows the aim). g_mLightProjectionMatrix's w row is the light's forward axis (view space).
+bool is_flashlight() {
+  if (tb_q.w != 0) return true;
+  float3 f = normalize(g_mLightProjectionMatrix[3].xyz);
+  return length(g_vLightPosition) < tb_q.y && f.z > tb_q.z;
+}
+
+// Rays from the surface towards points on the bulb's disc (radius tb_p.y) around the light's
+// position: an area light, so the penumbra widens with the occluder's distance from the receiver
+// (crisp contact shadows near, soft far). Interleaved-gradient rotation per pixel, as the game's
+// PCF; its TAA resolves the noise.
 float shadow_rq(float3 vp, float3 n, float2 spos) {
   float3 wp = mul(g_mViewToWorld, float4(vp, 1)).xyz - tb_anchor.xyz;
   float3 wn = normalize(mul((float3x3)g_mViewToWorld, n));
@@ -72,22 +98,19 @@ float shadow_rq(float3 vp, float3 n, float2 spos) {
   float3 axis = normalize(wl - wp);
   float3 t = normalize(abs(axis.y) < 0.99 ? cross(axis, float3(0, 1, 0)) : cross(axis, float3(1, 0, 0)));
   float3 b = cross(axis, t);
+  float3 o = wp + wn * (tb_p.x + length(vp) * 0.001);
   float lit = 0;
   for (uint i = 0; i < rays; i++) {
     float r = tb_p.y * sqrt((float(i) + 0.5) / float(rays));
     float a = ang + 2.4 * float(i);
-    float3 target = wl + (t * cos(a) + b * sin(a)) * r;
-    float3 d = target - wp;
+    float3 d = wl + (t * cos(a) + b * sin(a)) * r - o;
     float len = length(d);
     RayDesc ray;
-    ray.Origin = wp + wn * (tb_p.x + length(vp) * 0.001);
+    ray.Origin = o;
     ray.Direction = d / len;
     ray.TMin = 0.0;
     ray.TMax = max(len - tb_p.w, 0.0);
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(g_tlas, RAY_FLAG_NONE, uint(tb_anchor.w), ray);
-    q.Proceed();
-    lit += q.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+    lit += tb_occluded(g_tlas, uint(tb_anchor.w), ray, tb_q.x != 0) ? 0.0 : 1.0;
   }
   return lit / float(rays);
 }
@@ -108,7 +131,7 @@ float4 main(float4 pos : SV_Position, float3 ray : TEXCOORD0) : SV_Target {
   float2 luv = float2(lp.x / lp.w * 0.5 + 0.5, 0.5 - lp.y / lp.w * 0.5);
   col *= g_sLightProjectionMapTex.Sample(g_sLightProjectionMap, luv).xyz;
 #ifdef TB_SHADOW_RQ
-  float sh = shadow_rq(vp, N, pos.xy);
+  float sh = is_flashlight() ? shadow_rq(vp, N, pos.xy) : shadow_pcf(vp, pos.xy);
 #elif defined(TB_SHADOW_NONE)
   float sh = 1;
 #else
