@@ -34,6 +34,7 @@
 #include "core/log.h"
 #include "core/module.h"
 #include "core/present.h"
+#include "features/fpcontrols.h"
 
 namespace tb {
 namespace {
@@ -176,13 +177,16 @@ struct Params {
   double fov_deg = 0;         // horizontal FOV at 16:9, degrees; 0 = the game's own
   double near_m = 0;          // m: the near plane in first person; 0 = auto (close 0.05, else the game's)
   double smooth = 0.1;        // s: low-pass time constant on the head's offset from the root
+  bool aim_eye = true;        // aim from the eye (the game's aim ray starts at the eye; the view
+                              // looks at its target); false = 0.6.4 (aim_distance convergence)
   double aim_distance = 15;   // m: >0 = look at the point this far along the game camera's ray
   // framing = close (viewmodel arms); the knobs below only matter then
   bool framing_close = true;
   double hands_forward = 0.34;  // m: resting wrists this far ahead of the eye
   double hands_drop = 0.65;     // ... this fraction of the half-height below the centre
-  double hands_side = 0.40;     // ... this fraction of the half-width out to their side
+  double hands_side = 0.60;     // ... this fraction of the half-width out to their side
   double hands_sight = 0.60;    // aiming: the gun hand this fraction of the half-height below the centre
+  double hands_aim_side = 0.35; // aiming: the flashlight hand this fraction of the half-width left of the centre
   double hands_aim = 1.0;       // 0..1: turn the held items towards the view's aim point
   double hands_follow = 0.25;   // s: animation motion faster than this passes through to the hands
   double hands_motion = 0.5;    // ... scaled by this
@@ -1067,6 +1071,8 @@ struct VmState {
   // filters (camera space): slow wrist positions, aim factors, held-item directions
   bool filt_ok = false;
   double slow[2][3] = {}, aimf[2] = {}, fwd[2][3] = {};
+  double rest_hc[3][3] = {};  // the flashlight hand's resting orientation, camera space
+  bool rest_ok = false;
   uint64_t computes = 0, applies = 0, slot_applies = 0;
 } g_vm;
 std::atomic<void*> g_vm_ch{nullptr};  // character the deltas apply to (null = none)
@@ -1094,6 +1100,7 @@ struct VmArm {
   double w[3];      // wrist, camera space
   double raise;     // wrist height above the shoulder / arm length (-1 hanging .. 0 level)
   double attach[12];
+  double H[9];      // the hand joint's world rotation rows (animated)
 };
 
 bool vm_compute(void* ch, const Params& p) {
@@ -1140,8 +1147,13 @@ bool vm_compute(void* ch, const Params& p) {
   // an empty hand stays as animated
   void* fl = rd<void*>(ch, kCharFlashlight);
   void* wp = rd<void*>(ch, kCharWeapon);
+  // controls = deliberate: the gun's mesh is hidden while holstered (by us), so the right arm holds
+  // it whenever the game itself does not hide it (WeaponHolder +0x1c: use animations)
+  bool deliberate = fpc_in_use();
   bool holds[2] = {fl && rd<uint8_t>(fl, 0xc0) && !(rd<uint32_t>(rd<void*>(fl, 0xc8), kRoFlags) & 8),
-                   wp && rd<uint8_t>(wp, 0x30) && !(rd<uint32_t>(rd<void*>(wp, 0x38), kRoFlags) & 8)};
+                   wp && rd<uint8_t>(wp, 0x30) &&
+                       (deliberate ? !rd<uint8_t>(wp, 0x1c) : !(rd<uint32_t>(rd<void*>(wp, 0x38), kRoFlags) & 8))};
+  double draw = deliberate ? fpc_draw() : 1.0;  // 0 = holstered: the right hand lowered out of view
   for (int s = 0; s < 2; s++) holds[s] = holds[s] && (p.hands_arms >> s & 1);
   VmArm A[2];
   for (int s = 0; s < 2; s++) {
@@ -1155,6 +1167,7 @@ bool vm_compute(void* ch, const Params& p) {
       jw(ch, b, g_vs.joint[s][k]);
       for (int i = 0; i < 3; i++) P[k][i] = b[9 + i];
     }
+    for (int i = 0; i < 9; i++) a.H[i] = b[i];
     double se[3], ew[3];
     v_sub(a.E, a.S, se), v_sub(a.W, a.E, ew);
     a.la = v_len(se), a.lb = v_len(ew);
@@ -1187,13 +1200,17 @@ bool vm_compute(void* ch, const Params& p) {
   double rest[2][3] = {{-p.hands_side * th * z, -p.hands_drop * tv * z, z},
                        {p.hands_side * th * z, -p.hands_drop * tv * z, z}};
   double zaim = z + 0.08;
-  double aimpos[2][3] = {{-0.10 * th * zaim, -p.hands_sight * tv * zaim, zaim},
+  // aiming: the gun just right of the centre at the sight line, the flashlight out to the left
+  // (hands_aim_side), both turned to the aim point; 0 brings back 0.6.4's two-handed grip (the
+  // flashlight hand keeping its animated offset from the gun hand)
+  double aimpos[2][3] = {{-p.hands_aim_side * th * zaim, -p.hands_sight * tv * zaim, zaim},
                          {0.10 * th * zaim, -p.hands_sight * tv * zaim, zaim}};
-  // two-handed: the flashlight hand keeps its animated offset from the gun hand
-  if (A[0].ok && A[1].ok) {
-    double k = aimf[1];
+  if (A[0].ok && A[1].ok && p.hands_aim_side <= 0) {
+    double k = aimf[1] * draw;
     for (int i = 0; i < 3; i++) aimpos[0][i] += ((aimpos[1][i] + slow[0][i] - slow[1][i]) - aimpos[0][i]) * k;
   }
+  // holstered (controls = deliberate): the right wrist low at the hip, below the frame
+  const double holster[3] = {0.22, -0.70, 0.08};
   for (int s = 0; s < 2; s++) {
     VmArm& a = A[s];
     if (!a.ok) continue;
@@ -1204,6 +1221,7 @@ bool vm_compute(void* ch, const Params& p) {
     double fl = v_len(fast) * p.hands_motion, fmax = 0.05, fk = p.hands_motion * (fl > fmax ? fmax / fl : 1.0);
     for (int i = 0; i < 3; i++) {
       double base = rest[s][i] + (aimpos[s][i] - rest[s][i]) * aimf[s];
+      if (s == 1) base = holster[i] + (base - holster[i]) * draw;
       t[i] = base + fast[i] * fk;
       t[i] = a.w[i] + (t[i] - a.w[i]) * hw[s];
     }
@@ -1289,10 +1307,38 @@ bool vm_compute(void* ch, const Params& p) {
     // The flashlight hand keeps its animated orientation (the animation already points the beam
     // at the camera's target); the gun hand turns with the forearm (the animated wrist bend is
     // kept: a hanging gun comes up with the arm). Then each turns towards its aim.
-    double rot_h[3][3], id3[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    memcpy(rot_h, s == 0 ? id3 : rot_f, sizeof rot_h);
-    double (*rb)[3] = s == 0 ? id3 : rot_f;
-    double weight = p.hands_aim * hw[s];
+    double rot_h[3][3];
+    // The flashlight hand held apart when aiming (hands_aim_side > 0): the aim stance's hand
+    // (a two-handed grip, palm up under the gun) looks wrong on its own, so the hand keeps the
+    // orientation it had at rest, relative to the view, while it rises (then turns to the aim).
+    double rbase[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    if (s == 0) {
+      double cm[3][3] = {{r[0], u[0], f[0]}, {r[1], u[1], f[1]}, {r[2], u[2], f[2]}};  // world -> cam
+      double H2[3][3], Hc[3][3];
+      for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++) H2[i][c] = a.H[i * 3] * rc[0][c] + a.H[i * 3 + 1] * rc[1][c] + a.H[i * 3 + 2] * rc[2][c];
+      for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++) Hc[i][c] = H2[i][0] * cm[0][c] + H2[i][1] * cm[1][c] + H2[i][2] * cm[2][c];
+      if (aimf[0] < 0.05 && hw[0] > 0.99) {
+        memcpy(g_vm.rest_hc, Hc, sizeof Hc);
+        g_vm.rest_ok = true;
+      }
+      if (g_vm.rest_ok && p.hands_aim_side > 0 && aimf[0] > 1e-3) {
+        double Hd[3][3], R[3][3];
+        for (int i = 0; i < 3; i++)  // cam -> world: cm^T
+          for (int c = 0; c < 3; c++)
+            Hd[i][c] = g_vm.rest_hc[i][0] * cm[c][0] + g_vm.rest_hc[i][1] * cm[c][1] + g_vm.rest_hc[i][2] * cm[c][2];
+        Xf hx = xf_id();
+        memcpy(hx.r, H2, sizeof H2);
+        Xf hi = xf_inv(hx);
+        for (int i = 0; i < 3; i++)
+          for (int c = 0; c < 3; c++) R[i][c] = hi.r[i][0] * Hd[0][c] + hi.r[i][1] * Hd[1][c] + hi.r[i][2] * Hd[2][c];
+        rot_scale(R, aimf[0], rbase);
+      }
+    }
+    memcpy(rot_h, s == 0 ? rbase : rot_f, sizeof rot_h);
+    double (*rb)[3] = s == 0 ? rbase : rot_f;
+    double weight = p.hands_aim * hw[s] * (s == 1 ? draw : 1.0);
     if (weight > 0) {
       const double* at = a.attach;
       double fw[3], rel[3], pos[3], want[3], fwc[3], fws[3], dirc[3], ra[3][3];
@@ -1312,7 +1358,8 @@ bool vm_compute(void* ch, const Params& p) {
       // turn the low-passed direction onto the wanted one, so fast kicks still show
       normalize(fw);
       dir_cam(fw, fwc);
-      for (int i = 0; i < 3; i++) fws[i] = lp(g_vm.fwd[s][i], fwc[i], 0.12);
+      // (the flashlight on the current direction: its beam is the aim, the damage cone)
+      for (int i = 0; i < 3; i++) fws[i] = s == 0 ? (g_vm.fwd[s][i] = fwc[i]) : lp(g_vm.fwd[s][i], fwc[i], 0.12);
       rot_arc(fws, dirc, weight, (s == 0 ? 75 : 80) * M_PI / 180, ra);  // camera-space rotation
       // to world: R_w = C^T R_c C (row-vector: world dir -> cam -> rotate -> world)
       double cm[3][3] = {{r[0], u[0], f[0]}, {r[1], u[1], f[1]}, {r[2], u[2], f[2]}};  // world -> cam
@@ -1424,6 +1471,139 @@ void vm_camera(void* ch, const double* mm, const double* aim, double dt, const P
   g_vm.smooth_ok = p.hands_sway > 0;
 }
 
+// ---- aim from the eye (docs/first-person.md section 11) --------------------------------------
+// The player's aim is one PlayerAim object (the global behind 0x2f3d10, updated by 0x2f53c0 from
+// PlayerInputReader vtable +0x28): +0 the target point, +0xc the ray origin, +0x18 the aim
+// direction (from its yaw +0x24 / pitch +0x28, which mouse look and the right stick turn), +0x2c..
+// flags (target is a character...). Each update the origin is 0x2f3bb0(player): a fixed point on
+// Alan's chest (model (-0.10, 1.28, 0.12) m), and the target is the first hit of origin + dir * 100 m
+// (0x405920, mask 0x27). Everything aims at that target: the weapon's shot (0x341d80 copies it to
+// WeaponHolder +0x198; 0x342b60 casts from the muzzle towards it), the animation's flashlight and gun
+// aim, the TailCamera (it looks at it from over the shoulder). In first person (aim_from = eye) the
+// origin becomes the eye (hook on 0x2f3bb0) and the view looks at the target, so the screen centre,
+// the bullets and the beam converge on the same point at every distance.
+constexpr uintptr_t RVA_AIM_GET = 0x2f3d10;     // `mov rax,[rip+d]; ret`: PlayerAim*
+constexpr uintptr_t RVA_AIM_ORIGIN = 0x2f3bb0;  // PlayerAim origin(Character*, float out[3])
+constexpr uintptr_t RVA_PLAYERCAM = 0x1d2570;   // `mov rax,[rip+d]; ret`: PlayerCamera* (+0xcc8 float[12])
+constexpr uintptr_t RVA_TRACER_ADD = 0x346120;  // bullet tracers: add(mgr, from*, to*, f): one per shot ray
+const Sig kAimSigs[] = {
+    {RVA_AIM_GET, "48 8b 05 ?? ?? ?? ?? c3"},
+    // the fixed chest offset (-0.22, 1.16, 0.23) it starts from
+    {RVA_AIM_ORIGIN, "48 89 5c 24 08 57 48 83 ec 30 0f 29 74 24 20 48 8b fa c7 02 ae 47 61 be 48 8b d9 c7 42 04 e1 7a "
+                     "94 3f c7 42 08 1f 85 6b 3e"},
+    // 0x2f53c0: lea rdx,[rsi+0xc]; mov rcx,r15; call 0x2f3bb0 (the origin is aim +0xc)
+    {0x2f572c, "48 8d 56 0c 49 8b cf e8 78 e4 ff ff"},
+    {RVA_PLAYERCAM, "48 8b 05 ?? ?? ?? ?? c3"},
+    {RVA_TRACER_ADD, "40 57 48 83 ec 30 45 33 d2 0f 29 74 24 20 41 8b c2 4c 8d 49 30"},
+};
+using AimOriginFn = void(__fastcall*)(void* ch, float* out);
+using TracerFn = void(__fastcall*)(void* mgr, float* from, float* to, float f);
+AimOriginFn g_o_aim_origin = nullptr;
+TracerFn g_o_tracer = nullptr;
+bool g_aim_ok = false;
+void** g_aim_obj = nullptr;   // &PlayerAim*
+void** g_playercam = nullptr;  // &PlayerCamera*
+std::atomic<uint64_t> g_aim_origin_hits{0}, g_aim_origin_applied{0};
+struct ShotLog {
+  float from[3], to[3];
+  double eye[3], R[3][3];  // the rendered view when it was fired (rows right, up, forward)
+  uint64_t frame;
+};
+std::mutex g_shot_mu;
+double g_view_eye[3], g_view_R[3][3];  // the last first-person view set (mono eye)
+ShotLog g_shots[8];
+int g_nshots = 0;
+
+const float* aim_obj() {
+  void* a = g_aim_ok && g_aim_obj ? *g_aim_obj : nullptr;
+  return a ? static_cast<const float*>(a) : nullptr;
+}
+
+// The first-person eye for the game's aim, now: the character's current root plus the smoothed
+// head offset of the last view (the root moves up to ~8 cm per frame when running; the head's
+// offset from it changes slowly).
+bool eye_now(void* ch, double* o) {
+  if (!g_smooth_valid) return false;
+  Params p = params();
+  const float* root = reinterpret_cast<const float*>(static_cast<uint8_t*>(ch) + kCharTransform);
+  double fx = g_camfwd[0], fz = g_camfwd[2], n = std::sqrt(fx * fx + fz * fz);
+  if (n > 1e-6) fx /= n, fz /= n;
+  else fx = fz = 0;
+  o[0] = root[9] + g_smooth_off[0] + fx * p.eye_forward;
+  o[1] = root[10] + g_smooth_off[1] + (p.anchor == Anchor::Head ? p.eye_up : 0);
+  o[2] = root[11] + g_smooth_off[2] + fz * p.eye_forward;
+  return true;
+}
+
+// 0x2f3bb0: in first person the aim ray starts at the eye.
+void __fastcall hk_aim_origin(void* ch, float* out) {
+  g_o_aim_origin(ch, out);
+  if (!g_on.load(std::memory_order_relaxed) || !g_active.load(std::memory_order_relaxed)) return;
+  g_aim_origin_hits++;
+  if (!params().aim_eye || ch != player()) return;
+  double e[3];
+  if (!eye_now(ch, e)) return;
+  for (int i = 0; i < 3; i++) out[i] = float(e[i]);
+  g_aim_origin_applied++;
+}
+
+// Bullet tracers (pass-through): the last shots, for `fp aim` (where they went against the view).
+void __fastcall hk_tracer(void* mgr, float* from, float* to, float f) {
+  g_o_tracer(mgr, from, to, f);
+  if (!from || !to) return;
+  std::lock_guard lk(g_shot_mu);
+  ShotLog& s = g_shots[g_nshots++ % 8];
+  memcpy(s.from, from, sizeof s.from);
+  memcpy(s.to, to, sizeof s.to);
+  memcpy(s.eye, g_view_eye, sizeof s.eye);
+  memcpy(s.R, g_view_R, sizeof s.R);
+  s.frame = present_frame();
+}
+
+// The view's look-at for aim_from = eye: the aim target (or along the aim direction when the
+// target is closer than 0.3 m), plus the game camera's shake and recoil (the Cameraman camera's
+// rotation relative to the PlayerCamera's: CameraMan 0x172db0 adds them between the two).
+double g_view_fwd[3] = {0, 0, 1};
+bool aim_view(const double* m, double R[3][3], double* target) {
+  const float* a = aim_obj();
+  if (!a) return false;
+  double t[3] = {a[0], a[1], a[2]}, dir[3] = {a[6], a[7], a[8]}, d[3];
+  v_sub(t, g_eye, d);
+  double dist = v_len(d), f[3];
+  if (!(dist < 1e4) || !(v_len(dir) > 0.5)) return false;
+  if (dist > 0.3) {
+    for (int i = 0; i < 3; i++) f[i] = d[i] / dist;
+  } else {
+    memcpy(f, dir, sizeof f);
+    normalize(f);
+  }
+  memcpy(target, t, sizeof t);
+  double up0[3] = {0, 1, 0}, r[3], u[3];
+  cross(up0, f, r);  // left-handed: right = up x forward
+  if (v_len(r) < 1e-6) return false;
+  normalize(r);
+  cross(f, r, u);
+  double L[3][3] = {{r[0], r[1], r[2]}, {u[0], u[1], u[2]}, {f[0], f[1], f[2]}};
+  // shake: S = R_pc^T R_cm (world-space delta; R_cm = R_pc S)
+  void* pc = g_playercam ? *g_playercam : nullptr;
+  double S[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+  if (pc) {
+    const float* q = reinterpret_cast<const float*>(static_cast<uint8_t*>(pc) + 0xcc8);
+    double P[3][3];
+    for (int i = 0; i < 3; i++)
+      for (int k = 0; k < 3; k++) P[i][k] = q[i * 3 + k];
+    for (int i = 0; i < 3; i++)
+      for (int k = 0; k < 3; k++) S[i][k] = P[0][i] * m[k] + P[1][i] * m[3 + k] + P[2][i] * m[6 + k];
+    // ignore anything that is not a small rotation (another camera, a cut)
+    if (S[0][0] + S[1][1] + S[2][2] < 2.9)
+      for (int i = 0; i < 3; i++)
+        for (int k = 0; k < 3; k++) S[i][k] = i == k;
+  }
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) R[i][k] = L[i][0] * S[0][k] + L[i][1] * S[1][k] + L[i][2] * S[2][k];
+  return true;
+}
+
 // core/camera.h filter: the main view's transform -> the player's eyes.
 bool fp_filter(void* view, double* m) {
   if (g_job_pending.load(std::memory_order_relaxed) && G.ok && G.cameraman && view == *G.cameraman) job_run();
@@ -1472,7 +1652,13 @@ bool fp_filter(void* view, double* m) {
     return false;
   }
   for (int i = 0; i < 3; i++) g_camfwd[i] = m[6 + i];
-  if (p.aim_distance > 0) {
+  double R[3][3], aim_target[3];
+  bool aimed = p.aim_eye && aim_view(m, R, aim_target);
+  if (aimed) {
+    // aim from the eye: look at the game's aim target
+    for (int i = 0; i < 3; i++) m[i] = R[0][i], m[3 + i] = R[1][i], m[6 + i] = R[2][i];
+    memcpy(g_view_fwd, R[2], sizeof g_view_fwd);
+  } else if (p.aim_distance > 0) {
     // Look at the point the game camera's centre ray reaches at aim_distance (where the reticle
     // points at that range), so the reticle stays on target from the new viewpoint.
     double t[3] = {m[9] + m[6] * p.aim_distance, m[10] + m[7] * p.aim_distance, m[11] + m[8] * p.aim_distance};
@@ -1487,11 +1673,15 @@ bool fp_filter(void* view, double* m) {
   m[9] = g_eye[0];
   m[10] = g_eye[1];
   m[11] = g_eye[2];
+  for (int i = 0; i < 3; i++) {
+    g_view_eye[i] = g_eye[i];
+    for (int k = 0; k < 3; k++) g_view_R[i][k] = m[i * 3 + k];
+  }
   g_active = true;
   if (g_vm_ok) {
     // the viewmodel's camera and aim point (the point the view converges on)
     double dist = p.aim_distance > 0 ? p.aim_distance : 15, aim[3];
-    for (int i = 0; i < 3; i++) aim[i] = g_cam[i] + g_camfwd[i] * dist;
+    for (int i = 0; i < 3; i++) aim[i] = aimed ? aim_target[i] : g_cam[i] + g_camfwd[i] * dist;
     static uint64_t last_frame = ~0ull;
     uint64_t fr = present_frame();
     vm_camera(ch, m, aim, fr != last_frame ? g_frame_dt : 0, p);
@@ -1625,6 +1815,11 @@ std::string status() {
 
 }  // namespace
 
+bool fp_active_now() { return g_on.load(std::memory_order_relaxed) && g_active.load(std::memory_order_relaxed); }
+void* fp_player_character() { return G.ok ? player() : nullptr; }
+bool fp_hide_all() { return params().hide == Params::Hide::All; }
+bool fp_sig_ok(uintptr_t rva, const char* hex) { return sig_ok(rva, hex); }
+
 void firstperson_register() {
   cfg_listen("camera.", [](const std::string& id, const std::string& v) {
     std::lock_guard lk(g_pmu);
@@ -1647,11 +1842,13 @@ void firstperson_register() {
     if (id == "camera.near") g_p.near_m = n > 0.01 && n < 1 ? n : 0;
     if (id == "camera.smooth") g_p.smooth = n > 0 ? n : 0;
     if (id == "camera.aim_distance") g_p.aim_distance = n > 0 ? n : 0;
+    if (id == "camera.aim_from") g_p.aim_eye = v != "game";
     if (id == "camera.framing") g_p.framing_close = v != "classic";
     if (id == "camera.hands_forward") g_p.hands_forward = n < 0.1 ? 0.1 : n > 0.8 ? 0.8 : n;
     if (id == "camera.hands_drop") g_p.hands_drop = n < 0 ? 0 : n > 1.5 ? 1.5 : n;
     if (id == "camera.hands_side") g_p.hands_side = n < 0 ? 0 : n > 1.5 ? 1.5 : n;
     if (id == "camera.hands_aim") g_p.hands_aim = n < 0 ? 0 : n > 1 ? 1 : n;
+    if (id == "camera.hands_aim_side") g_p.hands_aim_side = n < 0 ? 0 : n > 1.2 ? 1.2 : n;
     if (id == "camera.hands_sight") g_p.hands_sight = n < -0.5 ? -0.5 : n > 1.5 ? 1.5 : n;
     if (id == "camera.hands_follow") g_p.hands_follow = n < 0 ? 0 : n > 2 ? 2 : n;
     if (id == "camera.hands_motion") g_p.hands_motion = n < 0 ? 0 : n > 1 ? 1 : n;
@@ -1662,6 +1859,7 @@ void firstperson_register() {
   });
   camera_filter_add(0, fp_filter);
   camera_prerender_add(fp_prerender);
+  fpcontrols_register();
   // `quiver lab call <i> fp [status]`; `fp slot N`: the player's slot N world position (probe).
   lab_verb("fp", [](const std::vector<std::string>& a, bool& ok) -> std::string {
     if (a.empty() || a[0] == "status") return status();
@@ -1795,6 +1993,70 @@ void firstperson_register() {
         }
         snprintf(b, sizeof b, "],\"render_count\":%d}", nm);
         return o + b;
+      }, ok);
+    }
+    if (a[0] == "aim" && G.ok) {
+      // Aim convergence: the game's aim (target, origin, direction), the view's centre against it,
+      // the flashlight's beam (slot 0, as posed) against it, the weapon's target, and the last shots
+      // (bullet tracers) as offsets from the screen centre of the view they were fired in.
+      return job_call([] {
+        const float* ao = aim_obj();
+        void* ch = player();
+        if (!ao || !ch) return json_str("no aim object / player");
+        double t[3] = {ao[0], ao[1], ao[2]}, d[3];
+        v_sub(t, g_view_eye, d);
+        double dist = v_len(d);
+        double tv = g_vm.tan_v, th = tv * 16.0 / 9.0;
+        auto px = [&](const double* eye, const double (*R)[3], const double* p, double* o) {
+          double q[3];
+          v_sub(p, eye, q);
+          double z = v_dot(q, R[2]);
+          o[0] = z > 1e-4 ? v_dot(q, R[0]) / z / th * 960 : 1e9;
+          o[1] = z > 1e-4 ? v_dot(q, R[1]) / z / tv * 540 : 1e9;
+        };
+        double c[2];
+        px(g_view_eye, g_view_R, t, c);
+        // the beam: slot 0 (the flashlight's light, as posed) forward against its line to the target
+        float s0[12];  // through the hooked getter: the posed flashlight (what the beam and the damage cone use)
+        reinterpret_cast<BoneSlotFn>(game_image().at(RVA_BONE_SLOT))(ch, s0, 0);
+        double bp[3] = {s0[9], s0[10], s0[11]}, bf[3] = {s0[6], s0[7], s0[8]}, bt[3];
+        v_sub(t, bp, bt);
+        normalize(bt);
+        normalize(bf);
+        double beam_err = std::acos(std::fmax(-1.0, std::fmin(1.0, v_dot(bf, bt)))) * 180 / M_PI;
+        // where the beam's axis passes at the target's distance, in screen pixels
+        double tq[3];
+        v_sub(t, bp, tq);
+        double tb_len = v_len(tq);
+        double beam_pt[3] = {bp[0] + bf[0] * tb_len, bp[1] + bf[1] * tb_len, bp[2] + bf[2] * tb_len}, bc[2];
+        px(g_view_eye, g_view_R, beam_pt, bc);
+        void* wp = rd<void*>(ch, kCharWeapon);
+        char b[1400];
+        snprintf(b, sizeof b,
+                 "{\"aim_from\":\"%s\",\"hook\":%s,\"origin_applied\":%llu,\"target\":[%.3f,%.3f,%.3f],"
+                 "\"origin\":[%.3f,%.3f,%.3f],\"dir\":[%.3f,%.3f,%.3f],\"flags\":\"%02x%02x%02x%02x\","
+                 "\"eye\":%s,\"target_dist\":%.2f,\"target_px\":[%.1f,%.1f],\"beam_err_deg\":%.2f,"
+                 "\"beam_px\":[%.1f,%.1f],\"weapon_target\":[%.3f,%.3f,%.3f],\"shots\":[",
+                 params().aim_eye ? "eye" : "game", g_aim_ok ? "true" : "false",
+                 (unsigned long long)g_aim_origin_applied.load(), ao[0], ao[1], ao[2], ao[3], ao[4], ao[5], ao[6],
+                 ao[7], ao[8], rd<uint8_t>(ao, 0x2c), rd<uint8_t>(ao, 0x2d), rd<uint8_t>(ao, 0x2e),
+                 rd<uint8_t>(ao, 0x2f), fmt3(g_view_eye).c_str(), dist, c[0], c[1], beam_err, bc[0], bc[1],
+                 wp ? rd<float>(wp, 0x198) : 0.f, wp ? rd<float>(wp, 0x19c) : 0.f, wp ? rd<float>(wp, 0x1a0) : 0.f);
+        std::string o = b;
+        std::lock_guard lk(g_shot_mu);
+        int n = g_nshots < 8 ? g_nshots : 8;
+        for (int k = 0; k < n; k++) {
+          const ShotLog& s = g_shots[(g_nshots - 1 - k) % 8];
+          double to[3] = {s.to[0], s.to[1], s.to[2]}, sc[2], q[3];
+          px(s.eye, s.R, to, sc);
+          v_sub(to, s.eye, q);
+          snprintf(b, sizeof b, "%s{\"frame\":%llu,\"from\":[%.2f,%.2f,%.2f],\"to\":[%.2f,%.2f,%.2f],\"dist\":%.2f,"
+                   "\"px\":[%.1f,%.1f]}",
+                   k ? "," : "", (unsigned long long)s.frame, s.from[0], s.from[1], s.from[2], s.to[0], s.to[1],
+                   s.to[2], v_len(q), sc[0], sc[1]);
+          o += b;
+        }
+        return o + "]}";
       }, ok);
     }
     if (a[0] == "vmtest" && a.size() > 1) {
@@ -1932,6 +2194,28 @@ void firstperson_start() {
     }
   }
   if (!g_vm_ok) TB_LOG("firstperson: framing = close unavailable; the arms stay as animated");
+  // aim_from = eye: the aim origin hook (without it the view converges at aim_distance, 0.6.4)
+  g_aim_ok = true;
+  for (auto& s : kAimSigs)
+    if (!sig_ok(s.rva, s.hex)) {
+      TB_LOG("firstperson: signature mismatch at rva 0x%zx; aim_from = eye unavailable (aim_distance instead)",
+             (size_t)s.rva);
+      g_aim_ok = false;
+      break;
+    }
+  if (g_aim_ok) {
+    g_aim_obj = static_cast<void**>(rip_target(game_image().at(RVA_AIM_GET), 3, 7));
+    g_playercam = static_cast<void**>(rip_target(game_image().at(RVA_PLAYERCAM), 3, 7));
+    g_aim_ok = game_image().contains(reinterpret_cast<uintptr_t>(g_aim_obj)) &&
+               game_image().contains(reinterpret_cast<uintptr_t>(g_playercam)) &&
+               hook_fn(reinterpret_cast<void*>(game_image().at(RVA_AIM_ORIGIN)), reinterpret_cast<void*>(&hk_aim_origin),
+                       reinterpret_cast<void**>(&g_o_aim_origin), "PlayerAim origin");
+    if (g_aim_ok)
+      hook_fn(reinterpret_cast<void*>(game_image().at(RVA_TRACER_ADD)), reinterpret_cast<void*>(&hk_tracer),
+              reinterpret_cast<void**>(&g_o_tracer), "bullet tracer");
+  }
+  if (!g_aim_ok) TB_LOG("firstperson: aim_from = eye unavailable; the view converges at aim_distance");
+  fpcontrols_start();
   TB_LOG("firstperson: ready (rendered camera at %p)", (void*)G.cameraman);
 }
 

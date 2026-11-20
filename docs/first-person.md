@@ -18,12 +18,16 @@ reads the third-person camera. Cutscene, free, death and vehicle cameras and scr
 the player camera fall back to the game's camera (and the body comes back). It composes with
 stereo: first person is a camera filter that runs before the stereo eye offset, so `sbs` renders
 both eyes around the first-person eye point (measured depth-dependent disparity). What it is not
-yet: a first-person game in every respect (aim parallax at close range, DOF focus and sound
-listener still at the third-person camera, head bob only low-passed). Since 0.6.4 (`framing =
+yet: a first-person game in every respect (DOF focus and sound listener still at the third-person
+camera, head bob only low-passed, the shadow shows the posed arms). Since 0.6.4 (`framing =
 close`, the default, section 10) the arms are re-posed as a viewmodel: the flashlight in the
 left hand at the lower left, the gun in the right hand at the lower right, the beam from the hand
-to the screen centre, and a two-handed sight picture when aiming; `framing = classic` keeps the
-third-person arms of 0.6.3 (they show only when aiming or looking down).
+to the screen centre; `framing = classic` keeps the third-person arms of 0.6.3 (they show only
+when aiming or looking down). Since 0.6.7: the game's aim ray starts at the eye and the view looks
+at its target, so the screen centre, the bullets and the beam meet at every distance (`aim_from =
+eye`, section 11); the hands sit further apart, also when aiming (section 10); and `controls =
+deliberate` (the default in first person, section 12) holsters the gun until you aim, gives the
+flashlight's boost its own button and lets you switch the flashlight off.
 
 Addresses are RVAs (image base 0x140000000) of `Game_f_x64_EOS.exe` (Epic, 2026-11). "static" =
 read in Ghidra (`re/scripts/Serve.java`), "live" = observed in the lab (instance `awr-fp`,
@@ -39,17 +43,26 @@ mode = first_person   ; third_person = the game's camera (inert)
 fov = 0               ; horizontal degrees at 16:9 in first person, 0 = the game's (game.fov)
 hide = head           ; head (default: arms, body, held items visible) | all | body | none
 framing = close       ; close (default: viewmodel arms, section 10) | classic (0.6.3's arms)
+controls = deliberate ; deliberate (default: holstered gun, boost button, light switch; section 12) | game
+holster_delay = 3     ; s after the last aim / shot / reload before the gun is put away
+key_boost = KeyV      ; deliberate: hold to boost (a list works: KeyV, Mouse4)
+key_flashlight = KeyT ; deliberate: flashlight off / on
+pad_boost = RB        ; pad buttons: A B X Y LB RB LT RT L3 R3 Back Start DPadUp.. none
+pad_flashlight = DPadUp
+pad_moves = THROW_ITEM:R3, HOLD_FLARE:R3, TOGGLE_SIDE:none, INVENTORY_UP:L3
 hands_forward = 0.34  ; close: resting wrists this far ahead of the eye (m)
 hands_drop = 0.65     ; ... this fraction of the half-height below the centre
-hands_side = 0.40     ; ... this fraction of the half-width out to their side
+hands_side = 0.60     ; ... this fraction of the half-width out to their side (0.40 up to 0.6.6)
 hands_sight = 0.60    ; aiming: the gun hand this fraction of the half-height below the centre
+hands_aim_side = 0.35 ; aiming: the flashlight hand this far left (0 = 0.6.4's two-handed grip)
 hands_motion = 0.5    ; how much of the animation's own hand motion shows on top of the pose
 hands_sway = 0.06     ; s: the hands trail the view's turns
 anchor = head         ; head (animated) | body (root + eye_height)
 smooth = 0.1          ; s, low-pass on the head's motion relative to the body
 eye_up = 0.05         ; m above the head slot
 eye_forward = 0.10    ; m ahead of it (camera's horizontal forward)
-aim_distance = 15     ; m, look at this point of the game camera's centre ray (0 = parallel)
+aim_from = eye        ; eye (default: aim ray from the eye, section 11) | game (0.6.4)
+aim_distance = 15     ; aim_from = game: m, look at this point of the game camera's centre ray
 ```
 
 All live (`quiver lab call <i> cfg camera.mode first_person`). Lab verb: `quiver lab call <i> fp`
@@ -67,7 +80,10 @@ what the game's Developer Menu cheats do: revolver, flare gun, shotgun; flashlig
 `fp vmtest on|off` (test aid: pose the arms in third person too, for an eye looking along Alan's
 facing), `fp skel` (the animation skeleton: joints, parents, positions, slot table, render-bone
 map), `fp slotm S...` (world transforms of slots), `fp peek ADDR [N]` (RE aid: bytes at an RVA or
-address).
+address), `fp aim` (section 11: the game's aim target, origin and direction, the target's and the
+posed beam's offset from the screen centre in pixels, the last shots' hit points as pixel offsets
+in the view they were fired in). `quiver lab call <i> fpc [state|pad]` (section 12: the control
+scheme's state; the game's pad action table as it is now).
 
 ---
 
@@ -197,8 +213,8 @@ camera. Consequences (live unless marked):
 | movement | relative to the (unchanged) game camera's heading, which is the view's heading: W walks into the view (live: 2 s of W moved the player 5.7 m along the view) |
 | mouse look | unchanged (it turns the game camera, the view follows); pitch clamped to +/-60 deg |
 | flashlight aim / focus | the game aims along its own camera's centre ray; the beam leaves the (hidden) left hand at the lower left and reaches the aimed point; "[F] Focus" works and burns the Taken birds (`fp-aim.jpg`, `fp-focus-birds.jpg`) |
-| aim parallax | the game camera is ~2.9 m from the eye (measured: game camera (1383.26, 46.77, 2263.48), head (1385.54, 46.87, 2261.72)), behind and right of Alan. With `aim_distance = 15` the view looks at the 15 m point of that ray: the screen centre is on target at 15 m, off by roughly atan(0.5 m / d) for other distances d |
-| gun | not tested (the fixture's Alan has no gun yet); same aiming path as the flashlight (static assumption) |
+| aim parallax | up to 0.6.6: the view looked at the 15 m point of the game camera's ray and was off at other distances. Since 0.6.7 none: the aim ray starts at the eye (section 11; measured: shots at 1, 18 and 38 m land 0.0-0.1 px from the screen centre) |
+| gun | aims and fires at the same target (section 11); with `controls = deliberate` it is holstered until aim (section 12) |
 | dodge / cinematic moments | stay first person (mode 0) |
 | interaction prompts, HUD, objective text | screen-space, unchanged; the red world-space threat arc still draws |
 | use, pickups (batteries, ammo, supply cases) | the game picks the target from the player's position and facing and its own aim point, as in third person; works with every `hide` setting since 0.6.2 (section 5) |
@@ -527,8 +543,8 @@ helicopter shot fallback, stereo sbs (hsbs) around the first-person eye.
 
 Doesn't, or not yet:
 
-- **Aim parallax**: the game aims from its third-person camera; the screen centre matches the
-  aim point only at `aim_distance`. Close targets (a Taken at 3 m) will be off by ~10 deg.
+- **Aim parallax**: fixed in 0.6.7 (`aim_from = eye`, section 11). With `aim_from = game` the
+  screen centre matches the aim point only at `aim_distance`.
 - **Arms**: fixed in 0.6.4 by `framing = close` (section 10). With `framing = classic` the hands
   are the third-person animation's (they show when aiming or looking down 40 deg or more). With
   `hide = all` only the beam shows; `hide = body` keeps the flashlight and gun floating.
@@ -538,7 +554,8 @@ Doesn't, or not yet:
 - **Pitch** stays clamped at +/-60 deg (the game camera's limit).
 - **DOF focus and the sound listener** stay at the third-person camera (static).
 - Probably no player shadow with `hide = body/all` (render-object flag 8; not checked). With
-  `hide = head` the shadow is complete (live, section 6).
+  `hide = head` the shadow is complete (live, section 6) but shows the viewmodel's posed arms
+  (section 13).
 - Not tested: guns, driving, Bink and in-engine cutscenes in first person (static reasoning only),
   death, scripts that hide the character for their own reasons while first person is active (ours
   stands aside while the game's mask hides the character, by design).
@@ -547,10 +564,7 @@ Doesn't, or not yet:
 
 ## 9. Next steps (prioritised)
 
-1. **Aim from the eye**: find the game's aim ray (the flashlight/gun target: TailCamera aim
-   state, `Aim:*` / adhesion code, "Light:Aim beam" users) and either feed it the first-person
-   camera (the float transform at +0xcc8 of the Cameraman camera, read by `0x1d2400(true)`
-   callers) or converge the view on the actual hit point each frame instead of a fixed distance.
+1. **Aim from the eye**: done in 0.6.7 (section 11).
 2. **Head and body**: done in 0.6.3 (`hide = head`, section 6). Left: the torso and legs are below
    the frame even at the pitch limit; see section 6 "Next steps" (a first-person pitch range, a
    camera-relative arm pose).
@@ -698,11 +712,11 @@ The pose itself is not rewritten; its two outputs are, with the same rigid per-s
 
 - **Light damage follows the posed beam** (static: `0x22e590` passes the slot-0 transform it got
   from `0x179f10`, now posed, to the damage cone `0x22c3e0`; live: the slot hook applies every
-  frame and the beam ends at the screen centre). Not measured: damage against a Taken. The
-  flashlight aims at the convergence point (`aim_distance`), so section 3's parallax applies to
-  the beam as to the reticle.
+  frame and the beam ends at the screen centre). Since 0.6.7 the beam aims at the game's aim
+  target from the eye (section 11); live: the Taken birds of level 15 burn in the beam's centre,
+  unboosted and boosted (`fp-aim-eye.jpg`, `fp-deliberate.jpg`).
 - **Shadow**: the arms' shadow is posed too (main and shadow passes share the skinned vertices):
-  Alan's shadow holds his arms up in front.
+  Alan's shadow holds his arms up in front. Section 13 has the investigation.
 - **Big swings**: in level 15's combat idle the gun hand hangs ~0.4 m behind the eye, so the arm
   swings ~150 deg; the sleeves stay whole (near plane, plane-keeping IK, shrug, jacket panels),
   but the revolver points steeply up-forward in the lower right (`fp-close-idle.jpg`) and the
@@ -711,6 +725,249 @@ The pose itself is not rewritten; its two outputs are, with the same rigid per-s
   only the translation.
 - Dodges, cinematic moments and the bird attacks' slow motion go through the same pose; nothing
   special-cases them. The hands leave the frame when looking up past +30 deg.
-- Not tested: the shotgun and flare gun (the left hand keeps its animated offset from the right,
-  so it should hold the fore-end), throwables (thrown from the posed hand), a gamepad, damage
-  numbers.
+- Not tested: the shotgun and flare gun (with `hands_aim_side = 0` the left hand keeps its
+  animated offset from the right, so it should hold the fore-end; with the default it is held
+  apart), throwables (thrown from the posed hand), a gamepad, damage numbers.
+
+### Hands apart (0.6.7)
+
+User request: "move the flashlight and gun further apart, even if it's unphysical". Resting hands
+`hands_side` 0.40 -> 0.60 of the half-width. Aiming: the gun hand comes to just right of the centre
+at the sight line (0.10 of the half-width, `hands_sight` below), the flashlight hand to
+`hands_aim_side` (0.35) of the half-width left of the centre, both turned to the aim point; 0.6.4
+put the flashlight hand at its animated offset from the gun hand (the aim stance's two-handed
+grip, flashlight under the barrel). On its own the aim stance's left hand is palm up under where
+the gun would be (live, a flashlight lying on an open palm), so when held apart it keeps the
+orientation it had at rest, relative to the view (stored while the arm is down, blended in by the
+arm's raise), then turns to the aim; the beam is turned on its current direction (no low-pass),
+so it stays on the aim point (live: `fp aim` beam error 0.02-0.3 deg at rest and aiming, 3 deg at
+a wall 1 m away). `hands_aim_side = 0` gives back 0.6.4's grip.
+
+![before (top: 0.6.4 hands, the game's controls; rest and aim) and after (bottom: hands apart, deliberate controls; holstered rest and aim)](img/fp-hands-apart.jpg)
+
+## 11. Aim from the eye (0.6.7)
+
+User report (0.6.4): "the gun doesn't seem to actually hit where the flashlight is pointed". Up to
+0.6.6 the game aimed from its own (third-person) camera and the first-person view looked at that
+ray's point 15 m out (`aim_distance`), so the screen centre, the beam and the bullets agreed only
+at 15 m. Result: `[camera] aim_from = eye` (default): the game's aim ray starts at the eye and the
+view looks at what it hits; they agree at every distance (measured below). Lab `awr-fp`,
+1920x1080, fixture `awr-forest-night` (level 15), build 0.6.7.
+
+### How the game aims (static, Ghidra; live where marked)
+
+- **PlayerAim** (one object, the global behind the getter `0x2f3d10`; updated by `0x2f53c0` from
+  `PlayerInputReader` vtable +0x28 = `0x2a1310`): +0 the **target point**, +0xc the **ray origin**,
+  +0x18 the **aim direction**, +0x24 yaw / +0x28 pitch (mouse look and the right stick turn these,
+  actions 5/6; the pitch is clamped by `Aim:Min/Max Vertical Angle`), +0x2c..+0x2f flags (target is
+  a character of another faction / the same faction / ...; target more than 1 m away). The turn
+  speed is slowed near characters by the aim assistance (`Aim:Adhesion*`, `Aim:Assistance*`; rays
+  `0x405920` mask 0x28 to the candidates).
+- The origin is `0x2f3bb0(player)`: the fixed model-space point (-0.10, 1.28 - controller height,
+  0.12) times the character transform, **a point on Alan's chest**, not the camera. The target is
+  the first hit of origin + direction x 100 m (`0x405920`, mask 0x27) or the ray's end.
+- Everything aims at that target: `PlayerInputReader` vtable +0x80 (`0x29f2f0`) returns the
+  auto-aim lock if there is one (`0x181bc0`) else PlayerAim +0; the weapon's pre-update `0x341d80`
+  (from `Character::updateAnimation` `0x17f600`) copies it to WeaponHolder +0x198 (plus
+  dispersion); the shot `0x342b60` casts from the muzzle (slot 9) towards +0x198 and, for the
+  player, a sphere cast from slot 0's animated position (`0x179ff0`) to find a character; bullet
+  tracers `0x346120(mgr, from, hit)`. The animation's aim and the flashlight (`0x22f7f0`) take the
+  AimDirection controller's point (`0x13e350`), which follows the same target. The TailCamera
+  follows the aim direction and looks at the target from over the shoulder; `PlayerCamera::update`
+  `0x29d380` writes the direction itself only for script look-ats (`0x2f5390`).
+- The use target's ray check (`0x321a10`) starts at the camera position: unchanged; use and
+  pickups work (section 5, and live in section 12).
+
+### What `aim_from = eye` does (`src/features/firstperson.cpp`, "aim from the eye")
+
+1. **Hook `0x2f3bb0`**: in first person (active, the player) the origin becomes the eye, computed
+   from the character's current root plus the head offset smoothed by the last view (+ `eye_up`,
+   `eye_forward`), so running does not leave the ray a frame behind. Third person: pass-through.
+2. **The view looks at PlayerAim +0** (along +0x18 when the target is closer than 0.3 m), world up,
+   plus the game camera's shake and recoil: the Cameraman camera's rotation relative to the
+   PlayerCamera's (+0xcc8), which is what `CameraMan` `0x172db0` adds between the two.
+3. **The viewmodel's aim point is the target**: the flashlight (and the damage cone built from it,
+   `0x22c3e0`) and the gun turn to it; the flashlight's turn is computed on its current direction
+   (no low-pass) so the beam stays on it.
+4. Fallback: a signature mismatch (`kAimSigs`: the getter, the origin function and its constant
+   offset, the call site in `0x2f53c0`, the PlayerCamera getter, the tracer function) keeps 0.6.4's
+   `aim_distance` convergence. `aim_from = game` selects that too.
+
+### Measured (live, `fp aim`)
+
+| target | distance | the shot's hit, px from the screen centre | beam |
+|---|---|---|---|
+| warehouse wall | 38.2 m | (0.0, 0.0) | spot on the centre, error 0.06 deg |
+| overturned van | 18.4 m | (-0.1, 0.0) | 0.14 deg |
+| van side, flashlight off | 1.02 m | (0.0, 0.0) | - (3.2 deg with the light on at 1 m: the hand is 0.35 m left of the eye) |
+| sky (no hit, the ray's end) | 100 m | (-0.1, 0.0) | 0.02 deg |
+| bird swarm (Taken), unboosted and boosted | 10-40 m | - | the birds burn in the beam's centre, on the screen centre |
+
+In third person `origin_applied` stops counting and the origin is back on the chest (live).
+
+![shots at 38 m and 18 m (top), at a wall 1 m away with the light off, and the beam on the Taken birds (bottom)](img/fp-aim-eye.jpg)
+
+### Crosshair
+
+The game draws no crosshair on PC (live: with the flashlight off nothing marks the aim). Its aim
+cue is the flashlight's focus ring, drawn in the world on the lit spot (live, `fp-aim-eye.jpg`),
+so in stereo it is at the target's depth; with the aim from the eye it is on the screen centre at
+every distance. While the light is on no crosshair is needed. `[camera] crosshair` was **not
+implemented**: the case left is the flashlight switched off or empty (section 12); the game has no
+2D draw entry point we found (no named Draw2D API; only `Draw2D::videoQuad` `0x464c00`), so it
+would be a D3D12 overlay after the HUD, and drawn at screen depth it would disagree with distant
+targets in sbs (like the HUD). Proposal: `crosshair = off | aim | always`, a small dot drawn per
+eye at PlayerAim +0's depth.
+
+## 12. Controls: scheme A, "deliberate" (0.6.7)
+
+The user chose scheme A ("deliberate draw") from: (A) gun holstered by default, aim draws it,
+boost on its own button; (B) an explicit flashlight switch; (C) the game's aim model improved.
+`[camera] controls = deliberate` (default; first person only) implements A with B.
+`controls = game` and third person keep the game's controls (every hook passes through).
+
+### The game's input (static, Ghidra; live where marked)
+
+- **Actions**: an enum of 0xa4 (names from `0x19e20`): 2 JUMP, 3 SHOOT, 4 RELOAD, 5/6 CAMERA_X/Y,
+  0x15 TURBOBOOST (sprint, dodge), 0x16 TOGGLE_SPRINT, 0x26 TOGGLE_MANUSCRIPT, 0x28
+  TOGGLE_LIGHTSOURCE, 0x29..0x2d INVENTORY_UP/RIGHT/DOWN/LEFT/EXTRA, 0x2e USE, 0x33 THROW_ITEM,
+  0x34 HOLD_FLARE, 0x36 PUSH_BACK, 0x37 TOGGLE_SIDE, 0x38 RELOAD_BATTERY, **0x39 LIGHT_BOOST**,
+  0x4d LOOK_AT ("Focus"), 0x9f..0xa3 MOVE_* / WALK.
+- **Keyboard**: `std::map<action, VK>` behind `0xd34230` (docs/settings.md); defaults (`0x3ff960`,
+  live keybinds.xml): LMB SHOOT, RMB LIGHT_BOOST, MMB THROW_ITEM, Shift TURBOBOOST, Ctrl WALK,
+  Space JUMP, E USE, R RELOAD, Q RELOAD_BATTERY, F LOOK_AT, Tab TOGGLE_SIDE, 1-5 inventory, F5
+  manuscript. Free: T, V, C, X, Z, G, B. Queries: `0x3fe3b0` held (the key state array behind
+  `0x3fe3eb`: byte VK + 0x1c, bit 0), `0x3fe330` pressed.
+- **Pad**: `input::Gamepad_Windows` (vtable `0x7824c8`) reads `XInputGetState` in `0x400190`; a
+  button index is the XINPUT_GAMEPAD bit (0 D-pad up .. 9 RB, 12 A .. 15 Y), 16 LT, 17 RT. Per
+  layout an action table (0xa4 x 0x18 bytes: type, context mask, button; `PTR 0x9461a0[layout]`,
+  the current one behind `0x3fe5cc`); "swap sticks / triggers" (`0x3fec00`) swap 6/7, 8/9 and
+  16/17 in it. Queries `0x3fe5a0` (digital), `0x3fe450` (value -1..1). Layout 1 on foot (live,
+  `fpc pad`): LT LIGHT_BOOST (analog), RT SHOOT, LB TURBOBOOST + TOGGLE_SPRINT, **RB THROW_ITEM +
+  HOLD_FLARE**, A JUMP, B USE (+ TOGGLE_LIGHTSOURCE), X RELOAD, Y RELOAD_BATTERY, L3 LOOK_AT +
+  PUSH_BACK, R3 TOGGLE_SIDE, Back manuscript, Start menu, **D-pad up INVENTORY_UP (the long
+  gun)**, right handgun, left flare gun, down throwables (live with keys 1-4). No button is free.
+- **Aim and boost** are one action: `PlayerInputReader::update` `0x2a0940` asks `0x2a05c0`
+  "aiming" (keyboard held, or LT past -0.9: raises the weapon `0x341510` -> WeaponHolder +0x18c,
+  the camera's aim stance, the animation's aim) and `0x2a0660` "boosting" (LT past 0.2), both
+  gated by the flashlight's boost permission (Flashlight +0x158, script `EnableLightBoost`,
+  `0x22c3d0`). On a keyboard both are the same key; a half-pulled LT aims without boost.
+- **Shooting**: the reader's ShootInput (+0x70): `0x2d68c0` update (+8/+9 fire latches, +0xb held
+  last update), `0x2d6840` "fire held" (SHOOT held, or RT past `0x29f930`).
+- **Flashlight on/off**: Flashlight (Character +0x230) +0x38 on, +0x50/+0x54 fade; the beam, its
+  lights and the light-damage cone exist while on or fading (`0x22e590`, `0x22f370`).
+  `Flashlight::switch(on)` `0x22e320` plays ToggleOn / ToggleOff (sound, animation event) and
+  fades (0.1 s off). The game uses it when Alan picks up another light source (`0x231700` off,
+  `0x2315e0` on) and scripts do (`SwitchLightSource`, `0x18c5e0`); the player has no switch:
+  TOGGLE_LIGHTSOURCE (pad B) has no reader we found. Off is a normal game state: aiming and boost
+  still work (they check +0x158 only), there is no light and no light damage (live).
+- **Weapon**: the game has no holster; once Alan has a gun it is always in his right hand.
+  WeaponHolder (Character +0x220): +0x30/+0x38 the mesh's render object, +0x1c hidden (`0x340340`;
+  the game hides it during use animations), +0x18c raised (from the reader), +0x194 the
+  animation's raise state (`raise_weapon` / `lower_weapon` events, `0x341890`), +0xe fire, +0x128
+  the current weapon (`0x344710`, `0x3441d0`), +0x198 its target. Selection: `0x21ec50` (D-pad /
+  1-5).
+- **Remapping per mode** works without input injection: answer the reader's predicates per mode
+  (hooks), patch the pad action table in place (as the game's own swap does), read our own keys
+  from the game's key state array.
+
+### Options and cost (as investigated)
+
+| option | what it needs | cost | status |
+|---|---|---|---|
+| A: holstered gun, aim draws, boost on its own button | hooks on the two predicates, ShootInput update / pressed and the reader update; the weapon mesh's hidden flag; a holster pose in the viewmodel; pad table patches for the displaced actions | medium | **done (0.6.7)** |
+| B: flashlight switch | the game's `0x22e320` from the reader update on a key edge; switched back on when first person stops | low | **done**, part of A |
+| C: improve the game's aim model | aim from the eye (section 11) for every scheme; further: hold vs toggle aim, the aim-assist tweakables (`Aim:Adhesion*`, `Aim:Assistance*`, `Combat:Auto Aim Radius`) as options | low-medium | aim from the eye done; the rest open |
+
+### What `controls = deliberate` does (`src/features/fpcontrols.cpp`)
+
+- **Gun**: holstered when first person starts. Aim (the game's LIGHT_BOOST binding: right mouse /
+  LT) draws it; fire (left mouse / RT) shoots while it is drawn; it is holstered `holster_delay`
+  (3) s after the last aim, shot or reload. **Fire while holstered draws the gun**; the shot goes
+  off once it is up (0.2 s) if fire is still held, a tap only draws (chosen over "nothing", which
+  reads as a broken button, and over an instant shot from a hidden gun). While holstered or coming
+  up, ShootInput is held idle (`0x2d68c0` skipped with its latches cleared; `0x2d6840` false).
+  Holstered = the gun mesh hidden (render-object flag 8 on WeaponHolder +0x38, once the arm is out
+  of view; the game's own +0x1c state back when drawn and when the scheme stops) and the
+  viewmodel's right wrist lowered to the hip below the frame; drawing and holstering blend in
+  ~0.2 s.
+- **Boost**: `key_boost` (V) / `pad_boost` (RB), held. "Boosting" is our button (and the game's
+  permission); "aiming" is the game's aim input or our boost: boost alone raises the flashlight
+  (the game's aim stance; the gun stays holstered); aim plus boost is the move against the Taken.
+- **Flashlight switch**: `key_flashlight` (T) / `pad_flashlight` (D-pad up), on the press edge,
+  through `0x22e320`; when first person or the scheme stops with the light off because of us, it
+  is switched back on.
+- **Pad**: the game's actions on RB and D-pad up move while the scheme applies (`pad_moves`):
+  THROW_ITEM and HOLD_FLARE to R3 (its TOGGLE_SIDE only swaps the hidden third-person camera's
+  shoulder, muted), INVENTORY_UP (the long gun) to L3 (shared with the contextual Focus). The
+  entries are put back when the scheme stops. Keyboard: no game binding changes (V and T are free;
+  F is LOOK_AT, "[F] Focus", so it was not used for the flashlight).
+- Inert: `controls = game` or third person: the predicate and shoot hooks return the originals, no
+  table patch, no mesh flag (live: `in_use` false, `pad_patches` 0, RMB boosts as in the game, the
+  gun visible in third person). Fallback: any signature mismatch (`kSigs` in fpcontrols.cpp: the
+  reader update, both predicates, ShootInput, the switch, the key state, the pad and value queries,
+  the input flags, the pad reader) leaves the game's controls.
+
+### Tested (live, 0.6.7 build, keyboard and mouse; the pad mapping is static only)
+
+| case | result |
+|---|---|
+| start of first person | gun holstered: only the flashlight hand in view (`fp-deliberate.jpg`) |
+| RMB held | gun drawn and raised right of the centre, flashlight left, both on the aim point |
+| LMB while drawn | shots at 1-38 m on the screen centre (section 11) |
+| RMB released | holstered after 3.0 s (`holsters` 1) |
+| LMB while holstered | the gun is drawn (`draw` rising), no shot from the tap (ammo unchanged) |
+| T | flashlight off (no beam, `fp-deliberate.jpg`); T again: on |
+| RMB + V | boosted beam, battery draining, the bird swarm burns; V alone boosts too |
+| pickup ("Pick up revolver", level 15 shed) | picked up (39 -> 42 rounds) with the gun holstered |
+| dodge (D + Shift) | a 2.9 m sideways burst; walking unchanged |
+| `controls = game` | RMB aims and boosts as in the game, gun out, no patches |
+| third person | inert; the gun visible; the aim origin back on the chest |
+| `framing = classic`, `hide = body` / `head` | work (arms hidden / shown) |
+| stereo `sbs`, `output = hsbs` | both eyes, the gun in both with depth (`fp-deliberate-stereo-hsbs.jpg`) |
+
+![holstered at rest, flashlight off (top); boost while aiming, pickup with the gun holstered (bottom)](img/fp-deliberate.jpg)
+![stereo hsbs, aiming in first person](img/fp-deliberate-stereo-hsbs.jpg)
+
+Risks: the pad mapping was not tested with a pad (the lab sends keyboard and mouse only; the table
+and the button indices are static plus the live table dump); with "swap triggers" on, the game
+swaps LB/RB in its table, while our `pad_boost` reads the physical button; `classic` framing
+holsters by hiding the mesh only (the right arm stays animated, so boosting shows the empty right
+hand in the aim stance); throwing while holstered was not tried.
+
+## 13. A separate shadow skeleton (investigation, 0.6.7)
+
+Goal: the main view shows the viewmodel's posed arms, the shadow (and any other pass) the
+untouched third-person pose. Not implemented; findings (static, Ghidra, plus docs/stereo.md
+section 5, measured there):
+
+- **The palette** (BoneArray +0x10, inverse bind x bone, `0x4b2390`) is built once per frame per
+  render object, stamped with the frame counter (`0xd744f8`) at rend::Object +0xf0 (seen in the
+  shadow dispatch `0x46dff0`; section 6 also lists `0x46d740`).
+- **Skinning is GPU work**: per submesh a `rend::VSSkinningPrimitiveCommand` or
+  `rend::ComputeSkinningPrimitiveCommand` (`0x4c5ec0`) is added to the render command list with a
+  sort key in the skinning phase, writing that submesh's skinned vertex buffer. rend::Object +0xf8
+  holds per submesh {stamp, buffer[2]}: the current one is buffer[counter & 1] (`0x46d650`), the
+  other is last frame's, read for skinned motion vectors (`0x46d680`, `0x4c9c90`); the first
+  collection of the frame that draws the submesh skins it (`0x46d6f0` stale check, called from both
+  `0x4cad50` and `0x4cd150`), every later pass reuses it.
+- (b) **Skinning twice with two palettes does not work as-is**: one current buffer per submesh per
+  frame; the other holds last frame's skin for motion vectors; a second skin of the current buffer
+  would be sorted with the first (both before the draws), so both passes would see the last one.
+  It needs a third buffer per submesh and redirected draws.
+- (a) **A shadow-only twin of the body is the feasible route**: a second render slot for the
+  player's mesh, created as `Character::init` `0x1794a0` does (`0x2afcc0`: rend::Object + BoneArray,
+  own skinned buffers), its bones set every frame from the unposed export (`0x184080`'s output
+  before our deltas, through `BoneArray::setBone` `0x168a50`), its transform copied, added to the
+  scene; our main-collection hook (`0x4cad50`) leaves the twin out of the main view and a
+  shadow-collection hook (`0x4cd150`, or its mask test at `0x4cd6a5`) leaves the posed original out
+  of the shadows. The flashlight and gun are rigid render objects (Flashlight +0xc8, WeaponHolder
+  +0x38): their twins need only a transform (the unposed slot 0 / 9). Cost: high (scene
+  registration and lifetime across level loads, LOD weights, one more skinned character in the
+  shadow passes). Risk: medium (engine object lifetime).
+- (c) **Cheapest partial**: leave the hands submesh (both hands, section 6) out of the shadow
+  collection while posed: the raised hands' shadow goes, the sleeves' stays (they are in the jacket
+  and hoodie submeshes with the torso). Not worth shipping on its own.
+
+Recommendation: (a) when the shadow matters enough; gameplay is unaffected either way (the light
+cone and the shots use the converged first-person values, section 11).
