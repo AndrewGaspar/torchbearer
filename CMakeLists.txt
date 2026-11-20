@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(torchbearer LANGUAGES C CXX)
-set(TB_VERSION "0.6.7")
+set(TB_VERSION "0.6.8")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +48,8 @@ add_library(torchbearer SHARED
   src/features/rt/census.cpp
   src/features/rt/dxr.cpp
   src/features/rt/dxc.cpp
+  src/features/rt/scene.cpp
+  src/features/rt/trace.cpp
   src/dxgi.def)
 set_target_properties(torchbearer PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 # Dev only: embeds vkd3d-proton's LGPL ray-query test shader for `rt dxrtest` (docs/raytracing.md).

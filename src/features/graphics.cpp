@@ -10,6 +10,7 @@
 #include "core/log.h"
 #include "core/module.h"
 #include "core/present.h"
+#include "features/rt/rt.h"
 
 namespace tb {
 namespace {
@@ -57,6 +58,12 @@ void write(const Branch (&br)[2], uint16_t v) {
 
 bool g_ok_ssao = false, g_ok_hbao = false;
 std::atomic<bool> g_ssao_cfg{false};
+// [graphics] ao: -1 unset (then the older `ssao` key decides), 0 game, 1 ssao, 2 rtao.
+std::atomic<int> g_ao_cfg{-1};
+int ao_mode() {
+  int a = g_ao_cfg.load();
+  return a >= 0 ? a : g_ssao_cfg.load() ? 1 : 0;
+}
 // Wanted branch modes (-1 game, 1 run, 0 skip), applied on the game thread at present.
 std::atomic<int> g_dev_ssao{-2}, g_dev_hbao{-2};  // dev overrides from rt flag (-2: none)
 int g_have_ssao = -1, g_have_hbao = -1;
@@ -64,7 +71,13 @@ int g_have_ssao = -1, g_have_hbao = -1;
 uint16_t code(int mode) { return mode < 0 ? kJz : mode ? kNops : kJmp; }
 
 void on_present(IDXGISwapChain*, uint64_t) {
-  int ws = g_dev_ssao.load() != -2 ? g_dev_ssao.load() : (g_ssao_cfg.load() ? 1 : -1);
+  int mode = ao_mode();
+  // RTAO (rt/scene.cpp, rt/trace.cpp) replaces HBAO's result just before HBAO's apply, so the
+  // game's branches stay as they are.
+  static int last_mode = -1;  // on changes only: `rt scene on/off` (lab) may switch it meanwhile
+  if (mode != last_mode) rt::set_rtao(mode == 2);
+  last_mode = mode;
+  int ws = g_dev_ssao.load() != -2 ? g_dev_ssao.load() : (mode == 1 ? 1 : -1);
   if (g_ok_ssao && ws != g_have_ssao) {
     write(kSsao, code(ws));
     g_have_ssao = ws;
@@ -72,7 +85,7 @@ void on_present(IDXGISwapChain*, uint64_t) {
   }
   // HBAO's apply overwrites the shadow buffer's AO channel after SSAO's (measured), so SSAO only
   // shows with HBAO skipped: the option replaces one with the other.
-  int wh = g_dev_hbao.load() != -2 ? g_dev_hbao.load() : (g_ssao_cfg.load() ? 0 : -1);
+  int wh = g_dev_hbao.load() != -2 ? g_dev_hbao.load() : (mode == 1 ? 0 : -1);
   if (g_ok_hbao && wh != g_have_hbao) {
     write(kHbao, code(wh));
     g_have_hbao = wh;
@@ -85,6 +98,10 @@ void on_present(IDXGISwapChain*, uint64_t) {
 void graphics_register() {
   cfg_listen("graphics.", [](const std::string& id, const std::string& v) {
     if (id == "graphics.ssao") g_ssao_cfg = (v == "1" || v == "on" || v == "true");
+    if (id == "graphics.ao") {
+      g_ao_cfg = v == "game" ? 0 : v == "ssao" ? 1 : v == "rtao" ? 2 : -1;
+      if (!v.empty() && g_ao_cfg.load() < 0) TB_LOG("graphics: unknown ao = %s (game, ssao or rtao)", v.c_str());
+    }
   });
 }
 

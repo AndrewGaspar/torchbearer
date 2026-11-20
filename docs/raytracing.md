@@ -1,8 +1,10 @@
-# Ray tracing in Alan Wake Remastered: feasibility
+# Ray tracing in Alan Wake Remastered: feasibility, RTAO and shadow prototypes
 
 Question from the user: how amenable is the game to replacing its lighting with ray-traced ambient
-occlusion, shadows and global illumination? This note answers it with evidence; the one
-implementation deliverable is `[graphics] ssao` (section 3). Everything is RVA-based
+occlusion, shadows and global illumination? Sections 1-7 are the feasibility study (its
+deliverable: `[graphics] ssao`, section 3); sections 8-12 the implementation that followed:
+geometry capture and acceleration structures (8), ray-traced AO shipped as `[graphics] ao = rtao`
+(9), and the sun/moon (10) and flashlight (11) shadow prototypes, with updated estimates (12). Everything is RVA-based
 (`Game_f_x64_EOS.exe`, image base 0x140000000) like the other notes. Tags: **static** = read in
 Ghidra or in the game's shader files, **live** = observed in the lab with the probe below,
 **measured** = numbers from the lab.
@@ -16,7 +18,13 @@ transforms, pre-skinned vertices in GPU buffers, ~0.7-0.85 M unique triangles dr
 part is alpha-tested foliage (a quarter of the draws). **Go for RTAO**, then sun/moon shadows; the
 flashlight needs a pixel-shader swap; DDGI is possible but large.
 
-Lab: instance `awr-rt` (1920x1080@60), runs r1-r9, fixtures `prologue-road`, `awr-forest-night`
+**Since (sections 8-12):** the capture validates against the G-buffer depth to 0.2 % on 84-90 % of
+geometry pixels (the rest is alpha-tested foliage counted as opaque), RTAO runs in 0.6.8 as an
+experimental option at roughly 3-4 ms per frame at 1080p, the sun prototype runs but needs
+off-screen casters, and the flashlight's shader swap works with **inline ray queries** against the
+same TLAS (verified port, no faults).
+
+Lab: instance `awr-rt` (1920x1080@60), runs r1-r9 (study; r10-r52 for sections 8-11), fixtures `prologue-road`, `awr-forest-night`
 (level 15, flashlight lit), `awr-brightfalls-day`. The instance's graphics settings include 4x
 MSAA on the colour passes (the census shows 4-sample colour targets).
 
@@ -34,6 +42,9 @@ MSAA on the colour passes (the census shows 4-sample colour targets).
 | `rt gpu on/status` | GPU timestamps recorded into the engine's own command lists around its passes |
 | `rt grab NAME PASS:0/1` | copies an engine render target at a pass boundary to a raw file |
 | `rt flag ssao/hbao game/1/0` | forces the SSAO / HBAO branch of the main pass |
+| `rt scene on/off/status` | geometry capture, BLAS/TLAS and the ray passes (sections 8-11); needs the capture installed at launch (`[graphics] ao = rtao` or `[dev] rt_scene = 1`) |
+| `rt scene validate MASK [img]` | primary rays vs the G-buffer depth: error histogram, colour-coded image (`rt_validate.py`) |
+| `rt scene dump N[:PS]`, `buf VA`, `dyn 0-3`, `casters 0/1`, `budget N`, `reset` | debugging: instance transforms, buffer lookups, per-update BLAS parts, shadow casters, build budget |
 
 Device hooks are MinHook on vkd3d-proton's implementation functions (so they coexist with the
 stereo feature's vtable patches); engine markers are hooks on the passes below, each
@@ -126,6 +137,9 @@ with SSAO forced (HBAO off); `pGlossinessRT` A. Each channel stretched between i
 percentile.*
 
 ## 3. The game's built-in SSAO, and `[graphics] ssao`
+
+(0.6.8: superseded by `[graphics] ao = game | ssao | rtao`; `ssao = 1` still applies while `ao` is
+empty or missing, i.e. in configs from before 0.6.8. The Quiver option is now `graphics.ao`.)
 
 Static (Ghidra, main pass `0x506b20`): `rend::SSAO` (RendererX86+0x130) renders at `0x536630`
 when "Render SSAO" (u8 `0xd755e0`) is set and applies at `0x536580`; `rend::HBAO` (+0x138) renders
@@ -254,7 +268,7 @@ into a texture of the same format and let the game's own apply put it in place.
   2.25x that, Performance (960x540) 4x**. For comparison HBAO costs 0.27 ms and the sun resolve
   0.14 ms per eye today; the game is CPU-bound at ~140 renders/s, so there is some GPU slack.
 
-## 7. Go / no-go and estimates
+## 7. Go / no-go and estimates (the study; section 12 updates it)
 
 | feature | verdict | why | effort (one person) | risk |
 |---|---|---|---|---|
@@ -273,7 +287,278 @@ it by tracing primary rays from the camera and comparing hit depth against `pLin
 raygen (compiled at run time with the game's DXC) recorded into the engine's list after HBAO's
 render, writing `g_sHBAOBuffer`.
 
+## 8. Geometry capture, BLAS cache and TLAS (implemented; `src/features/rt/scene.cpp`)
+
+Lab: instance `awr-rt` runs r10-r52 (1920x1080@60, `VKD3D_CONFIG=single_queue` in the instance
+manifest from r18 on: with several other sessions' containers on the GPU, vkd3d-proton's device
+creation failed with `VK_ERROR_INITIALIZATION_FAILED` even without the mod, the driver being out of
+hardware queues; one queue family fixes it. Our passes run on the game's main queue anyway).
+
+**How the scene is captured.** The D3D12 capture of the probe (`census.cpp`, MinHook on
+vkd3d-proton's implementation functions) is installed at launch when `[graphics] ao = rtao` (or
+`[dev] rt_scene = 1`). With the scene on:
+
+- Pipeline states are classified as they are created by their targets: G-buffer = R32F + RGBA16F +
+  BGRA8 with D32S8, shadow map = R32F with D24S8; their shaders are disassembled with the game's
+  DXC on a background thread (VS: `g_mLocalToView` offset in `$Globals`, which differs per shader,
+  live: 10 different offsets; a bone palette rejects skinning shaders; PS: alpha test).
+  Root signatures are parsed (RTS0) for the root parameter of the VS's `b0`.
+- Each command list keeps its PSO, root CBVs, vertex/index views, topology and render targets;
+  every `DrawIndexedInstanced` on a reflected G-buffer/shadow pipeline appends a record (position
+  VA at the base vertex, stride, vertex count to the view's end, index VA/count/format, the `$Globals`
+  VA). Records join the scene when the list is executed, in submission order.
+- **The kick** (the multi-list `ExecuteCommandLists` inside the main pass before HBAO; live: exactly
+  one, n = 14-15, on the game thread) holds every G-buffer and shadow-map list of the render. Right
+  after it, one list of ours is submitted on the same queue: BLAS work, TLAS, then the ray passes.
+  In GPU order it runs after the G-buffer and before the lighting.
+
+**Findings that shaped it (live):**
+
+- **Only the `$Globals` rows a shader reads are written per draw.** `g_mViewToWorld` (offset 64,
+  the same in every shader) holds stale ring data in G-buffer draws (dumped: different "camera"
+  translations per draw, 0, 627, 1383 m), while `g_mLocalToView` (read by the VS) is right (all of
+  the player's body parts share one, 3 m ahead of the camera). Matrices are `row_major`, used as
+  `mul(M, v)`: rows 0-2 are the DXR 3x4 layout directly. The camera comes from the engine's main
+  `rend::View` instead (+0x248 view-to-world, double, row vectors; +0x2a8 view-to-clip including the
+  TAA jitter, valid flag +0x4a8; `stereo::main_view()`): the G-buffer draw's own `g_mViewToClip`
+  is only valid if that draw's VS reads it (the prologue's first one did not: every pixel failed
+  validation until the projection came from the View).
+- **Reading those constants costs.** The constant ring is write-combined upload memory: plain loads
+  of 96 bytes for ~4000 draws took **37 ms** per update; SSE4.1 streaming loads (`MOVNTDQA`) bring
+  the whole capture to **1.0-1.5 ms** per update on the game thread (measured, forest and
+  prologue).
+- **The terrain and the grass are CPU-written every update.** The terrain is one 22 MB vertex buffer
+  in an upload heap (stride 44, 32-bit indices, vertices camera-relative: `g_mLocalToView`
+  translation ≈ 0), drawn in ~2-11-triangle pieces; the grass/foliage cards a 3 MB upload ring
+  (stride 20, alpha-to-coverage). They go into **one per-update BLAS** (fast build, one geometry per
+  draw with its own `Transform3x4`, opaque and alpha-tested apart): forest ~1600 geometries, 15 k
+  opaque + 43 k alpha triangles; Bright Falls ~4900 geometries, 21 k + 8.5 k.
+- **Every other mesh is cached**: one BLAS per (vertex range, index range), fast-trace + compaction
+  (built into a staging pool, compacted size read back four submissions later, copied into a
+  sub-allocated pool of 32 MB chunks); meshes whose layout carries `BLENDINDICES` (the pre-skinned
+  output, docs/stereo.md section 5) are fast-build + allow-update and **refit** every update. The
+  engine creates all its vertex buffers with the UAV flag, so that is not a dynamic signal.
+  Invalidation: a buffer created over a cached range or a `CopyBufferRegion` into it (none seen in
+  these scenes); eviction after 900 updates unused. Build budget 300 k triangles per update (the
+  first frames of a level).
+- **Alpha-tested**: `discard` alone is not an alpha test (the standard opaque material discards for
+  its dissolve fade; with it the player, rocks and whole trees vanished from an "opaque" TLAS) and
+  neither is alpha-to-coverage (the terrain uses it). Alpha-tested = the PS samples
+  `g_sAlphaTestSampler` or is a foliage card (`g_sFoliageNoiseMap`). They get their own instance mask
+  bits (2 G-buffer, 8 shadow-only); no any-hit alpha yet (section 11).
+- **Shadow-map draws** are in light views whose placement isn't in their constants (the shadow VSs
+  read only `g_mLocalToView` and `g_mViewToClip`). Each view (draws grouped by their projection rows)
+  is placed from a mesh drawn exactly once in the G-buffer and once in that view:
+  `ViewToWorld_light = World_gbuffer · inverse(LocalToView_light)`. Live (Bright Falls r47): 158 groups,
+  **only 5 placed** (72 shadow-only instances, 0.2 M triangles, 250 duplicates of G-buffer
+  instances dropped): the grouping key is unreliable because many shadow VSs don't read their
+  projection rows either (stale). Off-screen casters are therefore mostly missing (section 10).
+- The TLAS is built once per game update (the stereo view path's second eye reuses it; live sbs
+  forest: 107 updates, 214 traced eyes) in world space relative to the update's camera position
+  (precision), instances culling-disabled.
+
+**Three GPU faults found on the way** (kernel `Xid 13`, the game wedged): a fresh dynamic BLAS
+queued for refit in the same update with its update-scratch size still 0 (scratch overrun); a
+TraceRay geometry multiplier of 1 against a 1-record hit-group table, with ~1500-geometry BLAS
+("Misaligned PC"); and none since (r33-r52, several hundred thousand traced frames).
+
+**Validation** (primary rays from the camera vs the G-buffer depth, `rt scene validate MASK img`,
+`re/scripts/rt_validate.py`; one frame each, all instances, measured):
+
+| scene | geometry px within 0.2 % / 1 % / 5 % of the G-buffer distance | ray nearer / farther | missed |
+|---|---|---|---|
+| forest-night (level 15 yard) | 83.9 / 85.9 / 88.9 % (r33); 85.6 / 88.7 % within 1 / 5 % (r43) | 4.3 / 5.5 % | 1.4 % |
+| prologue-road | 65.1 / 67.3 / 75.5 % | 20.8 / 1.6 % | 1.6 % |
+| Bright Falls ferry (day) | 89.5 / 91.6 / 93.5 % | 0.4 / 4.7 % | 1.5 % |
+
+"Nearer" is almost all alpha-tested foliage counted as opaque (prologue: ferns and branches; with
+opaque instances only the prologue gives 58 / 61 % and 13 % missed: the cards are then absent);
+"farther" are distant tree LOD cards and the moving birds' edges; "missed" sky-adjacent billboards
+and the water. The structural error is zero: walls, terrain, debris, the player and the birds
+(skinned, refit) match to 0.2 %.
+
+![validation, forest](img/rt-validate-forest.jpg)
+
+*forest-night r43: the frame and the validation (green < 0.2 %, light green < 1 %, yellow < 5 %,
+red ray nearer, blue ray farther, magenta missed, black sky).*
+
+| measured per update | forest-night | Bright Falls |
+|---|---|---|
+| G-buffer draws / instances / triangles | 1930 / 330 / 0.71 M | 5410 / 446 / 0.51 M |
+| per-update BLAS geometries / triangles | 1600 / 58 k | 4960 / 30 k |
+| cached BLAS entries (skinned) / memory | 579 (230) / 45 MB (pool reserve 64 MB) | 434 (176) / 26 MB |
+| per-update BLAS memory / TLAS | 5.5 MB / 0.19 MB | 3.0 MB / 0.26 MB |
+| refits per update | 48 | 61-67 |
+| CPU on the game thread (capture → list submitted) | 1.0-1.2 ms | 1.2-1.5 ms |
+| GPU, list start → TLAS built | 2.2-2.4 ms (prologue, under the lock but another session rendering) | 0.86 ms (contended) |
+
+## 9. RTAO (`[graphics] ao = rtao`, 0.6.8; `src/features/rt/trace.cpp`)
+
+**Pass.** DXR 1.0 pipeline (raygen/miss/closest-hit in one `lib_6_3`, compute `cs_6_0` denoiser),
+**compiled at run time by the game's own DXC 1.4** (no third-party code in the DLL), recorded into
+our list after the TLAS:
+
+1. `rg_ao`: per pixel, position from the G-buffer's R32F device depth (RT0; `pLinearDepthRT` is
+   only made later, in the second batch) and the jittered `ClipToView`; geometric normal from the
+   depth (smallest-step neighbours) for the ray origin and to keep rays above the surface, shading
+   normal from `pNormalRT` (view space) for the cosine lobe; 1 ray per pixel, 1.5 m, first hit ends.
+   Opaque instances are traced first; alpha-tested ones (no alpha test yet) then occlude with a
+   probability (`[dev] rtao_alpha`, 0.4, their average coverage): treated as opaque, leaf cards
+   turned the prologue's trees black (AO mean 0.77).
+2. `cs_temporal`: per-eye history (2 ping-pong pairs per eye, plus linear depth), reprojected with
+   the camera matrices (`W2C_prev · V2W_cur`, doubles: the engine's motion vectors are written after
+   the lighting, so they don't exist yet at this point of the frame); rejected on a 4 % linear-depth
+   mismatch; up to 24 samples.
+3. `cs_atrous` x3 (steps 1, 2, 4), depth- and normal-weighted 5x5; the last writes R16G16_FLOAT
+   (AO in R), the format of the engine's `g_sHBAOBuffer`.
+4. In the engine's own list, at HBAO's apply (`0x537ef0`, object +0x18): a `CopyResource` of this
+   eye's result over `g_sHBAOBuffer`; the engine's apply (PS `5e551338353d5d50`: `.r` to all four
+   channels, write mask 0x8) puts it into `pShadowRT.a` as it would HBAO's. The HBAO render itself
+   still runs (0.26 ms); skipping it needs its pool target kept alive (not done).
+
+Stereo: per-eye histories and results (`stereo::eye_now()`), TLAS shared by the update (sbs forest:
+214 copies for 107 updates, 0 misses). Inert when off: `ao = game` installs nothing (the capture is
+only hooked at launch with `rtao`); switching to or from rtao needs a restart (option
+`apply = "restart"`; game/ssao stay live from the ini).
+
+**Measured GPU time** (our timestamps; prologue r37 under `quiver lab gpu`, another session's
+instance still rendering, so upper bounds):
+
+| | ms per eye |
+|---|---|
+| acceleration structures (per-update BLAS, refits, TLAS; once per update) | 2.2-2.4 |
+| AO rays, 1 ray/pixel 1.5 m | 1.3-1.4 |
+| denoise (temporal + 2 à-trous at the time; 3 now: +~0.15) | 0.37-0.40 |
+| the game's HBAO, for comparison | 0.26 |
+| engine main pass GPU time, rtao off / on | 8.7 / 9.8-10.9 |
+
+Bright Falls r45, contended, no lock: AS 0.86, rays 0.93, denoise (3 passes) 0.54 ms. Order of
+magnitude **3-4 ms per frame at 1080p**, dominated by building the per-update BLAS and by the rays;
+the study's synthetic 0.4 ms/ray was optimistic by ~3x on real geometry.
+
+**Captures** (final frame top, `pShadowRT.a` bottom; HBAO left, RTAO right; small JPEGs):
+
+![RTAO, Bright Falls](img/rt-ao-brightfalls.jpg)
+
+*Bright Falls ferry r42 (day): RTAO occludes under the bridge, inside the car, the player's arm
+and the railing; AO mean 0.88 vs HBAO 0.98.*
+
+![RTAO, prologue](img/rt-ao-prologue.jpg)
+
+*prologue-road r38: contact under rocks and bushes, the pole's base, the coat; mean 0.91 vs 0.98.
+This capture predates the constant-stride fix of r40 (its AO strength was ~0.7 and the foliage
+coverage 0), so it is lighter than the shipped pass.*
+
+![RTAO, forest](img/rt-ao-forest.jpg)
+
+*forest-night r43 (the opening cinematic moved the camera between the two): debris and barrels;
+mean 0.92 vs 0.98.*
+
+Known artifacts: noise on a moving platform (the ferry: camera-only reprojection rejects the
+history of things moving with the camera; the third à-trous pass hides most of it); banding on
+skinned close-ups (the skinned BLAS vs the rasterized surface, partly fixed by a distance-scaled
+TMin); leaf cards are approximations.
+
+## 10. Sun / moon shadows (prototype, `[dev] rt_sun = 1`)
+
+- **Light direction**: the sun/moon resolve (`0x52cb40`, PS `3fd4eb73c302e5b7`) is recognised by
+  reflection (`g_mShadowProjection` and `g_fRegionStart` in its `$Globals`, BGRA8 target); its
+  `g_mShadowProjection` (view → shadow u, v, depth) has the light's forward axis in its depth row;
+  towards the light = its opposite, to world through the View (live, Bright Falls: (0.75, 0.47,
+  -0.47), above the horizon). One update's latency (the resolve runs after the kick).
+- **Pass**: `rg_sun` (rays towards a cone of `[dev] rt_sun_cone` around the light, 1000 m, first hit)
+  through the same temporal/à-trous chain, written as B8G8R8A8 (R = visibility; typed UAV stores on
+  BGRA8 are supported here) and **copied over `pShadowRT` at the end of the shadow-buffer pass**
+  (`0x52d5c0`), where the engine's cascades were resolved. G and B aren't read by the lighting
+  (study, static); A is written next by the AO apply. The sun cookie
+  (`g_sSunLightProjectionMapTex`) stays in the material shaders.
+- **Measured** (Bright Falls r45, contended): 0.61 ms rays + 0.74 ms denoise.
+- **State** (captured, below): it runs and gives soft, contact-hardening shadows from on-screen
+  casters (the player's shadow on the deck), but **does not match the cascades yet**: the bridge
+  overhead (mostly off-screen) casts nothing because shadow-only casters are rarely placed (section
+  8), surfaces facing away from the light read grey (sign/elevation of the direction not verified
+  against the cascades), foliage is opaque cards.
+
+![sun prototype](img/rt-sun-prototype.jpg)
+
+*Bright Falls r47: final frame and `pShadowRT.r`; left the game's cascades (PCF), right ray-traced.*
+
+Remaining: place the shadow views properly (hook the light views' `setViewToWorld` and tag the
+shadow lists, or reflect which shadow VSs read their projection), verify the direction, any-hit
+alpha for trees (mandatory here), then tune. **+1.5-2 weeks** (unchanged).
+
+## 11. Flashlight shadows: option (a), the pixel shader swapped (prototype, `[dev] rt_spot`)
+
+The flashlight is the shadowed spot of `DeferredLight`, PS `aa17e58e1bd8d853` ("spotlightPS",
+~145 DXIL ops): view-space position from linear depth, exponential falloff, a projected cookie,
+**10-tap Vogel-disk PCF** on the shadow atlas (interleaved-gradient noise rotation, `g_fPCFSize_d3t`,
+blended by `g_fShadowLOD`), Ward-anisotropic or Phong specular, exposure, clamp 32 (static, read
+from the disassembly). The shadow factor multiplies the whole contribution, so a separate mask
+(option b) would be equivalent, but the contribution can't be separated after the draw (additive
+into `pLightRT`) without changing the pipeline anyway. Option (a) won:
+
+- `src/features/rt/shaders/spotlight.hlsl`: the shader re-written in HLSL, binding-compatible with the
+  original (only the `$Globals` rows it reads, via `packoffset`: the same rows 26, 29, 31, 90-93,
+  114-123; the same t0-t5/s0-s5), with the shadow term selectable.
+- Swapped **at pipeline creation by bytecode hash** (`CreateGraphicsPipelineState` hook): a second
+  pipeline with our PS, the original kept as a fallback.
+- `rt_spot = 1` (PCF port): **verified identical** against the original in the same session
+  (live A/B of `pLightRT` with `[dev] rt_spot_on`, forest r50, compiled in-process; r51 with DXC 1.9: light mean 0.0022 vs 0.0022, |diff|
+  p99 0.0008, i.e. the noise/temporal differences of two frames).
+- `rt_spot = 2` (**inline ray queries**, `ps_6_5`, built at dev time with DXC 1.9.2609 by
+  `scripts/build_shaders` and embedded; the DLL contains only our DXIL): per lit pixel, 4 rays to a
+  4 cm disc at the light's position (`g_vLightPosition`), ending 35 cm short of it (the hand and the
+  flashlight model are in the TLAS), against the update's TLAS. The TLAS and a constant buffer need
+  root parameters the game's root signatures don't have: **every root signature the game creates
+  gets two appended** (root SRV t0 space 9, root CBV b0 space 9, pixel visibility; deserialised and
+  re-serialised with vkd3d-proton's versioned (de)serializer) and they are set right before each
+  swapped draw; frames without a TLAS fall back to the original pipeline. Live (forest r52): 1024
+  spot draws with ray queries, 81 fallbacks (loading), no faults; the spot keeps its shape and the
+  planks get crisper contact shadows than the atlas gives (crop below).
+- **Pitfall**: DXC 1.9's default output (validator 1.8 metadata) produced **no light at all** under
+  this vkd3d-proton (no error logged); the same HLSL compiled by the game's DXC 1.4 worked, and so
+  does DXC 1.9 with `-validator-version 1.5`.
+
+![flashlight, atlas vs ray queries](img/rt-flashlight-rq.jpg)
+
+*forest-night r52, `pLightRT` (diffuse light) around the flashlight's spot: top the game's atlas
+PCF, bottom the ray-traced shadow (the camera swayed between the two grabs).*
+
+Not done: the shadowed spots other than the flashlight use the same shader and get the same
+treatment (fine, but their shadow-map rendering still runs: skipping it is the real saving);
+light radius/bias tuning; cost not isolated (the deferred-light pass has no marker); the stereo
+second eye with `skip_shadows` (the lost spot, docs/stereo.md section 6) not tested: the ray-query
+shader doesn't need the atlas, but the cause of the lost spot was not identified.
+
+## 12. Go / no-go, updated
+
+| feature | verdict now | state | remaining (one person) | risk |
+|---|---|---|---|---|
+| **RTAO** | **shipped, experimental** (`[graphics] ao = rtao`, default `game`) | capture validated in three scenes, per-eye histories, inert unless chosen at launch | quality v2 **1-2 weeks**: any-hit alpha for foliage (+1 w: per-geometry alpha textures/UVs from the draws' descriptor tables, or opacity micromaps), motion vectors for moving platforms (object/camera velocity of our own), skip HBAO's render, cut the per-update BLAS (cache the terrain while the camera stands) | medium: foliage look, ~3-4 ms cost |
+| **Sun/moon RT shadows** | **go, prototype running** | direction from the cascade resolve, pass + injection over `pShadowRT` work | **1.5-2 weeks**: place the shadow views reliably (off-screen casters), verify the direction, any-hit alpha (trees), tuning | medium |
+| **Flashlight RT shadows** | **go** (was conditional) | option (a) works: HLSL port verified identical, swapped by hash at pipeline creation, inline ray queries against the TLAS through two root parameters appended to the game's root signatures | **1-1.5 weeks**: per-light tuning (radius, bias, the held flashlight excluded more robustly than by distance), cost isolated, skip the atlas render for spots, stereo second eye | medium: the global root-signature change; vkd3d-specific DXIL metadata pitfall (section 11) |
+| **RTGI** | no-go for now | unchanged | 2-3 months | high |
 ## Reproducing
+
+RTAO, validation and the prototypes (sections 8-11; helper scripts of the sessions were
+`relaunch`, `val`, `aoshots`, `spotab`: they are the commands below):
+
+```sh
+scripts/build && cp -r build/mod build/mod-rt          # [graphics] ao = rtao in its torchbearer.ini
+quiver lab edit awr-rt env.VKD3D_CONFIG=single_queue   # only if device creation fails (GPU queues exhausted)
+quiver lab launch awr-rt --mod build/mod-rt --wait frame && quiver lab wait awr-rt in-world
+quiver lab call awr-rt rt scene status
+quiver lab call awr-rt rt scene validate 0xf img && sleep 2 && quiver lab call awr-rt rt scene status > st.json
+python3 re/scripts/rt_validate.py st.json <run>/rt-validate.raw val.jpg
+quiver lab call awr-rt cfg dev.rtao_ao 0|1               # RTAO result copied or not (A/B)
+quiver lab call awr-rt rt grab pShadowRT hbao_apply:1 TAG  # the AO channel
+# sun prototype: [dev] rt_sun = 1 (live); flashlight: [dev] rt_spot = 1 (PCF port) or 2 (ray
+# queries, with ao = rtao), read at launch; A/B live with `cfg dev.rt_spot_on 0|1` and
+# `rt grab pLightRT post:0 TAG`
+scripts/build_shaders                                   # after editing src/features/rt/shaders/spotlight.hlsl
+```
+
+The study's census and grabs:
 
 ```sh
 scripts/build && cp -r build/mod build/mod-rt
