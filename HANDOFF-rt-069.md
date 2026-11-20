@@ -6,8 +6,13 @@ Written 2026-11-20 ~14:07 MST by Muse (muse-wonder-full-1.0), picking up subagen
 Release update, 2026-11-20 ~14:42 MST: the user authorized Muse to commit, push, and publish.
 The branch was merged to `master` in `0679d67`, the merged tree was rebuilt and lab-smoked
 (r79), and Quiver Torchbearer **0.6.9 (`vx8mzgd`, mod revision 27) was published and is
-current**. A Git push could not be completed because this repository has **no remotes
-configured** (`git remote -v` is empty); no remote was guessed or added.
+current**. A Git push could not then be completed because this repository had **no remotes
+configured** (`git remote -v` was empty); no remote was guessed or added at that point.
+
+GitHub update, 2026-11-20 MST: at the user's request, a public MIT-licensed repository was then
+created at https://github.com/AndrewGaspar/torchbearer, with a screenshot-led README maintained
+under `docs/screenshots/`, and `master` was pushed there (initial public tip `f55133a`, remote
+`origin`).
 
 ## Where things are
 
@@ -85,6 +90,7 @@ configured** (`git remote -v` is empty); no remote was guessed or added.
 
 SendMessage the subagent (`a05b775f5244f01c0`) rather than starting a new one, per the limit
 notice — but its context predates all of the above, so point it at this file and the commit list
-first. The branch is already merged and 0.6.9 is published/current in Quiver. Suggested next
-steps, in order: configure the intended Git remote and push `master` if desired, run a quiet
-armed dark-scene stereo-spot test, then sun/moon placement.
+first. The branch is already merged, 0.6.9 is published/current in Quiver, and `master` is
+public at https://github.com/AndrewGaspar/torchbearer. Suggested next steps, in order: run a
+quiet armed dark-scene stereo-spot test, then sun/moon placement. Keep the README screenshots
+current when pictured features change (`docs/screenshots/README.md`).
