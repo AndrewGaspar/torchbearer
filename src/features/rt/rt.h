@@ -11,5 +11,8 @@ void start();             // [dev] rt_capture / [graphics] ao = rtao: hook D3D12
 // the next present; needs the capture installed at launch) and whether it is running.
 void set_rtao(bool on);
 bool rtao_active();
+// Ray-traced flashlight shadows ([graphics] flashlight_shadows = rt): the scene capture wanted
+// for the TLAS alone (the AO chain stays off unless ao = rtao as well).
+void set_flashlight_rt(bool on);
 
 }  // namespace tb::rt

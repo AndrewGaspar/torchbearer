@@ -403,6 +403,7 @@ std::atomic<bool> g_engine_hooked{false};
 // Scene + ray passes, wanted by [graphics] ao = rtao or `rt scene on`; switched at present (game
 // thread): it needs the device (hooks from launch), the list hooks and the engine markers.
 std::atomic<int> g_want_scene{0};
+std::atomic<int> g_want_flash{0};  // [graphics] flashlight_shadows = rt (TLAS without the AO chain)
 int g_have_scene = 0;
 bool g_scene_failed_logged = false;
 
@@ -562,7 +563,15 @@ ID3D12Resource* pool_resource(const char* name) { return pool_res(name); }
 namespace {
 
 void apply_scene() {
-  int want = g_want_scene.load();
+  // The AO chain runs for ao=rtao (and for lab `rt scene on`), not when the scene is wanted
+  // only for the flashlight's TLAS.
+  static int have_ao = -1;
+  int want_ao = g_want_scene.load() ? 1 : (g_want_flash.load() ? 0 : 1);
+  if (want_ao != have_ao) {
+    trace_config("dev.rtao_ao", want_ao ? "1" : "0");
+    have_ao = want_ao;
+  }
+  int want = (g_want_scene.load() || g_want_flash.load()) ? 1 : 0;
   if (want == g_have_scene) return;
   if (!want) {
     scene_enable(false);
@@ -583,6 +592,7 @@ void apply_scene() {
 
 void set_rtao(bool on) { g_want_scene = on ? 1 : 0; }
 bool rtao_active() { return g_have_scene == 1 && scene_enabled(); }
+void set_flashlight_rt(bool on) { g_want_flash = on ? 1 : 0; }
 
 void register_feature() {
   lab_verb("rt", verb);
@@ -603,10 +613,13 @@ void register_feature() {
 void start() {
   // The D3D12 capture goes in at launch (it tracks resources and pipeline states as they are
   // created): for the census ([dev] rt_capture) and for the ray-traced passes ([graphics] ao =
-  // rtao, or [dev] rt_scene = 1 for the lab verbs). Otherwise nothing is hooked.
+  // rtao, [graphics] flashlight_shadows = rt, or [dev] rt_scene = 1 for the lab verbs).
+  // Otherwise nothing is hooked.
   bool full = cfg_bool("dev.rt_capture", false);
+  bool flash = cfg_str("graphics.flashlight_shadows") == "rt";
   int spot = int(cfg_num("dev.rt_spot", 0));
-  if (full || cfg_str("graphics.ao") == "rtao" || cfg_bool("dev.rt_scene", false) || spot)
+  if (!spot && flash) spot = 2;
+  if (full || cfg_str("graphics.ao") == "rtao" || flash || cfg_bool("dev.rt_scene", false) || spot)
     capture_early(full, spot);
 }
 
