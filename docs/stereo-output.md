@@ -129,6 +129,23 @@ later; Hyprland restored that first geometry as the floating size on leaving ful
 2880x900 window's halves were different slices — live, user report). An hsbs window resized to
 something else still isn't followed; use sbs (Wayland) for windowed play.
 
+## Automatic 3D on stereo displays (0.6.1)
+
+Like the Quiver app's "3D on stereo displays: Auto" (quiver-app `stereo_ui.rs`), the defaults
+are `[stereo] mode = auto` and `output = auto`:
+- **Display state:** core/hyprland.cpp polls `j/clients` + `j/monitors` once a second; the game's
+  window's monitor (before the window exists: the focused one) is a stereo output when HypXRland
+  reports `"stereo": "sbs"` for it. Live check (bare Wine, laptop panel only): 0 (mono).
+- **mode = auto** resolves every update: side-by-side while the output is packed and the display
+  is a stereo output, off otherwise.
+- **output = auto** resolves at launch (the swapchain's width is fixed when it is created): on a
+  stereo display `sbs` if the larger-swapchain Proton is in use (`PROTON_ENABLE_WAYLAND=1` and
+  `WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1` in the environment), else `hsbs`; elsewhere `none`, or
+  `full` when 3D mode is forced to `sbs`. Live (lab, no Hyprland): defaults -> none, plain mono;
+  forced sbs -> full, 2x swapchain, side-by-side running.
+- Limitation: moving the game between a stereo and a mono display mid-session switches 3D on/off
+  but not the packing (logged; takes effect at the next launch).
+
 ## Not done
 
 - Exclusive fullscreen (mode 0) with a 2x swapchain is untested: DXGI would need a 3840-wide

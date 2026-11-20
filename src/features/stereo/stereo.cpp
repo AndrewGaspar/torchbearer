@@ -57,7 +57,7 @@ Void1_t o_modeSwitchRender;
 Bool1_t o_beginFrame;
 Void1_t o_endFrame;
 
-enum class Mode { Off, Left, Right, Alternate, Sbs };
+enum class Mode { Off, Left, Right, Alternate, Sbs, Auto };
 // sbs: how the two eyes of one game update are rendered.
 //   Frame  ModeSwitch::render twice (two whole engine frames; the first Present swallowed)
 //   View   renderFrame twice inside one ModeSwitch::render (one engine frame: beginFrame/endFrame,
@@ -84,9 +84,18 @@ struct Params {
 std::mutex g_pmu;
 Params g_p;
 
+// mode = auto (the default): side-by-side while the game's monitor is a HypXRland stereo output
+// (and the output is packed), mono elsewhere, like the Quiver app's "3D on stereo displays: Auto".
+// Resolved here, every update, from the Hyprland poll (core/hyprland.cpp).
+std::atomic<bool> g_packed_for_auto{false};
 Params params() {
-  std::lock_guard lk(g_pmu);
-  return g_p;
+  Params p;
+  {
+    std::lock_guard lk(g_pmu);
+    p = g_p;
+  }
+  if (p.mode == Mode::Auto) p.mode = g_packed_for_auto.load() && hypr_display_stereo() == 1 ? Mode::Sbs : Mode::Off;
+  return p;
 }
 
 Mode parse_mode(const std::string& s) {
@@ -94,6 +103,7 @@ Mode parse_mode(const std::string& s) {
   if (s == "right") return Mode::Right;
   if (s == "alternate") return Mode::Alternate;
   if (s == "sbs") return Mode::Sbs;
+  if (s == "auto") return Mode::Auto;
   return Mode::Off;
 }
 const char* mode_name(Mode m) {
@@ -102,6 +112,7 @@ const char* mode_name(Mode m) {
     case Mode::Right: return "right";
     case Mode::Alternate: return "alternate";
     case Mode::Sbs: return "sbs";
+    case Mode::Auto: return "auto";
     default: return "off";
   }
 }
@@ -777,6 +788,50 @@ bool g_hooked = false;
 // halves carry the same image, which is still a valid packed frame (2D in the glasses).
 std::string g_tag_layout;
 bool g_tag_on = true;
+// [stereo] output: the packing, decided before the game creates its swapchain (it sizes it).
+//   full | hsbs | sbs | none   as chosen;
+//   auto (the default)          under a HypXRland stereo display: sbs if this Proton lets the
+//                               swapchain be larger than the window (Wine's Wayland driver with
+//                               WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1, GE-Proton11-12-hypxr), else
+//                               hsbs; elsewhere none, or full if 3D mode is forced to sbs (a plain
+//                               3840x1080 desktop).
+// Changing it after the swapchain exists needs a restart (logged).
+std::string g_output_req;
+std::string g_output_now;
+bool larger_swapchain_ok() {
+  return process_env("WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN") == "1" && process_env("PROTON_ENABLE_WAYLAND") == "1";
+}
+void update_window_tag();
+void apply_output_locked() {  // caller holds g_pmu
+  std::string v = g_output_req;
+  if (v == "auto") {
+    int ds = hypr_display_stereo_now();
+    if (ds == 1) v = larger_swapchain_ok() ? "sbs" : "hsbs";
+    else v = g_p.mode == Mode::Sbs ? "full" : "none";
+    TB_LOG("stereo: output auto -> %s (display %s, larger-swapchain Proton %s)", v.c_str(),
+           ds == 1 ? "stereo" : ds == 0 ? "mono" : "unknown", larger_swapchain_ok() ? "yes" : "no");
+  }
+  if (v == g_output_now) return;
+  if (!g_output_now.empty() && present_frame() > 0)
+    TB_LOG("stereo: output %s -> %s takes effect at the next launch (the swapchain already exists)",
+           g_output_now.c_str(), v.c_str());
+  g_output_now = v;
+  // Packed outputs (2x-wide swapchain, read at swapchain creation):
+  //   full: window 2x wide, each eye 1:1 (a plain 3840x1080 desktop);
+  //   hsbs: window = desktop, each eye squeezed 2:1 (HypXRland 3D mode, any Proton);
+  //   sbs:  window = the game's own, each eye 1:1 at full width (HypXRland 3D mode, with the
+  //         larger-swapchain Proton).
+  bool packed = v == "full" || v == "hsbs" || v == "sbs";
+  present_set_width_scale(packed ? 2 : 1);
+  g_packed_for_auto = packed;
+  g_p.anamorphic = v == "hsbs";
+  g_ana_on = g_p.anamorphic;
+  window_set_stretched(v == "hsbs");
+  window_set_keep(v == "sbs");
+  g_tag_layout = v == "full" || v == "sbs" ? "sbs" : v == "hsbs" ? "hsbs" : "";
+  update_window_tag();
+}
+
 void update_window_tag() {
   hypr_set_window_tag(g_tag_on && !g_tag_layout.empty() ? "stereo-" + g_tag_layout : "");
   // Quiver's Sight HUD/panel: the packing, whether or not stereo rendering is on.
@@ -788,7 +843,10 @@ void update_window_tag() {
 void register_feature() {
   cfg_listen("stereo.", [](const std::string& id, const std::string& v) {
     std::lock_guard lk(g_pmu);
-    if (id == "stereo.mode") g_p.mode = parse_mode(v);
+    if (id == "stereo.mode") {
+      g_p.mode = parse_mode(v);
+      if (!g_output_req.empty()) apply_output_locked();
+    }
     else if (id == "stereo.separation") g_p.separation_mm = atof(v.c_str());
     else if (id == "stereo.convergence") g_p.convergence_m = atof(v.c_str());
     else if (id == "stereo.swap_eyes") g_p.swap = (v == "1" || v == "true");
@@ -800,20 +858,8 @@ void register_feature() {
       g_tag_on = v != "0" && v != "false";
       update_window_tag();
     } else if (id == "stereo.output") {
-      // Packed outputs (2x-wide swapchain, read at swapchain creation):
-      //   full: window 2x wide, each eye 1:1 (a plain 3840x1080 desktop);
-      //   hsbs: window = desktop, each eye squeezed 2:1 (HypXRland 3D mode, any Proton);
-      //   sbs:  window = desktop, each eye 1:1 at full width (HypXRland 3D mode, with a Proton
-      //         that lets the swapchain be larger than the window: GE-Proton11-12-hypxr,
-      //         PROTON_ENABLE_WAYLAND=1, WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1).
-      bool packed = v == "full" || v == "hsbs" || v == "sbs";
-      present_set_width_scale(packed ? 2 : 1);
-      g_p.anamorphic = v == "hsbs";
-      g_ana_on = g_p.anamorphic;
-      window_set_stretched(v == "hsbs");
-      window_set_keep(v == "sbs");
-      g_tag_layout = v == "full" || v == "sbs" ? "sbs" : v == "hsbs" ? "hsbs" : "";
-      update_window_tag();
+      g_output_req = v;
+      apply_output_locked();
     }
     else if (id == "stereo.sbs_path") g_p.path = v == "frame" ? SbsPath::Frame : SbsPath::View;
     else if (id == "stereo.view_kick") g_view_kick = (v == "1" || v == "true");
@@ -878,6 +924,17 @@ void register_feature() {
     if (sub == "status") return status_json();
     if (sub == "window") return window_status();
     if (sub == "hyprland") return hypr_status();
+    if (sub == "auto") {
+      std::lock_guard lk(g_pmu);
+      Params raw = g_p;
+      return std::string("{\"mode_setting\":") + json_str(mode_name(raw.mode)) + ",\"mode_now\":" +
+             json_str(mode_name(raw.mode == Mode::Auto ? (g_packed_for_auto.load() && hypr_display_stereo() == 1 ? Mode::Sbs
+                                                                                                        : Mode::Off)
+                                                        : raw.mode)) +
+             ",\"output_setting\":" + json_str(g_output_req) + ",\"output_now\":" + json_str(g_output_now) +
+             ",\"display_stereo\":" + std::to_string(hypr_display_stereo()) +
+             ",\"larger_swapchain\":" + (larger_swapchain_ok() ? "true" : "false") + "}";
+    }
     if (!g_hooked) {
       ok = false;
       return json_str("stereo hooks not installed (see torchbearer.log)");

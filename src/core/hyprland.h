@@ -18,4 +18,16 @@ std::string hypr_request(const std::string& req);
 void hypr_set_window_tag(const std::string& tag);
 std::string hypr_status();
 
+// Start the background poll (window tag, display state) if running under Hyprland. Idempotent.
+void hypr_start();
+// Whether the game's monitor (its window's, else the focused one) is a HypXRland side-by-side
+// stereo output: 1 yes, 0 no, -1 unknown (not Hyprland, no answer yet). Updated each second;
+// hypr_display_stereo_now() asks right away (for start-up decisions, before the window exists).
+int hypr_display_stereo();
+int hypr_display_stereo_now();
+
+// An environment variable of this process: the Windows environment, else the unix one
+// (/proc/self/environ: Wine doesn't copy every variable into the Windows environment).
+std::string process_env(const char* name);
+
 }  // namespace tb

@@ -83,7 +83,7 @@ size_t field(const std::string& j, const char* key, size_t from, size_t end) {
 
 struct Client {
   std::string address, title, stereo;
-  int w = 0, h = 0;
+  int w = 0, h = 0, monitor = -1;
   bool mapped = false;
 };
 
@@ -103,6 +103,8 @@ std::vector<Client> clients(const std::string& j) {
     if (t != std::string::npos && j[t] == '"') c.title = j.substr(t + 1, j.find('"', t + 1) - t - 1);
     size_t s = field(j, "stereo", pos, end);
     if (s != std::string::npos && j[s] == '"') c.stereo = j.substr(s + 1, j.find('"', s + 1) - s - 1);
+    size_t mo = field(j, "monitor", pos, end);
+    if (mo != std::string::npos) c.monitor = atoi(j.c_str() + mo);
     size_t z = field(j, "size", pos, end);
     if (z != std::string::npos && j[z] == '[') sscanf(j.c_str() + z, "[%d ,%d", &c.w, &c.h);
     if (!c.address.empty()) out.push_back(c);
@@ -158,6 +160,52 @@ std::string identify(HWND hwnd) {
   return found;
 }
 
+// Monitors in `j/monitors`: HypXRland reports `"stereo": "sbs"` only on a side-by-side stereo
+// output (an XReal in 3D mode under `monitor = …, stereo:sbs`), which is what the Quiver app's
+// "3D on stereo displays: Auto" keys on too (quiver-app stereo_ui.rs).
+struct Monitor {
+  int id = -1;
+  bool focused = false, stereo = false;
+};
+std::vector<Monitor> monitors(const std::string& j) {
+  // Each monitor object has a "description" (its nested workspace objects, which also carry an
+  // "id", don't): a monitor spans from the "id" before its description to the "id" before the
+  // next monitor's description.
+  std::vector<size_t> starts;
+  for (size_t d = j.find("\"description\":"); d != std::string::npos; d = j.find("\"description\":", d + 1)) {
+    size_t id = j.rfind("\"id\":", d);
+    if (id != std::string::npos) starts.push_back(id);
+  }
+  std::vector<Monitor> out;
+  for (size_t i = 0; i < starts.size(); i++) {
+    size_t pos = starts[i], end = i + 1 < starts.size() ? starts[i + 1] : j.size();
+    Monitor m;
+    size_t v = field(j, "id", pos, end);
+    if (v != std::string::npos) m.id = atoi(j.c_str() + v);
+    size_t f = field(j, "focused", pos, end);
+    m.focused = f != std::string::npos && j.compare(f, 4, "true") == 0;
+    size_t st = field(j, "stereo", pos, end);
+    m.stereo = st != std::string::npos && j.compare(st, 5, "\"sbs\"") == 0;
+    out.push_back(m);
+  }
+  return out;
+}
+
+// -1 unknown (not Hyprland / no answer), 0 the game's monitor is mono, 1 it is a stereo output.
+std::atomic<int> g_display_stereo{-1};
+
+// Our window's monitor (when we know our window), else the focused one.
+int display_stereo(const std::vector<Client>& all, const std::string& address) {
+  auto ms = monitors(hypr_request("j/monitors"));
+  if (ms.empty()) return -1;
+  int mon = -1;
+  for (const auto& c : all)
+    if (!address.empty() && c.address == address) mon = c.monitor;
+  for (const auto& m : ms)
+    if ((mon >= 0 && m.id == mon) || (mon < 0 && m.focused)) return m.stereo ? 1 : 0;
+  return -1;
+}
+
 std::mutex g_mu;
 std::string g_want;     // tag to keep on the window ("" = none)
 std::string g_applied;  // tag currently applied
@@ -183,6 +231,9 @@ void step() {
   // Is the window we know still there?
   const Client* me = nullptr;
   auto all = clients(hypr_request("j/clients"));
+  int ds = display_stereo(all, address);
+  if (ds != g_display_stereo.exchange(ds))
+    TB_LOG("hyprland: the game's display is %s", ds == 1 ? "a stereo (side-by-side) output" : ds == 0 ? "mono" : "unknown");
   for (const auto& c : all)
     if (!address.empty() && c.address == address) me = &c;
   if (!me) {
@@ -247,25 +298,44 @@ std::string hypr_request(const std::string& req) {
   return out;
 }
 
+void hypr_start() {
+  if (g_thread.exchange(true)) return;
+  if (!hypr_available()) {
+    TB_LOG("hyprland: not running under Hyprland (no HYPRLAND_INSTANCE_SIGNATURE)");
+    return;  // g_thread stays true: don't retry
+  }
+  std::thread(thread_main).detach();
+}
+
 void hypr_set_window_tag(const std::string& tag) {
   {
     std::lock_guard lk(g_mu);
     g_want = tag;
   }
-  if (tag.empty() || g_thread.exchange(true)) return;
-  if (!hypr_available()) {
-    TB_LOG("hyprland: not running under Hyprland (no HYPRLAND_INSTANCE_SIGNATURE); window tag %s not applied",
-           tag.c_str());
-    g_thread = false;
-    return;
+  if (!tag.empty()) TB_LOG("hyprland: keeping window tag %s on this process's window", tag.c_str());
+  hypr_start();
+}
+
+int hypr_display_stereo() { return g_display_stereo.load(); }
+
+std::string process_env(const char* name) { return env(name); }
+
+int hypr_display_stereo_now() {
+  if (!hypr_available()) return -1;
+  std::string address;
+  {
+    std::lock_guard lk(g_mu);
+    address = g_address;
   }
-  TB_LOG("hyprland: keeping window tag %s on this process's window", tag.c_str());
-  std::thread(thread_main).detach();
+  int ds = display_stereo(clients(hypr_request("j/clients")), address);
+  g_display_stereo = ds;
+  return ds;
 }
 
 std::string hypr_status() {
   std::lock_guard lk(g_mu);
-  return "{\"available\":" + std::string(hypr_available() ? "true" : "false") + ",\"want\":" + json_str(g_want) +
+  return "{\"available\":" + std::string(hypr_available() ? "true" : "false") +
+         ",\"display_stereo\":" + std::to_string(g_display_stereo.load()) + ",\"want\":" + json_str(g_want) +
          ",\"applied\":" + json_str(g_applied) + ",\"address\":" + json_str(g_address) + ",\"last\":" + json_str(g_last) +
          "}";
 }
