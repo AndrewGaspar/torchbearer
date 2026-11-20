@@ -8,7 +8,9 @@
 // main view to the player's eyes, keeping the game camera's orientation. What of the player is
 // drawn depends on `hide`: head (default) leaves only the head's submeshes out of the main views
 // (they stay in the shadow maps), so arms, hands, held items, torso and legs show; body / all hide
-// the body with render-object flags (never the game's hide mask, which freezes "use").
+// the body with render-object flags (never the game's hide mask, which freezes "use"). With
+// framing = close (default) the arms are re-posed as a viewmodel so the flashlight and gun stay in
+// frame (the arm pose's outputs are hooked: render bones and attachment slots; see "framing").
 //
 // Active only while the player camera is the game's camera (camera mode 0), the view being set is
 // the Cameraman camera, a player exists and is not in a vehicle; anything else (cutscene /
@@ -53,6 +55,7 @@ constexpr uintptr_t RVA_WEAPON_HIDE = 0x340340;   // WeaponHolder::setHidden: [+
 constexpr uintptr_t RVA_USE_MGR = 0x321e10;       // `mov rax,[rip+d]; ret`: UseTarget manager (+4 target handle)
 constexpr uintptr_t RVA_USE_TARGET = 0x321f20;    // UseTarget::target(mgr): handle at +4 -> object
 constexpr uintptr_t RVA_OBJ_QUERY = 0x1d9190;     // objects of a type mask (out, shape or null, mask, flag)
+constexpr uintptr_t RVA_FRAME_DT = 0x1df650;      // `movss xmm0,[rip+d]; ret`: the game's frame time (s)
 
 constexpr int kSlotHead = 0x1d;            // head slot (FUN_14017a420 "head heading", Taken head shots)
 constexpr int kSlotGround = 30;            // straight below the root at the feet (live census)
@@ -111,6 +114,7 @@ const Sig kSigs[] = {
     {RVA_USE_MGR, "48 8b 05 ?? ?? ?? ?? c3"},
     {RVA_USE_TARGET, "8b 41 04 85 c0 75 03 33 c0 c3 8b c8 48 8d 15 ?? ?? ?? ?? 81 e1 ff 1f 00 00 c1 e8 0d"},
     {RVA_OBJ_QUERY, "4c 8b dc 49 89 5b 10 49 89 6b 20 45 89 43 18 56 57 41 54 41 56 41 57 48 81 ec b0 00 00 00"},
+    {RVA_FRAME_DT, "f3 0f 10 05 ?? ?? ?? ?? c3"},
 };
 
 bool sig_ok(uintptr_t rva, const char* hex) {
@@ -170,8 +174,22 @@ struct Params {
   double eye_height = 1.70;   // anchor = body: m above the character's root
   enum class Hide { None, Head, Body, All } hide = Hide::Head;
   double fov_deg = 0;         // horizontal FOV at 16:9, degrees; 0 = the game's own
+  double near_m = 0;          // m: the near plane in first person; 0 = auto (close 0.05, else the game's)
   double smooth = 0.1;        // s: low-pass time constant on the head's offset from the root
   double aim_distance = 15;   // m: >0 = look at the point this far along the game camera's ray
+  // framing = close (viewmodel arms); the knobs below only matter then
+  bool framing_close = true;
+  double hands_forward = 0.34;  // m: resting wrists this far ahead of the eye
+  double hands_drop = 0.65;     // ... this fraction of the half-height below the centre
+  double hands_side = 0.40;     // ... this fraction of the half-width out to their side
+  double hands_sight = 0.60;    // aiming: the gun hand this fraction of the half-height below the centre
+  double hands_aim = 1.0;       // 0..1: turn the held items towards the view's aim point
+  double hands_follow = 0.25;   // s: animation motion faster than this passes through to the hands
+  double hands_motion = 0.5;    // ... scaled by this
+  int hands_arms = 3;           // test aid: bit 0 left arm, bit 1 right arm
+  double hands_jacket = 0.5;    // the jacket's side panels follow this much of the upper arm's turn
+  double hands_shrug = 0.35;    // the clavicles take this much of the arms' swing
+  double hands_sway = 0.06;     // s: the hands trail the view's rotation by this time constant
 };
 std::mutex g_pmu;
 Params g_p;
@@ -195,10 +213,10 @@ constexpr double kScriptedShotDistance = 6.0;
 std::atomic<bool> g_hide_test{false};  // `fp hidetest on`: first-person hiding in any camera mode (test aid)
 std::atomic<uint64_t> g_filter_calls{0}, g_hide_applied{0}, g_hide_restored{0};
 uint64_t g_cache_frame = ~0ull;
-double g_eye[3], g_head[3], g_root[3], g_cam[3];
+double g_eye[3], g_head[3], g_root[3], g_cam[3], g_camfwd[3];
 double g_smooth_off[3];
 bool g_smooth_valid = false;
-LARGE_INTEGER g_last_qpc{};
+double g_frame_dt = 0;  // s, between the last two presented frames' eye updates
 
 void* player() {
   void* pm = G.players ? *G.players : nullptr;
@@ -235,18 +253,13 @@ bool has_slot(void* ch, int slot) {
   return pose && rd<int>(pose, 0x50 + size_t(slot) * 4) != -1;
 }
 
-double dt_seconds() {
-  static LARGE_INTEGER f = [] {
-    LARGE_INTEGER x;
-    QueryPerformanceFrequency(&x);
-    return x;
-  }();
-  LARGE_INTEGER c;
-  QueryPerformanceCounter(&c);
-  double dt = g_last_qpc.QuadPart ? double(c.QuadPart - g_last_qpc.QuadPart) / double(f.QuadPart) : 0;
-  g_last_qpc = c;
-  return dt > 0.25 ? 0.25 : dt;
+// The game's frame time (GameTimer, 0x1df650: the dt Character::update uses), so smoothing runs
+// on game time (it pauses with the game and follows a lab's virtual clock).
+double game_dt() {
+  double dt = reinterpret_cast<float(__fastcall*)()>(game_image().at(RVA_FRAME_DT))();
+  return dt > 0 && dt < 0.25 ? dt : dt >= 0.25 ? 0.25 : 0;
 }
+double dt_seconds() { return game_dt(); }
 
 // The eye position for this frame (computed once per presented frame, so every set of the main
 // view within a frame agrees).
@@ -277,6 +290,7 @@ bool eye_position(void* ch, const double* m, const Params& p) {
     for (int i = 0; i < 3; i++) g_head[i] = g_root[i] + off[i];
   }
   double dt = dt_seconds();
+  g_frame_dt = dt;
   if (p.smooth > 0 && g_smooth_valid && dt > 0) {
     double a = 1.0 - std::exp(-dt / p.smooth);
     for (int i = 0; i < 3; i++) g_smooth_off[i] += (off[i] - g_smooth_off[i]) * a;
@@ -788,6 +802,628 @@ void __fastcall hk_hide(void* hide, char on, uint32_t bits) {
     hide_apply(g_hs.ch, g_hs.mode);
 }
 
+// ---- framing = close: the arms as a viewmodel ------------------------------------------------
+// The third-person animation holds the flashlight and gun low (out of a first-person frame except
+// when aiming). With framing = close each arm is re-posed after the animation, before anything
+// reads it, so the wrist sits inside a camera-relative box in the lower frame: a two-bone IK
+// (upper arm, forearm; the animated elbow direction is the pole) moves the wrist there and the hand
+// keeps its animated orientation (so recoil, reloads, use gestures and the flashlight boost still
+// read), with the flashlight hand turned to point at the view's aim point. When the animation
+// already has a hand inside the box (aiming), that arm does not move.
+//
+// The pose itself is not rewritten, its two outputs are. Character::postAnimation (0x17c080; the
+// synchronous path 0x17f600 does the same) exports the model-space pose for the render bones
+// through 0x184080 (-> 0x414a40: pose joint map[i] -> render bone i), then updates the flashlight
+// (lights, mesh, the light-damage cone 0x22c3e0) and the weapon from Character::slotTransform
+// (0x179f10). Both are hooked and apply the same per-segment rigid deltas, so the skinned arm, the
+// flashlight and its beam, the gun and the damage cone agree. The deltas are computed at the
+// export from this frame's pose and the camera of the last main-view set, kept relative to the
+// character (walking does not leave the hands behind).
+constexpr uintptr_t RVA_POSE_EXPORT = 0x184080;  // (anim, float out[n][12], n)
+constexpr uintptr_t RVA_JOINT_WORLD = 0x179e30;  // Character::jointTransform(this, float out[12], joint): world
+const Sig kVmSigs[] = {
+    // lea r8,[rcx+0x48f8] (render map); mov rcx,[rcx+8]; jmp 0x414a40
+    {RVA_POSE_EXPORT, "4c 8d 81 f8 48 00 00 48 8b 49 08 e9"},
+    // 0x414a40: [rcx+8] -> model-space pose (0x64ff34); out[i] = model[map[i]] for i < map count
+    {0x414a40, "48 89 5c 24 10 48 89 6c 24 18 48 89 7c 24 20 41 56 48 83 ec 60 48 8b 49 08 4d 8b f0 48 8b da e8"},
+    {RVA_JOINT_WORLD, "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 20 48 8b 01 41 8b f0 48 8b da 48 8b f9 ff 90 c8 02 00 "
+                      "00 84 c0 74 56 48 8b 8f b8 01 00 00 e8"},
+    // controller height (Character +0x1c0 -> +0xd0), subtracted from slot / joint heights
+    {0x4083f0, "f3 0f 10 81 d0 00 00 00 c3"},
+    // render bone count: [anim+0x4900]
+    {0x184680, "8b 81 00 49 00 00 c3"},
+};
+constexpr size_t kAnimRenderMap = 0x48f8, kAnimRenderCount = 0x4900;
+// The animation's skeleton instance ([Character +0x1b8] +8): +0x50 slot -> joint (int); its pose
+// [+8] +0 the skeleton: +8 parent indices (int16), +0x10 joint count (live, `fp skel`).
+constexpr size_t kXSlots = 0x50;
+// Slots (semantic: the slot table maps them to joints): per side the upper arm, forearm, hand and
+// the held item's attachment (0 = flashlight, 9 = weapon), live `fp skel` / `fp slotm`.
+struct ArmSlots {
+  int up, fore, hand, attach;
+};
+constexpr ArmSlots kArm[2] = {{6, 4, 1, 0}, {16, 14, 11, 9}};  // left (flashlight), right (gun)
+using PoseExportFn = void(__fastcall*)(void* anim, float* out, int n);
+PoseExportFn g_o_export = nullptr;
+BoneSlotFn g_o_slot = nullptr;  // Character::slotTransform behind our hook
+bool g_vm_ok = false;           // signatures matched, hooks in
+
+// Row-vector rigid transform as the game stores it: rows right, up, forward, then position;
+// p' = p * r + t. xf_mul(a, b) = a then b.
+struct Xf {
+  double r[3][3];
+  double t[3];
+};
+Xf xf_id() { return Xf{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, {0, 0, 0}}; }
+Xf xf_from(const float* f) {
+  Xf x;
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) x.r[i][k] = f[i * 3 + k];
+  for (int k = 0; k < 3; k++) x.t[k] = f[9 + k];
+  return x;
+}
+void xf_to(const Xf& x, float* f) {
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) f[i * 3 + k] = float(x.r[i][k]);
+  for (int k = 0; k < 3; k++) f[9 + k] = float(x.t[k]);
+}
+Xf xf_mul(const Xf& a, const Xf& b) {
+  Xf c;
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) c.r[i][k] = a.r[i][0] * b.r[0][k] + a.r[i][1] * b.r[1][k] + a.r[i][2] * b.r[2][k];
+  for (int k = 0; k < 3; k++) c.t[k] = a.t[0] * b.r[0][k] + a.t[1] * b.r[1][k] + a.t[2] * b.r[2][k] + b.t[k];
+  return c;
+}
+Xf xf_inv(const Xf& a) {  // general 3x3 (bones may carry scale)
+  const double(*m)[3] = a.r;
+  double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  Xf o = xf_id();
+  if (std::fabs(det) < 1e-12) return o;
+  double id = 1.0 / det;
+  o.r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * id;
+  o.r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * id;
+  o.r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * id;
+  o.r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * id;
+  o.r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * id;
+  o.r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * id;
+  o.r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * id;
+  o.r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * id;
+  o.r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * id;
+  for (int k = 0; k < 3; k++) o.t[k] = -(a.t[0] * o.r[0][k] + a.t[1] * o.r[1][k] + a.t[2] * o.r[2][k]);
+  return o;
+}
+void v_sub(const double* a, const double* b, double* o) { o[0] = a[0] - b[0], o[1] = a[1] - b[1], o[2] = a[2] - b[2]; }
+double v_dot(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+double v_len(const double* a) { return std::sqrt(v_dot(a, a)); }
+void xf_pt(const Xf& x, const double* p, double* o) {
+  for (int k = 0; k < 3; k++) o[k] = p[0] * x.r[0][k] + p[1] * x.r[1][k] + p[2] * x.r[2][k] + x.t[k];
+}
+// Rotation (row-vector 3x3) turning direction a towards b: the fraction w of the angle, at most
+// max_rad.
+void rot_arc(const double* a0, const double* b0, double w, double max_rad, double r[3][3]) {
+  double a[3] = {a0[0], a0[1], a0[2]}, b[3] = {b0[0], b0[1], b0[2]}, ax[3];
+  normalize(a), normalize(b);
+  cross(a, b, ax);
+  double s = v_len(ax), c = v_dot(a, b), ang = std::atan2(s, c) * w;
+  if (ang > max_rad) ang = max_rad;
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) r[i][k] = i == k;
+  if (s < 1e-9 || std::fabs(ang) < 1e-9) return;
+  for (double& v : ax) v /= s;
+  double cs = std::cos(ang), sn = std::sin(ang), t = 1 - cs, x = ax[0], y = ax[1], z = ax[2];
+  // the column-vector Rodrigues matrix, stored transposed (row-vector convention)
+  double m[3][3] = {{t * x * x + cs, t * x * y - sn * z, t * x * z + sn * y},
+                    {t * x * y + sn * z, t * y * y + cs, t * y * z - sn * x},
+                    {t * x * z - sn * y, t * y * z + sn * x, t * z * z + cs}};
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) r[i][k] = m[k][i];
+}
+// The fraction k of a rotation (row-vector 3x3), about the same axis.
+void rot_scale(const double r[3][3], double k, double o[3][3]) {
+  // column-vector form c = r^T: angle from the trace, axis from the antisymmetric part
+  double tr = r[0][0] + r[1][1] + r[2][2], ca = (tr - 1) / 2;
+  ca = ca > 1 ? 1 : ca < -1 ? -1 : ca;
+  double ang = std::acos(ca);
+  double ax[3] = {r[1][2] - r[2][1], r[2][0] - r[0][2], r[0][1] - r[1][0]};  // c32-c23, c13-c31, c21-c12
+  for (int i = 0; i < 3; i++)
+    for (int c = 0; c < 3; c++) o[i][c] = i == c;
+  double n = v_len(ax);
+  if (n < 1e-9 || ang < 1e-9) return;
+  for (double& v : ax) v /= n;
+  double a = ang * k, cs = std::cos(a), sn = std::sin(a), t = 1 - cs, x = ax[0], y = ax[1], z = ax[2];
+  double m[3][3] = {{t * x * x + cs, t * x * y - sn * z, t * x * z + sn * y},
+                    {t * x * y + sn * z, t * y * y + cs, t * y * z - sn * x},
+                    {t * x * z - sn * y, t * y * z + sn * x, t * z * z + cs}};
+  for (int i = 0; i < 3; i++)
+    for (int c = 0; c < 3; c++) o[i][c] = m[c][i];
+}
+// Rigid delta: rotate by r about `from`, then move `from` to `to` (new = old * delta).
+Xf xf_pivot(const double* from, const double r[3][3], const double* to) {
+  Xf d;
+  memcpy(d.r, r, sizeof d.r);
+  for (int k = 0; k < 3; k++) d.t[k] = to[k] - (from[0] * r[0][k] + from[1] * r[1][k] + from[2] * r[2][k]);
+  return d;
+}
+
+// Each joint's segment: side * 3 + {0 upper arm, 1 forearm, 2 hand}, or none; cached per skeleton.
+constexpr uint8_t kSegNone = 0xff;
+struct VmSkel {
+  void* skel = nullptr;
+  int n = 0;
+  bool ok = false;
+  int joint[2][4] = {};  // per side: upper arm, forearm, hand, attachment
+  int jacket[2] = {-1, -1};  // per side: the jacket's shoulder panel (Jkt_L/R_Shoulder), or -1
+  int clav[2] = {-1, -1};    // per side: the clavicle (the upper arm's parent)
+  uint8_t seg[1024];
+} g_vs;
+
+void* anim_x(void* ch) {
+  void* anim = rd<void*>(ch, 0x1b8);
+  return anim ? rd<void*>(anim, 8) : nullptr;
+}
+
+bool vm_skeleton(void* ch) {
+  void* x = anim_x(ch);
+  void* pose = x && readable(x, 0x160) ? rd<void*>(x, 8) : nullptr;
+  void* skel = pose && readable(pose, 8) ? rd<void*>(pose, 0) : nullptr;
+  if (!skel || !readable(skel, 0x28)) return false;
+  int n = rd<int>(skel, 0x10);
+  if (skel == g_vs.skel && n == g_vs.n) return g_vs.ok;
+  g_vs.skel = skel, g_vs.n = n, g_vs.ok = false;
+  auto* par = rd<int16_t*>(skel, 8);
+  if (n <= 8 || n > 1024 || !readable(par, size_t(n) * 2) || par[0] != -1) {
+    TB_LOG("firstperson: framing = close: unexpected skeleton (%d joints); hands stay as animated", n);
+    return false;
+  }
+  for (int s = 0; s < 2; s++) {
+    const int slot[4] = {kArm[s].up, kArm[s].fore, kArm[s].hand, kArm[s].attach};
+    for (int k = 0; k < 4; k++) g_vs.joint[s][k] = rd<int>(x, kXSlots + size_t(slot[k]) * 4);
+  }
+  // each chain must be upper arm -> forearm -> hand, with the attachment below the hand
+  for (int s = 0; s < 2; s++) {
+    const int* j = g_vs.joint[s];
+    bool chain = j[0] > 0 && j[0] < n && j[1] > 0 && j[1] < n && j[2] > 0 && j[2] < n && par[j[1]] == j[0] &&
+                 par[j[2]] == j[1];
+    int a = j[3];
+    for (int g = 0; chain && a >= 0 && a < n && a != j[2] && g < 64; g++) a = par[a];
+    if (!chain || a != j[2]) {
+      TB_LOG("firstperson: framing = close: arm %d is not upper arm %d -> forearm %d -> hand %d (attachment %d); "
+             "hands stay as animated",
+             s, j[0], j[1], j[2], j[3]);
+      return false;
+    }
+  }
+  for (int i = 0; i < n; i++) {
+    uint8_t sg = kSegNone;  // the nearest arm joint up the hierarchy decides
+    for (int a = i, g = 0; a >= 0 && a < n && g < 64 && sg == kSegNone; a = par[a], g++)
+      for (int s = 0; s < 2; s++)
+        for (int k = 0; k < 3; k++)
+          if (a == g_vs.joint[s][k] && sg == kSegNone) sg = uint8_t(s * 3 + k);
+    g_vs.seg[i] = sg;
+  }
+  // The jacket's side panels (Jkt_L/R_Shoulder and their Front/Back/Rib chains, children of the
+  // chest) are skinned up into the armpits: a raised arm stretches them into a flap of cloth in
+  // front of the lens (live). They follow part of the upper arm's turn (segment 6 + side). Found
+  // by name through the render bones (mesh +0x238: 0x80 per bone, name first; render map).
+  g_vs.jacket[0] = g_vs.jacket[1] = -1;
+  void* ro = render_object(ch);
+  void* mesh = ro && readable(ro, 0x1f8) ? rd<void*>(ro, 0x80) : nullptr;
+  void* anim = rd<void*>(ch, 0x1b8);
+  auto* map = anim ? rd<int*>(anim, kAnimRenderMap) : nullptr;
+  int nmap = anim ? rd<int>(anim, kAnimRenderCount) : 0;
+  if (mesh && readable(mesh, 0x280) && map && nmap > 0 && nmap <= 0x100 && readable(map, size_t(nmap) * 4)) {
+    auto* bl = rd<uint8_t*>(mesh, 0x238);
+    int nb = rd<int>(mesh, 0x240);
+    for (int i = 0; i < nb && i < nmap && readable(bl + size_t(i) * 0x80, 0x40); i++) {
+      std::string nm = cstr_at(bl + size_t(i) * 0x80, 0x40);
+      if (nm == "Jkt_L_Shoulder" && map[i] > 0 && map[i] < n) g_vs.jacket[0] = map[i];
+      if (nm == "Jkt_R_Shoulder" && map[i] > 0 && map[i] < n) g_vs.jacket[1] = map[i];
+    }
+  }
+  for (int i = 0; i < n; i++)
+    for (int a = i, g = 0; g_vs.seg[i] == kSegNone && a >= 0 && a < n && g < 64; a = par[a], g++)
+      for (int s = 0; s < 2; s++)
+        if (a == g_vs.jacket[s]) g_vs.seg[i] = uint8_t(6 + s);
+  for (int s = 0; s < 2; s++) {
+    int c = par[g_vs.joint[s][0]];
+    g_vs.clav[s] = c > 0 && g_vs.seg[c] == kSegNone ? c : -1;
+    if (g_vs.clav[s] > 0) g_vs.seg[c] = uint8_t(8 + s);
+  }
+  g_vs.ok = true;
+  TB_LOG("firstperson: framing = close: skeleton of %d joints, left arm %d/%d/%d (flashlight %d), right arm "
+         "%d/%d/%d (weapon %d), jacket shoulders %d/%d",
+         n, g_vs.joint[0][0], g_vs.joint[0][1], g_vs.joint[0][2], g_vs.joint[0][3], g_vs.joint[1][0],
+         g_vs.joint[1][1], g_vs.joint[1][2], g_vs.joint[1][3], g_vs.jacket[0], g_vs.jacket[1]);
+  return true;
+}
+
+// Character model space (the pose's, and the render bones') -> world: the controller height
+// down, then the character transform (as Character::slotTransform does).
+Xf char_model_to_world(void* ch) {
+  Xf c = xf_from(reinterpret_cast<const float*>(static_cast<uint8_t*>(ch) + kCharTransform));
+  void* ctl = rd<void*>(ch, 0x1c0);
+  Xf y = xf_id();
+  y.t[1] = ctl ? -rd<float>(ctl, 0xd0) : 0;
+  return xf_mul(y, c);
+}
+
+struct VmState {
+  bool cam_ok = false;    // a first-person camera was set since first person started
+  Xf cam_m;               // the last main-view camera (mono eye), character model space
+  Xf cam_smooth;          // ... low-passed (sway), model space
+  bool smooth_ok = false;
+  double aim_m[3] = {};   // the view's aim point, model space
+  double tan_v = 0.5;     // tan(vertical half FOV) of the rendered view
+  bool valid = false;     // the deltas are usable for g_vm_ch
+  Xf d_world[10];         // per segment: new_world = old_world * d
+  Xf d_model[10];         // the same in model space
+  double wrist_cam[2][3] = {};  // diagnostics: animated wrist and its target, camera space
+  double target_cam[2][3] = {};
+  double aim_err_deg = 0;
+  double raise[2] = {}, aim_out[2] = {};
+  bool holds[2] = {};
+  double hold_w[2] = {};
+  // filters (camera space): slow wrist positions, aim factors, held-item directions
+  bool filt_ok = false;
+  double slow[2][3] = {}, aimf[2] = {}, fwd[2][3] = {};
+  uint64_t computes = 0, applies = 0, slot_applies = 0;
+} g_vm;
+std::atomic<void*> g_vm_ch{nullptr};  // character the deltas apply to (null = none)
+std::atomic<bool> g_vm_test{false};   // `fp vmtest on`: pose the arms in third person too (test aid)
+std::mutex g_vm_mu;
+
+// Per-segment deltas for this frame's pose (world space). g_vm_mu held.
+//
+// Per arm, in camera space (x right, y up, z ahead): the animated wrist w is split into its slow
+// part (low-passed, hands_follow) and its fast part (recoil, reload and use gestures, the walk's
+// swing). The slow part is replaced by a pose: "rest" (low in the frame at the arm's side) or
+// "aim" (the gun just under the screen centre; the flashlight hand keeps its animated offset from
+// the gun hand, so the two-handed grip stays), blended by how far the animation has raised that
+// arm (the wrist's height against the shoulder). The fast part is added back. A two-bone IK puts
+// the wrist there; the hand turns with the forearm and then towards its aim: the flashlight always
+// at the view's aim point (Alan Wake's beam follows the camera), the gun at it when aiming and at a
+// lower "ready" point at rest. The turn is computed from the low-passed held-item direction, so a
+// recoil kick still shows.
+double vm_dt() { return game_dt(); }
+
+struct VmArm {
+  bool ok = false;
+  double S[3], E[3], W[3], C[3] = {}, la, lb;
+  bool has_c = false;
+  double w[3];      // wrist, camera space
+  double raise;     // wrist height above the shoulder / arm length (-1 hanging .. 0 level)
+  double attach[12];
+};
+
+bool vm_compute(void* ch, const Params& p) {
+  if (!vm_skeleton(ch)) return false;
+  Xf m = char_model_to_world(ch);
+  Xf cam = xf_mul(g_vm.cam_smooth, m);
+  double aim[3];
+  xf_pt(m, g_vm.aim_m, aim);
+  // The hands' frame: the view's, with its pitch limited to [-70, +30] deg: looking further up,
+  // the hands stay where the shoulders can hold them and leave the bottom of the frame (an arm
+  // posed up in front of the face folds the sleeves badly, live).
+  double hr[3], hu[3], hf[3];
+  {
+    const double* vf = cam.r[2];
+    double pitch = std::asin(vf[1] < -1 ? -1 : vf[1] > 1 ? 1 : vf[1]), h[3] = {vf[0], 0, vf[2]};
+    if (v_len(h) < 1e-6) h[0] = -cam.r[0][2], h[2] = cam.r[0][0];  // straight up/down: right x up
+    normalize(h);
+    double pc = pitch < -70 * M_PI / 180 ? -70 * M_PI / 180 : pitch > 30 * M_PI / 180 ? 30 * M_PI / 180 : pitch;
+    double up0[3] = {0, 1, 0};
+    for (int i = 0; i < 3; i++) hf[i] = h[i] * std::cos(pc) + up0[i] * std::sin(pc);
+    cross(up0, hf, hr);  // left-handed: right = up x forward
+    normalize(hr);
+    cross(hf, hr, hu);
+  }
+  const double *r = hr, *u = hu, *f = hf, *e = cam.t;
+  double tv = g_vm.tan_v, th = tv * 16.0 / 9.0;
+  double dt = vm_dt();
+  bool reset = !g_vm.filt_ok || dt <= 0;
+  auto lp = [&](double& state, double v, double tau) {
+    state = reset || tau <= 0 ? v : state + (v - state) * (1.0 - std::exp(-dt / tau));
+    return state;
+  };
+  auto to_cam = [&](const double* pw, double* o) {
+    double d[3];
+    v_sub(pw, e, d);
+    o[0] = v_dot(d, r), o[1] = v_dot(d, u), o[2] = v_dot(d, f);
+  };
+  auto dir_cam = [&](const double* dw, double* o) { o[0] = v_dot(dw, r), o[1] = v_dot(dw, u), o[2] = v_dot(dw, f); };
+  auto from_cam = [&](const double* c, double* o) {
+    for (int i = 0; i < 3; i++) o[i] = e[i] + c[0] * r[i] + c[1] * u[i] + c[2] * f[i];
+  };
+  auto jw = reinterpret_cast<void(__fastcall*)(void*, float*, int)>(game_image().at(RVA_JOINT_WORLD));
+  // an arm is posed only while it holds its item (the flashlight's or the weapon's mesh shown);
+  // an empty hand stays as animated
+  void* fl = rd<void*>(ch, kCharFlashlight);
+  void* wp = rd<void*>(ch, kCharWeapon);
+  bool holds[2] = {fl && rd<uint8_t>(fl, 0xc0) && !(rd<uint32_t>(rd<void*>(fl, 0xc8), kRoFlags) & 8),
+                   wp && rd<uint8_t>(wp, 0x30) && !(rd<uint32_t>(rd<void*>(wp, 0x38), kRoFlags) & 8)};
+  for (int s = 0; s < 2; s++) holds[s] = holds[s] && (p.hands_arms >> s & 1);
+  VmArm A[2];
+  for (int s = 0; s < 2; s++) {
+    g_vm.d_world[s * 3] = g_vm.d_world[s * 3 + 1] = g_vm.d_world[s * 3 + 2] = g_vm.d_world[6 + s] =
+        g_vm.d_world[8 + s] = xf_id();
+    VmArm& a = A[s];
+    g_vm.holds[s] = holds[s];
+    float b[12];
+    double* P[3] = {a.S, a.E, a.W};
+    for (int k = 0; k < 3; k++) {
+      jw(ch, b, g_vs.joint[s][k]);
+      for (int i = 0; i < 3; i++) P[k][i] = b[9 + i];
+    }
+    double se[3], ew[3];
+    v_sub(a.E, a.S, se), v_sub(a.W, a.E, ew);
+    a.la = v_len(se), a.lb = v_len(ew);
+    if (a.la < 0.05 || a.lb < 0.05 || a.la > 1 || a.lb > 1) continue;
+    to_cam(a.W, a.w);
+    a.raise = (a.W[1] - a.S[1]) / (a.la + a.lb);
+    if (g_vs.clav[s] > 0) {
+      jw(ch, b, g_vs.clav[s]);
+      for (int i = 0; i < 3; i++) a.C[i] = b[9 + i];
+      a.has_c = true;
+    }
+    g_o_slot(ch, b, kArm[s].attach);
+    for (int i = 0; i < 12; i++) a.attach[i] = b[i];
+    a.ok = true;
+  }
+  if (!A[0].ok && !A[1].ok) return false;
+  // slow parts and aim factors (camera space)
+  double slow[2][3], aimf[2], hw[2];
+  for (int s = 0; s < 2; s++) {
+    if (!A[s].ok) continue;
+    // fades the pose in / out as the item is drawn or put away (or hidden by a use animation)
+    hw[s] = lp(g_vm.hold_w[s], holds[s] ? 1.0 : 0.0, 0.15);
+    for (int i = 0; i < 3; i++) slow[s][i] = lp(g_vm.slow[s][i], A[s].w[i], p.hands_follow);
+    // live (`fp vm`, level 03): flashlight arm at rest -0.62, gun arm hanging -0.95, both
+    // aiming -0.07..0
+    double raw = (A[s].raise + 0.55) / 0.45;
+    aimf[s] = lp(g_vm.aimf[s], raw < 0 ? 0 : raw > 1 ? 1 : raw, 0.08);
+  }
+  double z = p.hands_forward;
+  double rest[2][3] = {{-p.hands_side * th * z, -p.hands_drop * tv * z, z},
+                       {p.hands_side * th * z, -p.hands_drop * tv * z, z}};
+  double zaim = z + 0.08;
+  double aimpos[2][3] = {{-0.10 * th * zaim, -p.hands_sight * tv * zaim, zaim},
+                         {0.10 * th * zaim, -p.hands_sight * tv * zaim, zaim}};
+  // two-handed: the flashlight hand keeps its animated offset from the gun hand
+  if (A[0].ok && A[1].ok) {
+    double k = aimf[1];
+    for (int i = 0; i < 3; i++) aimpos[0][i] += ((aimpos[1][i] + slow[0][i] - slow[1][i]) - aimpos[0][i]) * k;
+  }
+  for (int s = 0; s < 2; s++) {
+    VmArm& a = A[s];
+    if (!a.ok) continue;
+    // the fast part, scaled by hands_motion and at most 5 cm (the walk swings the wrists by up to
+    // 50 cm, live; a raise into aim is mostly slow and must not overshoot)
+    double fast[3], t[3];
+    v_sub(a.w, slow[s], fast);
+    double fl = v_len(fast) * p.hands_motion, fmax = 0.05, fk = p.hands_motion * (fl > fmax ? fmax / fl : 1.0);
+    for (int i = 0; i < 3; i++) {
+      double base = rest[s][i] + (aimpos[s][i] - rest[s][i]) * aimf[s];
+      t[i] = base + fast[i] * fk;
+      t[i] = a.w[i] + (t[i] - a.w[i]) * hw[s];
+    }
+    double zmin = a.w[2] < 0.18 ? a.w[2] + (0.18 - a.w[2]) * hw[s] : 0.18;  // never into the lens
+    if (t[2] < zmin) t[2] = zmin;
+    memcpy(g_vm.wrist_cam[s], a.w, sizeof a.w);
+    memcpy(g_vm.target_cam[s], t, sizeof t);
+    g_vm.raise[s] = a.raise;
+    g_vm.aim_out[s] = aimf[s];
+    if (hw[s] < 1e-3) continue;  // as animated
+    double Wt[3], d[3], se[3], ew[3];
+    from_cam(t, Wt);
+    // The clavicle takes hands_shrug of the arm's swing (the shoulders come forward with the
+    // arms, which spreads the bend over two joints: a 150 deg swing at the shoulder alone pulls
+    // the armpit's cloth into a flap, live); the animated arm moves with it before the IK.
+    Xf dc = xf_id();
+    double rc[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    if (a.has_c && p.hands_shrug > 0) {
+      double sw0[3], tw[3];
+      v_sub(a.W, a.S, sw0), v_sub(Wt, a.S, tw);
+      rot_arc(sw0, tw, p.hands_shrug * hw[s], M_PI, rc);
+      dc = xf_pivot(a.C, rc, a.C);
+      double q[3];
+      for (double* pt : {a.S, a.E, a.W}) xf_pt(dc, pt, q), memcpy(pt, q, sizeof q);
+      double ap[3] = {a.attach[9], a.attach[10], a.attach[11]};
+      xf_pt(dc, ap, q);
+      for (int r3 = 0; r3 < 3; r3++) {
+        double row[3] = {a.attach[r3 * 3], a.attach[r3 * 3 + 1], a.attach[r3 * 3 + 2]};
+        for (int i = 0; i < 3; i++)
+          a.attach[r3 * 3 + i] = row[0] * rc[0][i] + row[1] * rc[1][i] + row[2] * rc[2][i];
+      }
+      for (int i = 0; i < 3; i++) a.attach[9 + i] = q[i];
+    }
+    v_sub(a.E, a.S, se), v_sub(a.W, a.E, ew);
+    // two-bone IK: shoulder fixed, wrist to Wt, the elbow in the animated elbow's plane
+    v_sub(Wt, a.S, d);
+    double L = v_len(d), lo = std::fabs(a.la - a.lb) + 1e-3, hi = (a.la + a.lb) * 0.999;
+    if (L < 1e-4) continue;
+    L = L < lo ? lo : L > hi ? hi : L;
+    double n[3] = {d[0], d[1], d[2]};
+    normalize(n);
+    for (int i = 0; i < 3; i++) Wt[i] = a.S[i] + n[i] * L;
+    double ca = (a.la * a.la + L * L - a.lb * a.lb) / (2 * a.la * L);
+    ca = ca > 1 ? 1 : ca < -1 ? -1 : ca;
+    // the pole: the animated elbow after swinging the whole arm rigidly onto the new shoulder ->
+    // wrist line, so the arm's plane (and the upper arm's roll) changes as little as possible
+    double sw0[3], sw[3][3], ses[3];
+    v_sub(a.W, a.S, sw0);
+    rot_arc(sw0, n, 1, M_PI, sw);
+    for (int i = 0; i < 3; i++) ses[i] = se[0] * sw[0][i] + se[1] * sw[1][i] + se[2] * sw[2][i];
+    double sa = std::sqrt(1 - ca * ca), pole[3], kk = v_dot(ses, n);
+    for (int i = 0; i < 3; i++) pole[i] = ses[i] - n[i] * kk;
+    if (v_len(pole) < 1e-4)
+      for (int i = 0; i < 3; i++) pole[i] = -u[i];
+    normalize(pole);
+    double Et[3], se2[3], ew2[3], rot_u[3][3], rot_b[3][3], rot_f[3][3], v[3];
+    for (int i = 0; i < 3; i++) Et[i] = a.S[i] + n[i] * a.la * ca + pole[i] * a.la * sa;
+    v_sub(Et, a.S, se2);
+    v_sub(Wt, Et, ew2);
+    // The upper arm takes the arm's plane (shoulder, elbow, wrist) onto the new one, so the elbow
+    // stays a hinge (a shortest-arc turn of each bone twists the elbow, which shows as a ribbon of
+    // sleeve, live); with a straight animated arm (no plane), the shortest arc.
+    double n1[3], n2[3];
+    cross(se, ew, n1);
+    cross(se2, ew2, n2);
+    if (v_len(n1) > 1e-3 * a.la * a.lb && v_len(n2) > 1e-3 * a.la * a.lb) {
+      double a1[3] = {se[0], se[1], se[2]}, a2[3] = {se2[0], se2[1], se2[2]}, b1[3], b2[3];
+      normalize(a1), normalize(a2), normalize(n1), normalize(n2);
+      cross(a1, n1, b1);
+      cross(a2, n2, b2);
+      const double* F1[3] = {a1, n1, b1};
+      const double* F2[3] = {a2, n2, b2};
+      for (int i = 0; i < 3; i++)  // R = F1^T F2 (row vectors: a1 -> a2, n1 -> n2)
+        for (int c = 0; c < 3; c++) rot_u[i][c] = F1[0][i] * F2[0][c] + F1[1][i] * F2[1][c] + F1[2][i] * F2[2][c];
+    } else {
+      rot_arc(se, se2, 1, M_PI, rot_u);
+    }
+    for (int i = 0; i < 3; i++) v[i] = ew[0] * rot_u[0][i] + ew[1] * rot_u[1][i] + ew[2] * rot_u[2][i];
+    rot_arc(v, ew2, 1, M_PI, rot_b);
+    for (int i = 0; i < 3; i++)
+      for (int c = 0; c < 3; c++)
+        rot_f[i][c] = rot_u[i][0] * rot_b[0][c] + rot_u[i][1] * rot_b[1][c] + rot_u[i][2] * rot_b[2][c];
+    // The flashlight hand keeps its animated orientation (the animation already points the beam
+    // at the camera's target); the gun hand turns with the forearm (the animated wrist bend is
+    // kept: a hanging gun comes up with the arm). Then each turns towards its aim.
+    double rot_h[3][3], id3[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    memcpy(rot_h, s == 0 ? id3 : rot_f, sizeof rot_h);
+    double (*rb)[3] = s == 0 ? id3 : rot_f;
+    double weight = p.hands_aim * hw[s];
+    if (weight > 0) {
+      const double* at = a.attach;
+      double fw[3], rel[3], pos[3], want[3], fwc[3], fws[3], dirc[3], ra[3][3];
+      for (int i = 0; i < 3; i++) fw[i] = at[6] * rb[0][i] + at[7] * rb[1][i] + at[8] * rb[2][i];
+      double ap[3] = {at[9], at[10], at[11]};
+      v_sub(ap, a.W, rel);
+      for (int i = 0; i < 3; i++) pos[i] = Wt[i] + rel[0] * rb[0][i] + rel[1] * rb[1][i] + rel[2] * rb[2][i];
+      // where it should point: the aim point; the gun at rest at a "ready" point below it
+      v_sub(aim, pos, want);
+      normalize(want);
+      dir_cam(want, dirc);
+      if (s == 1) {
+        double ready[3] = {dirc[0] * 0.7, dirc[1] - 0.2, dirc[2]};  // ~11 deg lower, a little inwards
+        normalize(ready);
+        for (int i = 0; i < 3; i++) dirc[i] = ready[i] + (dirc[i] - ready[i]) * aimf[1];
+      }
+      // turn the low-passed direction onto the wanted one, so fast kicks still show
+      normalize(fw);
+      dir_cam(fw, fwc);
+      for (int i = 0; i < 3; i++) fws[i] = lp(g_vm.fwd[s][i], fwc[i], 0.12);
+      rot_arc(fws, dirc, weight, (s == 0 ? 75 : 80) * M_PI / 180, ra);  // camera-space rotation
+      // to world: R_w = C^T R_c C (row-vector: world dir -> cam -> rotate -> world)
+      double cm[3][3] = {{r[0], u[0], f[0]}, {r[1], u[1], f[1]}, {r[2], u[2], f[2]}};  // world -> cam
+      double tmp[3][3], rw[3][3];
+      for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++) tmp[i][c] = cm[i][0] * ra[0][c] + cm[i][1] * ra[1][c] + cm[i][2] * ra[2][c];
+      for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++) rw[i][c] = tmp[i][0] * r[c] + tmp[i][1] * u[c] + tmp[i][2] * f[c];
+      double fsn[3] = {fws[0], fws[1], fws[2]};
+      normalize(fsn);
+      if (s == 0) g_vm.aim_err_deg = std::acos(std::fmin(1.0, v_dot(fsn, dirc))) * 180 / M_PI;
+      for (int i = 0; i < 3; i++)
+        for (int c = 0; c < 3; c++) rot_h[i][c] = rb[i][0] * rw[0][c] + rb[i][1] * rw[1][c] + rb[i][2] * rw[2][c];
+    }
+    // (the deltas below act on the shrugged arm: the clavicle's first)
+    g_vm.d_world[8 + s] = dc;
+    g_vm.d_world[s * 3 + 0] = xf_mul(dc, xf_pivot(a.S, rot_u, a.S));
+    double rot_j[3][3];
+    rot_scale(rot_u, p.hands_jacket, rot_j);
+    g_vm.d_world[6 + s] = xf_mul(dc, xf_pivot(a.S, rot_j, a.S));
+    g_vm.d_world[s * 3 + 1] = xf_mul(dc, xf_pivot(a.E, rot_f, Et));
+    g_vm.d_world[s * 3 + 2] = xf_mul(dc, xf_pivot(a.W, rot_h, Wt));
+  }
+  g_vm.filt_ok = true;
+  Xf mi = xf_inv(m);
+  for (int i = 0; i < 10; i++) g_vm.d_model[i] = xf_mul(xf_mul(m, g_vm.d_world[i]), mi);
+  g_vm.computes++;
+  return true;
+}
+
+// 0x184080: the model-space pose exported for the render bones.
+void __fastcall hk_export(void* anim, float* out, int n) {
+  g_o_export(anim, out, n);
+  void* ch = player();
+  bool test = g_vm_test.load(std::memory_order_relaxed);
+  if (!ch || anim != rd<void*>(ch, 0x1b8)) return;
+  if (!(g_on.load(std::memory_order_relaxed) || test)) {
+    // third person: nothing applied (the slot hook passes through once g_vm_ch is null)
+    if (g_vm_ch.load(std::memory_order_relaxed)) {
+      std::lock_guard lk(g_vm_mu);
+      g_vm_ch = nullptr;
+      g_vm.valid = g_vm.filt_ok = false;
+    }
+    return;
+  }
+  Params p = params();
+  std::lock_guard lk(g_vm_mu);
+  bool want = (p.framing_close || test) && g_vm_ok && (g_active.load(std::memory_order_relaxed) || test) &&
+              g_vm.cam_ok && !game_hides(ch);
+  g_vm.valid = want && vm_compute(ch, p);
+  if (!g_vm.valid) g_vm.filt_ok = false;
+  g_vm_ch = g_vm.valid ? ch : nullptr;
+  if (!g_vm.valid) return;
+  auto* map = rd<int*>(anim, kAnimRenderMap);
+  int cnt = rd<int>(anim, kAnimRenderCount);
+  for (int i = 0; map && i < cnt && i < 0x100; i++) {
+    int j = map[i];
+    if (j < 0 || j >= g_vs.n || g_vs.seg[j] == kSegNone) continue;
+    xf_to(xf_mul(xf_from(out + size_t(i) * 12), g_vm.d_model[g_vs.seg[j]]), out + size_t(i) * 12);
+  }
+  g_vm.applies++;
+}
+
+// Character::slotTransform: the player's arm slots (held items, hands) get the same deltas.
+void __fastcall hk_slot(void* ch, float* out, int slot) {
+  g_o_slot(ch, out, slot);
+  if (ch != g_vm_ch.load(std::memory_order_relaxed) || slot < 0 || slot >= 0x60) return;
+  std::lock_guard lk(g_vm_mu);
+  if (!g_vm.valid || ch != g_vm_ch.load() || !g_vs.ok) return;
+  void* x = anim_x(ch);
+  int j = x ? rd<int>(x, kXSlots + size_t(slot) * 4) : -1;
+  if (j < 0 || j >= g_vs.n || g_vs.seg[j] == kSegNone) return;
+  xf_to(xf_mul(xf_from(out), g_vm.d_world[g_vs.seg[j]]), out);
+  g_vm.slot_applies++;
+}
+
+// From the filter: the camera just set (mono eye) and its aim point, kept in model space; `sway`
+// low-passes the camera's orientation for placing the hands (they trail a fast turn slightly).
+void vm_camera(void* ch, const double* mm, const double* aim, double dt, const Params& p) {
+  std::lock_guard lk(g_vm_mu);
+  if (!ch) {
+    g_vm.cam_ok = g_vm.smooth_ok = g_vm.filt_ok = false;
+    return;
+  }
+  Xf c;
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) c.r[i][k] = mm[i * 3 + k];
+  for (int k = 0; k < 3; k++) c.t[k] = mm[9 + k];
+  Xf mi = xf_inv(char_model_to_world(ch));
+  g_vm.cam_m = xf_mul(c, mi);
+  xf_pt(mi, aim, g_vm.aim_m);
+  g_vm.cam_ok = true;
+  if (p.hands_sway > 0 && g_vm.smooth_ok) {
+    Xf& s = g_vm.cam_smooth;
+    if (dt > 0) {
+      double a = 1.0 - std::exp(-dt / p.hands_sway);
+      for (int i = 0; i < 3; i++)
+        for (int k = 0; k < 3; k++) s.r[i][k] += (g_vm.cam_m.r[i][k] - s.r[i][k]) * a;
+      // re-orthonormalise (forward, then up)
+      normalize(s.r[2]);
+      cross(s.r[1], s.r[2], s.r[0]);  // right = up x forward (left-handed)
+      normalize(s.r[0]);
+      cross(s.r[2], s.r[0], s.r[1]);
+    }
+    memcpy(s.t, g_vm.cam_m.t, sizeof s.t);
+  } else {
+    g_vm.cam_smooth = g_vm.cam_m;
+  }
+  g_vm.smooth_ok = p.hands_sway > 0;
+}
+
 // core/camera.h filter: the main view's transform -> the player's eyes.
 bool fp_filter(void* view, double* m) {
   if (g_job_pending.load(std::memory_order_relaxed) && G.ok && G.cameraman && view == *G.cameraman) job_run();
@@ -795,6 +1431,21 @@ bool fp_filter(void* view, double* m) {
   if (g_freecam_req.load(std::memory_order_relaxed) >= 0 && G.ok) freecam_apply();
   g_game_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
   if (!g_on.load(std::memory_order_relaxed)) {
+    if (g_vm_test.load(std::memory_order_relaxed) && g_vm_ok && G.ok && G.cameraman && view == *G.cameraman) {
+      // test aid: the arms posed for a first-person eye (head slot, looking along the character's
+      // facing) while the third-person view shows them (orbit the camera to look at them)
+      void* ch = player();
+      Params p = params();
+      if (ch && *G.cam_mode == 0 && eye_position(ch, m, p)) {
+        double mm[12];
+        const float* ct = reinterpret_cast<const float*>(static_cast<uint8_t*>(ch) + kCharTransform);
+        for (int i = 0; i < 9; i++) mm[i] = ct[i];
+        for (int i = 0; i < 3; i++) mm[9 + i] = g_eye[i];
+        double aim[3];
+        for (int i = 0; i < 3; i++) aim[i] = g_eye[i] + mm[6 + i] * 15;
+        vm_camera(ch, mm, aim, g_frame_dt, p);
+      }
+    }
     if (g_active.exchange(false)) g_reason = 0;
     if (g_hs.on || g_head_ro.load(std::memory_order_relaxed) || g_hide_test.load(std::memory_order_relaxed))
       hide_sync();
@@ -814,11 +1465,13 @@ bool fp_filter(void* view, double* m) {
   if (g_reason.exchange(r) != r) TB_LOG("firstperson: %s", kReasons[r]);
   if (r != 1) {
     g_active = false;
+    if (g_vm_ok) vm_camera(nullptr, nullptr, nullptr, 0, p);
     g_smooth_valid = false;
     g_cache_frame = ~0ull;
     hide_sync();
     return false;
   }
+  for (int i = 0; i < 3; i++) g_camfwd[i] = m[6 + i];
   if (p.aim_distance > 0) {
     // Look at the point the game camera's centre ray reaches at aim_distance (where the reticle
     // points at that range), so the reticle stays on target from the new viewpoint.
@@ -835,12 +1488,42 @@ bool fp_filter(void* view, double* m) {
   m[10] = g_eye[1];
   m[11] = g_eye[2];
   g_active = true;
+  if (g_vm_ok) {
+    // the viewmodel's camera and aim point (the point the view converges on)
+    double dist = p.aim_distance > 0 ? p.aim_distance : 15, aim[3];
+    for (int i = 0; i < 3; i++) aim[i] = g_cam[i] + g_camfwd[i] * dist;
+    static uint64_t last_frame = ~0ull;
+    uint64_t fr = present_frame();
+    vm_camera(ch, m, aim, fr != last_frame ? g_frame_dt : 0, p);
+    last_frame = fr;
+  }
   hide_sync();
   return true;
 }
 
-// core/camera.h pre-render: first-person FOV.
+// The rendered camera's near plane (PerspectiveView +0xcbc, "Camera:Near" 0.2 m): framing = close
+// brings the arms within a few centimetres of the eye, and at 0.2 m the near plane cuts the
+// sleeves open (the inside of a cut sleeve shows as a hollow ribbon, live). Lowered while first
+// person is active, the game's value put back after.
+float g_near_orig = 0;  // the game's near plane while ours is applied, else 0
+void near_apply(void* view, double want) {
+  auto* b = static_cast<uint8_t*>(view);
+  float cur = rd<float>(view, kViewNear);
+  float w = want > 0 ? float(want) : g_near_orig;
+  if (want > 0 && g_near_orig == 0) g_near_orig = cur;
+  if (want <= 0) g_near_orig = 0;
+  if (w > 0 && cur != w) {
+    memcpy(b + kViewNear, &w, sizeof w);
+    b[kViewDirtyProj] = 0;
+    b[kViewDirtyWorld] = 0;
+  }
+}
+
+// core/camera.h pre-render: first-person FOV and near plane.
 void fp_prerender(void* view) {
+  if (G.cameraman && view == *G.cameraman && g_near_orig != 0 &&
+      (!g_on.load(std::memory_order_relaxed) || !g_active.load(std::memory_order_relaxed)))
+    near_apply(view, 0);  // first person stopped: the game's near plane back
   if (!g_on.load(std::memory_order_relaxed) || !G.cameraman) return;
   // Which camera is rendered, as it changes (the Cameraman camera in gameplay; the cinematic,
   // free or death camera otherwise).
@@ -862,9 +1545,19 @@ void fp_prerender(void* view) {
   }
   if (!g_active.load(std::memory_order_relaxed)) return;
   Params p = params();
-  if (p.fov_deg <= 1 || p.fov_deg >= 170) return;
+  near_apply(view, p.near_m > 0 ? p.near_m : p.framing_close && g_vm_ok ? 0.05 : 0);
   float aspect = rd<float>(view, kViewAspect);
   if (!(aspect > 0.1f && aspect < 10.f)) return;
+  if (g_vm_ok) {
+    // the viewmodel's box is relative to the rendered frame
+    float hf = rd<float>(view, kViewFov);
+    double tv = std::tan(hf * 0.5) / aspect;
+    if (tv > 0.05 && tv < 5) {
+      std::lock_guard lk(g_vm_mu);
+      g_vm.tan_v = tv;
+    }
+  }
+  if (p.fov_deg <= 1 || p.fov_deg >= 170) return;
   // The setting is the horizontal FOV of a 16:9 view; keep the vertical FOV for other aspects.
   double v = 2.0 * std::atan(std::tan(p.fov_deg * M_PI / 360.0) / (16.0 / 9.0));
   float h = float(2.0 * std::atan(std::tan(v * 0.5) * aspect));
@@ -951,8 +1644,21 @@ void firstperson_register() {
                  : v == "body" ? Params::Hide::Body
                                : Params::Hide::All;
     if (id == "camera.fov") g_p.fov_deg = n;
+    if (id == "camera.near") g_p.near_m = n > 0.01 && n < 1 ? n : 0;
     if (id == "camera.smooth") g_p.smooth = n > 0 ? n : 0;
     if (id == "camera.aim_distance") g_p.aim_distance = n > 0 ? n : 0;
+    if (id == "camera.framing") g_p.framing_close = v != "classic";
+    if (id == "camera.hands_forward") g_p.hands_forward = n < 0.1 ? 0.1 : n > 0.8 ? 0.8 : n;
+    if (id == "camera.hands_drop") g_p.hands_drop = n < 0 ? 0 : n > 1.5 ? 1.5 : n;
+    if (id == "camera.hands_side") g_p.hands_side = n < 0 ? 0 : n > 1.5 ? 1.5 : n;
+    if (id == "camera.hands_aim") g_p.hands_aim = n < 0 ? 0 : n > 1 ? 1 : n;
+    if (id == "camera.hands_sight") g_p.hands_sight = n < -0.5 ? -0.5 : n > 1.5 ? 1.5 : n;
+    if (id == "camera.hands_follow") g_p.hands_follow = n < 0 ? 0 : n > 2 ? 2 : n;
+    if (id == "camera.hands_motion") g_p.hands_motion = n < 0 ? 0 : n > 1 ? 1 : n;
+    if (id == "camera.hands_arms") g_p.hands_arms = v.empty() ? 3 : int(n);
+    if (id == "camera.hands_jacket") g_p.hands_jacket = n < 0 ? 0 : n > 1 ? 1 : n;
+    if (id == "camera.hands_shrug") g_p.hands_shrug = n < 0 ? 0 : n > 0.8 ? 0.8 : n;
+    if (id == "camera.hands_sway") g_p.hands_sway = n < 0 ? 0 : n > 0.5 ? 0.5 : n;
   });
   camera_filter_add(0, fp_filter);
   camera_prerender_add(fp_prerender);
@@ -1043,6 +1749,111 @@ void firstperson_register() {
         return json_str("flashlight_normal_power_large_clip_A, 10 batteries");
       }, ok);
     }
+    if (a[0] == "skel" && G.ok) {
+      // RE aid: the player's animation skeleton (hkaSkeleton through the pose), slot table and
+      // the render-bone map.
+      return job_call([] {
+        void* ch = player();
+        if (!ch) return json_str("no player");
+        void* anim = rd<void*>(ch, 0x1b8);
+        void* x = anim ? rd<void*>(anim, 8) : nullptr;
+        void* pose = x ? rd<void*>(x, 8) : nullptr;
+        void* skel = pose ? rd<void*>(pose, 0) : nullptr;
+        char b[256];
+        snprintf(b, sizeof b, "{\"anim\":\"%p\",\"x\":\"%p\",\"pose\":\"%p\",\"skel\":\"%p\"", anim, x, pose, skel);
+        std::string o = b;
+        if (!readable(skel, 0x60)) return o + "}";
+        // skeleton: +8 parent indices (int16), +0x10 count, +0x18 names (char*), +0x28 reference
+        // pose (0x30 per joint), each array followed by its count (live)
+        auto* par = rd<int16_t*>(skel, 0x8);
+        int np = rd<int>(skel, 0x10);
+        auto* bones = rd<uint8_t*>(skel, 0x18);
+        int nb = rd<int>(skel, 0x20);
+        snprintf(b, sizeof b, ",\"nparents\":%d,\"nbones\":%d,\"joints\":[", np, nb);
+        o += b;
+        const float* root = reinterpret_cast<const float*>(static_cast<uint8_t*>(ch) + kCharTransform);
+        for (int i = 0; i < nb && i < 512; i++) {
+          std::string name = readable(bones, size_t(nb) * 8) ? cstr_at(rd<void*>(bones + size_t(i) * 8, 0)) : "";
+          float m[12];
+          memcpy(m, root, sizeof m);
+          reinterpret_cast<void(__fastcall*)(void*, float*, int)>(game_image().at(0x179e30))(ch, m, i);
+          snprintf(b, sizeof b, "%s[%d,\"%s\",%d,[%.3f,%.3f,%.3f]]", i ? "," : "", i, name.c_str(),
+                   i < np ? par[i] : -9, m[9] - root[9], m[10] - root[10], m[11] - root[11]);
+          o += b;
+        }
+        o += "],\"slots\":[";
+        for (int s = 0; s < 64; s++) {
+          snprintf(b, sizeof b, "%s%d", s ? "," : "", rd<int>(x, 0x50 + size_t(s) * 4));
+          o += b;
+        }
+        o += "],\"render_map\":[";
+        auto* map = rd<int*>(anim, 0x48f8);
+        int nm = rd<int>(anim, 0x4900);
+        for (int i = 0; i < nm && i < 512 && readable(map, size_t(nm) * 4); i++) {
+          snprintf(b, sizeof b, "%s%d", i ? "," : "", map[i]);
+          o += b;
+        }
+        snprintf(b, sizeof b, "],\"render_count\":%d}", nm);
+        return o + b;
+      }, ok);
+    }
+    if (a[0] == "vmtest" && a.size() > 1) {
+      g_vm_test = a[1] == "on";
+      return json_str(g_vm_test ? "arms posed in third person too" : "arms posed in first person only");
+    }
+    if (a[0] == "vm") {
+      // framing = close diagnostics: wrists (animated) and their targets in camera space
+      // (x right, y up, z ahead, m), the flashlight's turn to the aim point, counters.
+      std::lock_guard lk(g_vm_mu);
+      char b[768];
+      snprintf(b, sizeof b,
+               "{\"ok\":%s,\"valid\":%s,\"cam\":%s,\"tan_v\":%.3f,\"left_wrist\":%s,\"left_target\":%s,"
+               "\"right_wrist\":%s,\"right_target\":%s,\"flashlight_turn_deg\":%.1f,\"raise\":[%.2f,%.2f],"
+               "\"aim\":[%.2f,%.2f],\"dt\":%.4f,\"computes\":%llu,\"applies\":%llu,\"slot_applies\":%llu}",
+               g_vm_ok ? "true" : "false", g_vm.valid ? "true" : "false", g_vm.cam_ok ? "true" : "false", g_vm.tan_v,
+               fmt3(g_vm.wrist_cam[0]).c_str(), fmt3(g_vm.target_cam[0]).c_str(), fmt3(g_vm.wrist_cam[1]).c_str(),
+               fmt3(g_vm.target_cam[1]).c_str(), g_vm.aim_err_deg, g_vm.raise[0], g_vm.raise[1], g_vm.aim_out[0],
+               g_vm.aim_out[1], game_dt(), (unsigned long long)g_vm.computes,
+               (unsigned long long)g_vm.applies, (unsigned long long)g_vm.slot_applies);
+      return std::string(b);
+    }
+    if (a[0] == "slotm" && G.ok) {
+      // RE aid: world transforms (rows right, up, forward, position) of the given slots, and the
+      // game camera's forward.
+      std::vector<int> slots;
+      for (size_t i = 1; i < a.size(); i++) slots.push_back(atoi(a[i].c_str()));
+      return job_call([slots] {
+        void* ch = player();
+        if (!ch) return json_str("no player");
+        std::string o = "{";
+        char b[400];
+        for (int s : slots) {
+          float m[12];
+          G.bone_slot(ch, m, s);
+          snprintf(b, sizeof b, "\"%d\":[[%.3f,%.3f,%.3f],[%.3f,%.3f,%.3f],[%.3f,%.3f,%.3f],[%.3f,%.3f,%.3f]],", s, m[0],
+                   m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+          o += b;
+        }
+        snprintf(b, sizeof b, "\"cam_fwd\":[%.3f,%.3f,%.3f],\"cam\":%s,\"eye\":%s}", g_camfwd[0], g_camfwd[1],
+                 g_camfwd[2], fmt3(g_cam).c_str(), fmt3(g_eye).c_str());
+        return o + b;
+      }, ok);
+    }
+    if (a[0] == "peek" && a.size() > 1) {
+      // RE aid: N bytes (default 64) at an RVA (< 0x10000000) or an absolute address, as hex.
+      uintptr_t v = strtoull(a[1].c_str(), nullptr, 0);
+      size_t n = a.size() > 2 ? strtoul(a[2].c_str(), nullptr, 0) : 64;
+      if (n > 1024) n = 1024;
+      auto* p = reinterpret_cast<const uint8_t*>(v < 0x10000000 ? game_image().at(v) : v);
+      if (!readable(p, n)) {
+        ok = false;
+        return json_str("unreadable");
+      }
+      std::string o;
+      char t[4];
+      for (size_t i = 0; i < n; i++) snprintf(t, sizeof t, "%02x", p[i]), o += t;
+      return json_str(o);
+    }
     if (a[0] == "mask" && a.size() > 1 && G.ok) {
       // Test aid: the body render object's per-submesh draw mask (+0x158, bit i = submesh i).
       uint32_t m = strtoul(a[1].c_str(), nullptr, 0);
@@ -1069,7 +1880,7 @@ void firstperson_register() {
     ok = false;
     return json_str(
         "usage: fp [status|slots N|parts [bones]|mask HEX|give weapons|flashlight|freecam on|off|use|"
-        "usables [mask] [radius]|hidetest on|off]");
+        "usables [mask] [radius]|hidetest on|off|vm|vmtest on|off|skel|slotm S...|peek ADDR [N]]");
   });
 }
 
@@ -1097,6 +1908,30 @@ void firstperson_start() {
     TB_LOG("firstperson: collect hook failed; hide = head hides the body instead");
     g_head_ok = false;
   }
+  // framing = close: the viewmodel arms (without them, close keeps the classic arms).
+  g_vm_ok = true;
+  for (auto& s : kVmSigs)
+    if (!sig_ok(s.rva, s.hex)) {
+      TB_LOG("firstperson: signature mismatch at rva 0x%zx; framing = close keeps the animated arms (classic)",
+             (size_t)s.rva);
+      g_vm_ok = false;
+      break;
+    }
+  if (g_vm_ok && !hook_fn(reinterpret_cast<void*>(game_image().at(RVA_POSE_EXPORT)),
+                          reinterpret_cast<void*>(&hk_export), reinterpret_cast<void**>(&g_o_export),
+                          "Animation pose export")) {
+    g_vm_ok = false;
+  }
+  if (g_vm_ok) {
+    if (hook_fn(reinterpret_cast<void*>(game_image().at(RVA_BONE_SLOT)), reinterpret_cast<void*>(&hk_slot),
+                reinterpret_cast<void**>(&g_o_slot), "Character::slotTransform")) {
+      G.bone_slot = g_o_slot;
+    } else {
+      // the export hook stays in but never applies (g_vm_ok false)
+      g_vm_ok = false;
+    }
+  }
+  if (!g_vm_ok) TB_LOG("firstperson: framing = close unavailable; the arms stay as animated");
   TB_LOG("firstperson: ready (rendered camera at %p)", (void*)G.cameraman);
 }
 

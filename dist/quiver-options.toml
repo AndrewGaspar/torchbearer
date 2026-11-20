@@ -85,7 +85,12 @@ options = ["stereo.sbs_path", "stereo.skip_shadows", "stereo.skip_probe"]
 [[page]]
 id = "camera"
 title = "Camera"
-options = ["camera.mode", "camera.fov", "camera.hide", "camera.anchor", "camera.smooth"]
+options = ["camera.mode", "camera.framing", "camera.fov", "camera.hide", "camera.anchor", "camera.smooth"]
+
+[[page.group]]
+title = "Hands (close framing)"
+options = ["camera.hands_forward", "camera.hands_drop", "camera.hands_side", "camera.hands_sight",
+           "camera.hands_motion", "camera.hands_sway"]
 
 [[page.group]]
 title = "Eye position"
@@ -806,6 +811,86 @@ values = [
 ]
 default = "third_person"
 level = "basic"
+apply = "live"
+
+[option."camera.framing"]
+type = "enum"
+label = "First-person framing"
+help = "Close: Resident Evil style, the arms are posed so the flashlight (lower left) and the gun (lower right) are always in frame, the beam goes to the screen centre and the gun comes up to it when aiming. Classic: the arms as the third-person animation holds them (they show when aiming or looking down)."
+values = [
+  { value = "close", label = "Close (hands always in view)" },
+  { value = "classic", label = "Classic (third-person arms)" },
+]
+default = "close"
+level = "basic"
+apply = "live"
+
+[option."camera.hands_forward"]
+type = "float"
+label = "Hands: distance"
+help = "Close framing: how far ahead of the eye the resting wrists are."
+min = 0.2
+max = 0.6
+step = 0.01
+unit = "m"
+default = 0.34
+level = "advanced"
+apply = "live"
+
+[option."camera.hands_drop"]
+type = "float"
+label = "Hands: height"
+help = "Close framing: how far below the screen centre the resting wrists are, as a fraction of the frame's half-height (1 = the bottom edge)."
+min = 0.2
+max = 1.2
+step = 0.05
+default = 0.65
+level = "advanced"
+apply = "live"
+
+[option."camera.hands_side"]
+type = "float"
+label = "Hands: spread"
+help = "Close framing: how far out to their side the resting wrists are, as a fraction of the frame's half-width."
+min = 0
+max = 1
+step = 0.05
+default = 0.4
+level = "advanced"
+apply = "live"
+
+[option."camera.hands_sight"]
+type = "float"
+label = "Hands: aiming height"
+help = "Close framing: how far below the screen centre the gun hand comes up to when aiming, as a fraction of the frame's half-height."
+min = 0
+max = 1
+step = 0.05
+default = 0.6
+level = "advanced"
+apply = "live"
+
+[option."camera.hands_motion"]
+type = "float"
+label = "Hands: animation motion"
+help = "Close framing: how much of the animation's own hand motion (recoil, reloads, use gestures, the walk's swing) shows on top of the pose."
+min = 0
+max = 1
+step = 0.05
+default = 0.5
+level = "advanced"
+apply = "live"
+
+[option."camera.hands_sway"]
+type = "float"
+label = "Hands: sway"
+help = "Close framing: the hands trail the view's turns by this many seconds (0 = locked to the view)."
+min = 0
+max = 0.3
+step = 0.01
+unit = "s"
+default = 0.06
+level = "advanced"
 apply = "live"
 
 [option."camera.fov"]
