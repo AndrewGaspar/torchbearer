@@ -35,9 +35,10 @@ namespace tb::rt {
 namespace {
 
 constexpr int kSlots = 4;
-constexpr int kSets = 10;     // descriptor sets per slot
+constexpr int kSets = 16;     // descriptor sets per slot
 constexpr int kPerSet = 12;   // t1..t8, u0..u3
 constexpr int kTs = 16;       // timestamps per slot
+constexpr int kCbStride = 512;  // constant-buffer entries (sizeof(Cb), 256-aligned)
 
 const char* kCommon = R"(
 cbuffer C : register(b0) {
@@ -128,7 +129,7 @@ struct Pay { float t; };
     RayDesc r;
     r.Origin = o;
     r.Direction = dir;
-    r.TMin = 0.0;
+    r.TMin = 0.01 + length(p) * 0.002;  // past the receiver's own surface (skinned / LOD mismatch)
     r.TMax = g_p0.x;
     Pay pl;
     pl.t = 0;
@@ -295,6 +296,8 @@ struct Cb {
   uint32_t u0[4];
   float sun[4], p2[4];
 };
+
+static_assert(sizeof(Cb) <= kCbStride, "constant entries overlap");
 
 template <typename T>
 void rel(T*& p) {
@@ -672,7 +675,7 @@ bool trace_init(ID3D12Device5* dev, std::string& err) {
   }
   g_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   for (int s = 0; s < kSlots; s++) {
-    g_cb[s] = buffer(kSets * 256 * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    g_cb[s] = buffer(kSets * kCbStride * 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     D3D12_RANGE none{0, 0};
     if (!g_cb[s] || FAILED(g_cb[s]->Map(0, &none, (void**)&g_cb_cpu[s]))) {
       err = "constant buffers";
@@ -779,8 +782,8 @@ ID3D12Resource* trace_record(ID3D12GraphicsCommandList4* l, const EyeInputs& in,
   int ncb = 0;
   auto push_cb = [&](const Cb& v) -> D3D12_GPU_VIRTUAL_ADDRESS {
     int i = ncb++ % (kSets * 4);
-    memcpy(g_cb_cpu[slot] + i * 256, &v, sizeof v);
-    return g_cb[slot]->GetGPUVirtualAddress() + UINT64(i) * 256;
+    memcpy(g_cb_cpu[slot] + i * kCbStride, &v, sizeof v);
+    return g_cb[slot]->GetGPUVirtualAddress() + UINT64(i) * kCbStride;
   };
   int nset = 0;
   D3D12_GPU_VIRTUAL_ADDRESS base = g_table->GetGPUVirtualAddress();
@@ -915,38 +918,34 @@ ID3D12Resource* trace_record(ID3D12GraphicsCommandList4* l, const EyeInputs& in,
     bind(b2, ck);
     l->SetPipelineState(g_cs_temporal);
     l->Dispatch((g_w + 7) / 8, (g_h + 7) / 8, 1);
-    // 3. a-trous step 1 -> tmp; step 2 -> the chain's output
+    // 3. a-trous, steps 1, 2, 4: hist -> tmp -> raw (free again) -> the chain's output
     to(l, hist, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     to(l, lin, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    to(l, g_tmp, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    for (int pass = 0; pass < 2; pass++) {
-      Tex& src = pass ? g_tmp : hist;
-      if (pass) {
-        to(l, g_tmp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        to(l, ch.out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      }
+    Tex* srcs[3] = {&hist, &g_tmp, &g_raw};
+    Tex* dsts[3] = {&g_tmp, &g_raw, &ch.out};
+    for (int pass = 0; pass < 3; pass++) {
+      bool last = pass == 2;
+      to(l, *srcs[pass], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      to(l, *dsts[pass], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       Bind b3;
       b3.t[0] = in.depth;
       b3.tf[0] = DXGI_FORMAT_R32_FLOAT;
       b3.t[1] = in.normal;
       b3.tf[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-      b3.t[2] = src.r;
+      b3.t[2] = srcs[pass]->r;
       b3.tf[2] = DXGI_FORMAT_R16G16_FLOAT;
       b3.t[4] = lin.r;
       b3.tf[4] = DXGI_FORMAT_R32_FLOAT;
-      if (!pass) {
-        b3.u[0] = g_tmp.r;
-        b3.uf[0] = DXGI_FORMAT_R16G16_FLOAT;
-      } else if (kind) {
+      if (last && kind) {
         b3.u[3] = ch.out.r;
         b3.uf[3] = DXGI_FORMAT_B8G8R8A8_UNORM;
       } else {
-        b3.u[0] = ch.out.r;
+        b3.u[0] = dsts[pass]->r;
         b3.uf[0] = DXGI_FORMAT_R16G16_FLOAT;
       }
       Cb c3 = ck;
-      c3.u0[1] = (pass ? (kind ? 3u : 2u) : 1u) << 8;
-      c3.u0[2] = pass ? 2 : 1;
+      c3.u0[1] = (last ? (kind ? 3u : 2u) : 1u) << 8;
+      c3.u0[2] = 1u << pass;
       if (mode == 1) c3.u0[2] = 0;  // raw: no spatial filter (step 0 = the pixel itself)
       bind(b3, c3);
       l->SetPipelineState(g_cs_atrous);

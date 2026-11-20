@@ -39,7 +39,7 @@ options = ["game.quality", "game.taa", "game.fxaa", "game.msaa", "game.anisotrop
 
 [[page.group]]
 title = "Beyond the game's menu"
-options = ["graphics.ssao"]
+options = ["graphics.ao"]
 
 [[page]]
 id = "audio"
@@ -805,12 +805,17 @@ apply = "live"
 
 # ---------------------------------------------------------------- graphics (docs/raytracing.md)
 
-[option."graphics.ssao"]
-type = "bool"
-label = "Original 2010 ambient occlusion (SSAO)"
-help = "Use the game's original screen-space ambient occlusion, which the remaster ships but never enables, instead of its HBAO. Stronger contact shading that also reaches distant scenery (with the slight halos of its era), at the same cost."
-default = false
-apply = "live"
+[option."graphics.ao"]
+type = "enum"
+label = "Ambient occlusion"
+help = "The remaster's HBAO (the game's own), the original 2010 SSAO the remaster ships but never enables (stronger, reaches distant scenery, slight halos), or experimental ray-traced AO: contact shading from the actual scene geometry (needs a GPU with ray tracing; costs about 3-4 ms per frame at 1080p; foliage is approximated). Switching to or from ray-traced AO takes effect at the next launch."
+values = [
+  { value = "game", label = "HBAO (the game's)" },
+  { value = "ssao", label = "Original SSAO (2010)" },
+  { value = "rtao", label = "Ray-traced (experimental)" },
+]
+default = "game"
+apply = "restart"
 
 # ---------------------------------------------------------------- camera (docs/first-person.md)
 
