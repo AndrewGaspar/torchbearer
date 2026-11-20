@@ -534,10 +534,99 @@ shader doesn't need the atlas, but the cause of the lost spot was not identified
 
 | feature | verdict now | state | remaining (one person) | risk |
 |---|---|---|---|---|
-| **RTAO** | **shipped, experimental** (`[graphics] ao = rtao`, default `game`) | capture validated in three scenes, per-eye histories, inert unless chosen at launch | quality v2 **1-2 weeks**: any-hit alpha for foliage (+1 w: per-geometry alpha textures/UVs from the draws' descriptor tables, or opacity micromaps), motion vectors for moving platforms (object/camera velocity of our own), skip HBAO's render, cut the per-update BLAS (cache the terrain while the camera stands) | medium: foliage look, ~3-4 ms cost |
-| **Sun/moon RT shadows** | **go, prototype running** | direction from the cascade resolve, pass + injection over `pShadowRT` work | **1.5-2 weeks**: place the shadow views reliably (off-screen casters), verify the direction, any-hit alpha (trees), tuning | medium |
-| **Flashlight RT shadows** | **go** (was conditional) | option (a) works: HLSL port verified identical, swapped by hash at pipeline creation, inline ray queries against the TLAS through two root parameters appended to the game's root signatures | **1-1.5 weeks**: per-light tuning (radius, bias, the held flashlight excluded more robustly than by distance), cost isolated, skip the atlas render for spots, stereo second eye | medium: the global root-signature change; vkd3d-specific DXIL metadata pitfall (section 11) |
+| **RTAO** | **shipped, experimental** (`[graphics] ao = rtao`, default `game`) | capture validated in three scenes, per-eye histories, inert unless chosen at launch; **v2 in 0.6.9** (section 13): alpha-tested foliage, instance-motion history, precompiled ray-query passes | remaining: cache the per-update BLAS while the camera stands, LOD-aware alpha sampling, skinned close-up check | medium: foliage look at distance |
+| **Sun/moon RT shadows** | **go, prototype running** | direction from the cascade resolve, pass + injection over `pShadowRT` work; alpha path applies to it too (section 13) | **1.5-2 weeks**: place the shadow views reliably (off-screen casters), verify the direction, tuning | medium |
+| **Flashlight RT shadows** | **shipped, experimental** (`[graphics] flashlight_shadows = rt`, 0.6.9, section 14) | HLSL port swapped by hash, inline ray queries with a bulb disc and the alpha path; other spots keep PCF | cost isolated per light pass, skip the atlas render for the flashlight (checked: keep, other consumers), stereo second-eye spot isolated | medium: the global root-signature change; vkd3d-specific DXIL metadata pitfall (section 11) |
 | **RTGI** | no-go for now | unchanged | 2-3 months | high |
+## 13. Alpha-tested geometry and RTAO v2 (0.6.9; `census.cpp`, `scene.cpp`, `shaders/rays.hlsl`)
+
+The ray passes moved from runtime-compiled DXR 1.0 ray-generation shaders (the game's DXC 1.4)
+to precompiled `cs_6_5` compute shaders with inline ray queries (`shaders/rays.hlsl`, built by
+`scripts/build_shaders` like the spotlight; the DLL embeds only our own DXIL), so every pass can
+test alpha-tested candidates against their own textures (`shaders/alpha.hlsli`: a candidate loop
+committing only where the sampled alpha passes). The probabilistic `rtao_alpha` coverage of 0.6.8
+is gone (`[dev] rt_alpha` toggles the real test live).
+
+**What the capture records (static + live).** Per alpha-tested PSO, reflection (the background
+thread, from the DXIL disassembly) now also extracts: the alpha texture's register
+(`g_sAlphaTestSamplerTex`, else `g_sColorMapTex` for foliage cards) and its constant threshold —
+the sampled alpha shifted by a constant before the discard compare: 0.2 in the shadow depth
+shaders, derivative-scaled 0.5 in the G-buffer alpha-test shaders, 0.65 for foliage/grass
+(measured forms; one shader family thresholds from `$Globals` instead and stays opaque). The
+UV form is classified from the input layout plus the vertex shader (the forms found by
+tracing the captured shaders' sample coordinates back to their vertex inputs): mode 1,
+`R16G16_SINT` texcoords scaled by
+1/4095 (the VS constant `0x3F30010020000000`); mode 2, `COLOR0.xy` directly (terrain cards);
+mode 3, grass atlas cards (`int(TEXCOORD0.x*255+0.1)` indexing a `$Globals` table of
+(offset, scale) float4s, 2 rows per entry from row 142 — the row whose load extracts components
+2 and 3; the neighbouring table at 141 is not the UV one). Anything unrecognised stays opaque.
+
+The game's root signature is bindless-style (live): two whole-heap SRV tables at `t0` (vertex
+and pixel visibility; the pixel one is parameter 3), the table handle slid per material batch,
+descriptors rewritten per draw into a 264192-slot heap. So the draw record resolves its texture
+**at record time**: `SetDescriptorHeaps` and graphics descriptor tables are tracked per list,
+root-signature SRV ranges are parsed at creation (pixel-visibility match), and
+`CreateShaderResourceView`/`CopyDescriptors` destinations map CPU handles to resources. Copying
+the CPU descriptor later (at the kick) demonstrably names another draw's texture (live, r60).
+
+**Per update (scene.cpp `build_alpha`).** Alpha geometries are non-opaque in their BLAS
+(alpha meshes key the cache apart; the per-update BLAS keeps its alpha bucket non-opaque).
+`InstanceID` is the instance's first alpha record (`CandidateInstanceID() +
+CandidateGeometryIndex()` in the shader). Records (UV offset, texture in the mod's heap region,
+texture by game-heap index for the spotlight, threshold) and gather jobs go through an upload
+buffer; `cs_gather` reads the game's own vertex/index/constant buffers through raw views and
+writes every alpha triangle's UVs; then the AO/sun/validation rays and the spotlight test
+against them. About 420 jobs and 8 MB of UVs per update in the forest (live, r64).
+
+**Motion.** History reprojection now goes through each receiver pixel's TLAS instance:
+`cs_ao` also writes the receiver's instance index (a short primary ray, whose hit surface is
+optionally the ray origin — the skinned close-up banding mitigation), and `cs_temporal` maps the
+surface point through that instance's previous × inverse(current) transform (matched across
+updates by BLAS + occurrence; per-update-BLAS instances keep identity) before the previous
+camera. The eye's absolute world→clip (doubles) feeds it — the ray-query rewrite initially left
+it unwritten, which silently rejected all history. The ferry (`awr-brightfalls-day`, live r74)
+traces with motion on and no copy misses; a still cannot show temporal noise, so the ferry
+improvement itself is **not** separately measured.
+
+**Validation (measured, lab r64, interleaved A/B ×3 at fixed views, `validate noalpha` is the
+forced-opaque baseline).** Gameplay view: exact primary hits 1,268,572 → 1,289,435; too-near
+(solid cards) 42,256 → 21,839. Foliage-heavy view: exact 1,122,194 → 1,235,451; too-near
+264,363 → 118,870; foliage-material pixels exact 3,642 → 4,396, nearer 5,982 → 4,624. The cost
+is more too-far/missed rays (+76k/+14k in the foliage view): LOD0 point sampling of distant
+cards (the rasterizer samples a mip with derivative sharpening) and wind animation, which the
+bind-pose BLAS does not have. GPU (timestamps, uncontended): AS done 1.27 ms, gather included
+before it, AO rays +0.85 ms, denoise to 2.7 ms total at 1080p.
+
+HBAO's render is **not** skipped for RTAO: tried (render branch off, apply kept) — every AO
+copy missed (142/142, live r68), because the apply's source buffer is the render's pick
+(`obj+0x18`). Both branches stay the game's; the branch writes are split so a future delivery
+path could still split them.
+
+![validation, forced-opaque vs alpha-tested](img/rt-alpha-validate.jpg)
+
+*forest-night: primary rays vs G-buffer depth (green exact, red too near, blue too far, magenta
+missed). Left forced-opaque, right alpha-tested; frames differ (wind/birds), bins in the text.*
+
+## 14. Flashlight shadows as an option (`[graphics] flashlight_shadows = rt`, 0.6.9)
+
+Section 11's prototype, finished. The ray-query spotlight now also binds the alpha buffer
+(`t1 space9`), the game's own descriptor heap (`t0 space10`, textures by game-heap index — the
+spotlight runs inside the game's lists, whose bound heap is the game's) and a wrap sampler
+(`s0 space9`), all appended by `rs_extend` next to the prototype's TLAS/constants. Only the
+flashlight traces: near the eye and aimed along the view (`is_flashlight()`, constants `tb_q`;
+`[dev] rt_spot_all = 1` forces every shadowed spot for debugging); every other spot keeps the
+ported PCF bit-exactly. Shadows are rays to a disc the size of the bulb (crisp near, softer
+far), alpha-tested, with the prototype's bias/clear tuning now live keys (`dev.rt_spot_*`).
+
+With `ao = game` the scene capture runs for the TLAS alone (the AO chain and its copy stay off;
+live r67: swap and draws bound, `ao_copies` 0). The flashlight's atlas view still renders:
+`g_sShadowMapTex` is also read by `raymarchSunlight`, `downsample_shadow_map_PS` and the sun
+resolve (static), so skipping it is not the free saving it looked like. Stereo: runs in
+sbs/hsbs with `skip_shadows = 1` (live r73, both eyes rendered, draws bound in both); whether
+it restores the second eye's lost spot (docs/stereo.md section 6) was **not** isolated — the
+beam is lowered at idle in the lab, so no aimed A/B was captured. Cost is inside the game's
+deferred-light pass and not isolated by our timestamps.
+
 ## Reproducing
 
 RTAO, validation and the prototypes (sections 8-11; helper scripts of the sessions were
@@ -552,9 +641,10 @@ quiver lab call awr-rt rt scene validate 0xf img && sleep 2 && quiver lab call a
 python3 re/scripts/rt_validate.py st.json <run>/rt-validate.raw val.jpg
 quiver lab call awr-rt cfg dev.rtao_ao 0|1               # RTAO result copied or not (A/B)
 quiver lab call awr-rt rt grab pShadowRT hbao_apply:1 TAG  # the AO channel
-# sun prototype: [dev] rt_sun = 1 (live); flashlight: [dev] rt_spot = 1 (PCF port) or 2 (ray
-# queries, with ao = rtao), read at launch; A/B live with `cfg dev.rt_spot_on 0|1` and
-# `rt grab pLightRT post:0 TAG`
+# sun prototype: [dev] rt_sun = 1 (live); flashlight: [graphics] flashlight_shadows = rt (or
+# [dev] rt_spot = 1 PCF port / 2 ray queries), read at launch; A/B live with
+# `cfg dev.rt_spot_on 0|1`, alpha A/B with `cfg dev.rt_alpha 0|1`, validator baseline with
+# `rt scene validate 0x0f noalpha`
 scripts/build_shaders                                   # after editing src/features/rt/shaders/spotlight.hlsl
 ```
 
