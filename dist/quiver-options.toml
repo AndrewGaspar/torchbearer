@@ -89,16 +89,22 @@ options = ["stereo.sbs_path", "stereo.skip_shadows", "stereo.skip_probe"]
 [[page]]
 id = "camera"
 title = "Camera"
-options = ["camera.mode", "camera.framing", "camera.fov", "camera.hide", "camera.anchor", "camera.smooth"]
+options = ["camera.mode", "camera.framing", "camera.controls", "camera.fov", "camera.hide", "camera.anchor",
+           "camera.smooth"]
+
+[[page.group]]
+title = "First-person controls"
+options = ["camera.holster_delay", "camera.key_boost", "camera.key_flashlight", "camera.pad_boost",
+           "camera.pad_flashlight", "camera.pad_moves"]
 
 [[page.group]]
 title = "Hands (close framing)"
 options = ["camera.hands_forward", "camera.hands_drop", "camera.hands_side", "camera.hands_sight",
-           "camera.hands_motion", "camera.hands_sway"]
+           "camera.hands_aim_side", "camera.hands_motion", "camera.hands_sway"]
 
 [[page.group]]
 title = "Eye position"
-options = ["camera.eye_up", "camera.eye_forward", "camera.eye_height", "camera.aim_distance"]
+options = ["camera.eye_up", "camera.eye_forward", "camera.eye_height", "camera.aim_from", "camera.aim_distance"]
 
 [[page]]
 id = "diagnostics"
@@ -868,7 +874,7 @@ help = "Close framing: how far out to their side the resting wrists are, as a fr
 min = 0
 max = 1
 step = 0.05
-default = 0.4
+default = 0.6
 level = "advanced"
 apply = "live"
 
@@ -880,6 +886,17 @@ min = 0
 max = 1
 step = 0.05
 default = 0.6
+level = "advanced"
+apply = "live"
+
+[option."camera.hands_aim_side"]
+type = "float"
+label = "Hands: aiming spread"
+help = "Close framing, aiming: how far left of the screen centre the flashlight hand is, as a fraction of the frame's half-width (the gun sits just right of the centre). 0 = the game's two-handed grip, the flashlight under the gun."
+min = 0
+max = 1
+step = 0.05
+default = 0.35
 level = "advanced"
 apply = "live"
 
@@ -989,10 +1006,95 @@ default = 1.7
 level = "advanced"
 apply = "live"
 
+[option."camera.aim_from"]
+type = "enum"
+label = "Aim from"
+help = "Eye: in first person the game's aim ray starts at Alan's eyes and the view looks at what it hits, so the screen centre, the bullets and the flashlight beam meet at every distance. Game: the game aims from its third-person camera's ray and the view converges on it only at the aim convergence distance."
+values = [
+  { value = "eye", label = "Eye (converged at every distance)" },
+  { value = "game", label = "Game camera (converged at one distance)" },
+]
+default = "eye"
+level = "advanced"
+apply = "live"
+
+[option."camera.controls"]
+type = "enum"
+label = "First-person controls"
+help = "Deliberate: the gun stays holstered until you aim (right mouse / LT), fire shoots while it is out, it is put away a few seconds after you stop, and the flashlight gets its own boost button and an on / off switch. Game: the game's own controls (aim and boost on one button); third person always uses them."
+values = [
+  { value = "deliberate", label = "Deliberate (holstered gun, separate boost)" },
+  { value = "game", label = "Game" },
+]
+default = "deliberate"
+level = "basic"
+apply = "live"
+
+[option."camera.holster_delay"]
+type = "float"
+label = "Holster after"
+help = "Deliberate controls: seconds after you stop aiming, firing or reloading before the gun is put away."
+min = 0
+max = 15
+step = 0.5
+unit = "s"
+default = 3.0
+level = "basic"
+apply = "live"
+
+[option."camera.key_boost"]
+type = "key"
+label = "Flashlight boost (hold)"
+help = "Deliberate controls: hold to boost the flashlight (with or without aiming). Mouse4 (the thumb button) works too."
+default = "KeyV"
+level = "basic"
+apply = "live"
+
+[option."camera.key_flashlight"]
+type = "key"
+label = "Flashlight on / off"
+help = "Deliberate controls: switches the flashlight off and on. Off means no light: no light damage on the Taken and nothing to aim the beam with."
+default = "KeyT"
+level = "basic"
+apply = "live"
+
+[option."camera.pad_boost"]
+type = "enum"
+label = "Gamepad: flashlight boost (hold)"
+help = "Deliberate controls: the pad button held to boost the flashlight. Whatever the game had on it moves (see Gamepad: moved actions)."
+values = [
+  { value = "RB", label = "RB" }, { value = "LB", label = "LB" }, { value = "DPadUp", label = "D-pad up" },
+  { value = "R3", label = "Right stick click" }, { value = "L3", label = "Left stick click" },
+  { value = "none", label = "None" },
+]
+default = "RB"
+level = "advanced"
+apply = "live"
+
+[option."camera.pad_flashlight"]
+type = "enum"
+label = "Gamepad: flashlight on / off"
+values = [
+  { value = "DPadUp", label = "D-pad up" }, { value = "R3", label = "Right stick click" },
+  { value = "L3", label = "Left stick click" }, { value = "Back", label = "Back" },
+  { value = "none", label = "None" },
+]
+default = "DPadUp"
+level = "advanced"
+apply = "live"
+
+[option."camera.pad_moves"]
+type = "string"
+label = "Gamepad: moved actions"
+help = "Deliberate controls: the game's pad actions moved off the boost and flashlight buttons while first person is active, as ACTION:Button pairs (Button: A B X Y LB RB LT RT L3 R3 Back Start DPadUp DPadDown DPadLeft DPadRight, or none). Default: throw (RB) to the right stick click, whose camera-side switch means nothing in first person; select the long gun (D-pad up) to the left stick click."
+default = "THROW_ITEM:R3, HOLD_FLARE:R3, TOGGLE_SIDE:none, INVENTORY_UP:L3"
+level = "advanced"
+apply = "live"
+
 [option."camera.aim_distance"]
 type = "float"
 label = "Aim convergence distance"
-help = "The game aims along its own third-person camera's centre ray; the first-person view looks at that ray's point this far away, so the screen centre is on target at that range. 0 = parallel to the game camera."
+help = "Aim from = game only: the game aims along its own third-person camera's centre ray; the first-person view looks at that ray's point this far away, so the screen centre is on target at that range. 0 = parallel to the game camera."
 min = 0
 max = 100
 step = 1

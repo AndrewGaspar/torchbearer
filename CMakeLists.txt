@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(torchbearer LANGUAGES C CXX)
-set(TB_VERSION "0.6.5")
+set(TB_VERSION "0.6.7")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,6 +30,7 @@ add_library(torchbearer SHARED
   src/core/camera.cpp
   src/features/features.cpp
   src/features/firstperson.cpp
+  src/features/fpcontrols.cpp
   src/features/stereo/stereo.cpp
   src/features/stereo/gpu.cpp
   src/features/stereo/cmdlist.cpp
