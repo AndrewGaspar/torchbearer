@@ -628,9 +628,37 @@ the flashlight aimed (lab pad LT), the two eyes' centre luminance matches in RT 
 mean) as in the game's mode, i.e. no second-eye darkness was observed — but the aimed captures
 were taken during the bird encounter with floodlights dominating, so the lost-spot fix
 (docs/stereo.md section 6) is **consistent with, not isolated by**, this test. (The quiet indoor
-fixture cannot isolate it either: Alan has no flashlight in the apartment dream, live r77 — eyes
+fixture in r77 did not isolate it either: Alan starts without a flashlight in the apartment dream — eyes
 match there trivially.) Cost is inside the game's deferred-light pass and not isolated by our
 timestamps.
+
+### Aimed flashlight in stereo on a dark rock face
+
+In `awr-rt` r80 (0.6.9), switching the aimed flashlight off and on isolated its spot in both
+eyes. At the start of level 03, the rock face stays dark without the flashlight. The camera and
+player stayed in place for all captures. The table gives the mean 8-bit grayscale value in the
+same 135×120 patch of rock in each 960×1080 eye (top-left at x=390, y=315, before resizing).
+
+| Spotlight shader | Reuse shadows on eye 2 | Flashlight off, L / R | Flashlight on, L / R |
+|---|---|---:|---:|
+| Ray queries | On | 0.1 / 0.1 | 138.9 / 132.9 |
+| Game | On | 1.1 / 1.1 | 139.4 / 138.3 |
+| Game | Off | 0.5 / 0.5 | 139.5 / 138.2 |
+
+A second RT capture measured 141.0 / 140.7. Across that capture, `stereo status` counted
+585 additional shadow skips and zero additional fallbacks. The right eye retained the spot
+while shadow reuse was active. The game shader also passed in this scene, so it cannot
+establish whether RT fixes the near-wall loss seen in full SBS in [the earlier level 15
+test](stereo.md#open-issues).
+
+![The same dark rock in both eyes with the flashlight off (top) and on (bottom)](img/stereo-flashlight-rock.jpg)
+
+To repeat, use `mode = sbs`, `output = hsbs`, `skip_shadows = 1`, `flashlight_shadows = rt`
+and first-person deliberate controls. Load level 03 and leave the camera at the spawn point.
+Use the lab verbs `fp give weapons` and `fp give flashlight`, hold pad LT, and check that
+`fpc` reports `aim_raw` and `drawn` true. Toggle the flashlight with D-pad up, checking
+`flashlight_off_by_us`, and capture each state with a one-second settle. For the game-shader
+control set `dev.rt_spot_on = 0` live, then repeat with `stereo.skip_shadows = 0`.
 
 ## Reproducing
 

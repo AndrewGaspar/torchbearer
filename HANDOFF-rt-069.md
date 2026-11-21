@@ -74,7 +74,10 @@ under `docs/screenshots/`, and `master` was pushed there (initial public tip `f5
 - Stereo second-eye lost spot: aimed A/B done (r76 forest, r77 apartment; pad LT, sbs/hsbs +
   `skip_shadows = 1`): eyes match in both modes, no second-eye darkness — but forest captures
   are floodlight/encounter-dominated and Alan has no flashlight in the apartment dream, so
-  treat as consistent-with, not isolated proof. Settling it needs an armed, quiet, dark scene.
+  treat those captures as consistent-with, not isolated proof. Codex later isolated the spot in
+  both eyes on level 03's dark rock face (r80, confirmed aiming and shadow reuse). The game
+  shader also passed there. A direct RT comparison at the original level 15 full-SBS failure
+  location remains open. See [the measurements](docs/raytracing.md#aimed-flashlight-in-stereo-on-a-dark-rock-face).
   Note `awr-rt` now has `pads=1` in its manifest.
 - Ferry temporal improvement: measured (r78 bench A/B): temporal noise 18.68 ± 0.40 with
   instance motion vs 22.17 ± 1.42 without. Done; no further ferry work queued.
@@ -91,6 +94,6 @@ under `docs/screenshots/`, and `master` was pushed there (initial public tip `f5
 SendMessage the subagent (`a05b775f5244f01c0`) rather than starting a new one, per the limit
 notice — but its context predates all of the above, so point it at this file and the commit list
 first. The branch is already merged, 0.6.9 is published/current in Quiver, and `master` is
-public at https://github.com/AndrewGaspar/torchbearer. Suggested next steps, in order: run a
-quiet armed dark-scene stereo-spot test, then sun/moon placement. Keep the README screenshots
+public at https://github.com/AndrewGaspar/torchbearer. The quiet armed dark-scene stereo-spot
+test is recorded in r80. Sun/moon placement remains open. Keep the README screenshots
 current when pictured features change (`docs/screenshots/README.md`).
