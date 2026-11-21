@@ -44,7 +44,7 @@ MSAA on the colour passes (the census shows 4-sample colour targets).
 | `rt flag ssao/hbao game/1/0` | forces the SSAO / HBAO branch of the main pass |
 | `rt scene on/off/status` | geometry capture, BLAS/TLAS and the ray passes (sections 8-11); needs the capture installed at launch (`[graphics] ao = rtao` or `[dev] rt_scene = 1`) |
 | `rt scene validate MASK [img]` | primary rays vs the G-buffer depth: error histogram, colour-coded image (`rt_validate.py`) |
-| `rt scene dump N[:PS]`, `buf VA`, `dyn 0-3`, `casters 0/1`, `budget N`, `reset` | debugging: instance transforms, buffer lookups, per-update BLAS parts, shadow casters, build budget |
+| `rt scene dump N[:PS]`, `buf VA`, `dyn 0-3`, `casters 0/1/atlas`, `budget N`, `reset` | debugging: instance transforms, buffer lookups, per-update BLAS parts, shadow casters, build budget |
 
 Device hooks are MinHook on vkd3d-proton's implementation functions (so they coexist with the
 stereo feature's vtable patches); engine markers are hooks on the passes below, each
@@ -483,9 +483,37 @@ TMin); leaf cards are approximations.
 
 *Bright Falls r47: final frame and `pShadowRT.r`; left the game's cascades (PCF), right ray-traced.*
 
-Remaining: place the shadow views properly (hook the light views' `setViewToWorld` and tag the
-shadow lists, or reflect which shadow VSs read their projection), verify the direction, any-hit
-alpha for trees (mandatory here), then tune. **+1.5-2 weeks** (unchanged).
+### Direction and off-screen caster placement
+
+The prototype originally converted the resolve's view-space direction to world space using
+bytes 64–111 of its constant buffer. The captured resolve VS and PS
+(`f8d92111fa62a9b9`, `3fd4eb73c302e5b7`) both declare that matrix, but neither loads its rows.
+On the Bright Falls ferry the reported direction varied even in elevation (r81). The prototype
+now uses the validated engine camera basis saved at the scene submission before the resolve.
+With horizontal and vertical camera turns in r82, the ferry direction stayed at
+(0.7518, 0.4662, −0.4662). On level 03 the moon direction stayed at (−0.7071, 0.5000, −0.5000)
+across a horizontal turn, with 1,607 shadow-buffer copies and zero misses (r83).
+
+`rt scene casters atlas` groups shadow draws by their bound depth view and raster viewport,
+then uses the existing shared-mesh match to place each group. This reads the tile the game
+actually rendered into, even when a shader omitted its projection constants. Use
+`rt scene casters 1` for the original projection grouping or `0` to exclude shadow-only casters.
+These are single-frame samples. Each cell gives **groups placed / groups found** and the
+number of shadow-only instances admitted to the ray-tracing scene.
+
+| Scene | Projection grouping | Atlas grouping |
+|---|---:|---:|
+| Mirror Peak overlook, level 10 (r82) | 3 / 77, 9 instances | 3 / 5, 9 instances |
+| Crashed car, level 03 (r83, before turning) | 5 / 30, 60 instances | 5 / 5, 81 instances |
+
+![Mirror Peak directional visibility, game cascades on the left and ray tracing with atlas grouping on the right](img/rt-sun-mirror-peak.jpg)
+
+In the Mirror Peak captures the tree shadow on the billboard appears in both masks, but the
+RT ground and foliage are darker. Mean absolute difference in `pShadowRT.r` against the first
+game capture was 0.296 on a 0–1 scale with either grouping. Two game captures differed by
+0.052. These were successive frames with moving foliage. Atlas grouping remains a lab option.
+The next comparison is the ferry deck under the off-screen bridge, checking each tile's
+transform against a second shared mesh before attributing a shadow to it.
 
 ## 11. Flashlight shadows: option (a), the pixel shader swapped (prototype, `[dev] rt_spot`)
 

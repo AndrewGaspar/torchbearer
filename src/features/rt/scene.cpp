@@ -494,7 +494,8 @@ std::atomic<int> g_build_budget_tris{300000};
 std::atomic<int> g_dyn_on{3};  // bit 0 opaque, bit 1 alpha-tested  // the per-update BLAS (upload-heap meshes)
 std::atomic<int> g_dump{0};
 std::atomic<uint64_t> g_dump_ps{0};  // only draws with this pixel shader (0: any)  // log this many instances of the next update (debug)
-std::atomic<bool> g_shadow_casters{true};  // shadow-map draws placed by matching (above)
+enum class CasterGrouping { Off, Projection, AtlasTile };
+std::atomic<CasterGrouping> g_shadow_casters{CasterGrouping::Projection};
 
 double now_ms() {
   static LARGE_INTEGER f = [] {
@@ -762,11 +763,12 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
   uint32_t ng = 0, ns = 0, dup = 0, dg = 0, dsh = 0, nblas_pending = 0;
   // Shadow-map draws are in light views (cascades, spot lights) whose placement is not in their
   // constants (only the rows a VS reads are written: g_mLocalToView, g_mViewToClip). Group them
-  // by view (their g_mViewToClip rows), and place each view from a mesh drawn exactly once in
-  // the G-buffer and once in that view: ViewToWorld_light = World_gbuffer * inverse(LocalToView_light).
+  // by projection or, for the atlas experiment, by depth view and viewport. Place each view from
+  // a mesh drawn once in the G-buffer and once in that view: World_gbuffer * inverse(LocalToView_light).
   std::vector<int> light_of(draws.size(), -1);
   std::vector<std::array<double, 12>> light_v2w;
-  if (g_shadow_casters.load()) {
+  const CasterGrouping grouping = g_shadow_casters.load();
+  if (grouping != CasterGrouping::Off) {
     struct G {
       int n = 0;
       std::array<double, 12> w{};
@@ -791,7 +793,7 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
           g.w[r * 4 + c] = v;
         }
     }
-    std::unordered_map<uint64_t, int> views;  // projection hash -> light index
+    std::unordered_map<uint64_t, int> views;  // group key -> light index
     struct V {
       std::unordered_map<uint64_t, int> count;
       std::vector<size_t> idx;
@@ -800,13 +802,18 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
     for (size_t i = 0; i < draws.size(); i++) {
       auto& d = draws[i];
       if (d.cls != DC_SHADOW) continue;
-      float proj[16];
-      if (!g_cbc.read(d.cb + 128, proj, 64)) continue;
-      uint64_t h = 1469598103934665603ull;
-      for (float f : proj) {
-        uint32_t u;
-        memcpy(&u, &f, 4);
-        h = (h ^ u) * 1099511628211ull;
+      uint64_t h = d.shadow_tile;
+      if (grouping == CasterGrouping::AtlasTile) {
+        if (!h) continue;
+      } else {
+        float proj[16];
+        if (!g_cbc.read(d.cb + 128, proj, 64)) continue;
+        h = 1469598103934665603ull;
+        for (float f : proj) {
+          uint32_t u;
+          memcpy(&u, &f, 4);
+          h = (h ^ u) * 1099511628211ull;
+        }
       }
       auto [it, fresh] = views.emplace(h, int(vs.size()));
       if (fresh) vs.emplace_back();
@@ -852,7 +859,7 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
     for (auto& d : draws) {
       size_t di = size_t(&d - draws.data());
       if (d.cls == DC_SUN || (pass == 0) != (d.cls == DC_GBUFFER)) continue;
-      if (pass == 1 && !g_shadow_casters.load()) continue;
+      if (pass == 1 && grouping == CasterGrouping::Off) continue;
       (pass ? dsh : dg)++;
       // Only the $Globals rows a shader reads are written per draw (live: g_mViewToWorld at 64
       // holds stale ring data in G-buffer draws), so the view's placement comes from the engine's
@@ -1273,19 +1280,22 @@ void build_scene(ID3D12GraphicsCommandList4* l, std::vector<DrawRec>& draws, int
 
 // The sun / moon direction from its shadow resolve's g_mShadowProjection (3x4, view space ->
 // shadow-map u, v, depth): the depth row's xyz is the light's forward axis in view space; towards
-// the light is its opposite. In world space through that draw's g_mViewToWorld (offset 64).
+// the light is its opposite. The resolve follows the scene kick, so use the camera basis saved
+// at that kick (the stereo eyes share orientation). Neither resolve shader loads ViewToWorld.
 uint64_t g_sun_frames = 0;
 float g_sun_world[3] = {};
 void take_sun(const std::vector<DrawRec>& draws) {
+  if (g_last_update == ~0ull || present_frame() - g_last_update > 1) return;
   for (auto it = draws.rbegin(); it != draws.rend(); ++it) {
     if (it->cls != DC_SUN) continue;
-    float m[12], v2w[12];
-    if (!g_cbc.read(it->cb + it->l2v, m, 48) || !g_cbc.read(it->cb + 64, v2w, 48)) continue;
+    float m[12];
+    if (!g_cbc.read(it->cb + it->l2v, m, 48)) continue;
     double f[3] = {m[8], m[9], m[10]};
     double n = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
     if (!(n > 1e-12)) continue;
     double w[3];
-    for (int r = 0; r < 3; r++) w[r] = -(v2w[r * 4 + 0] * f[0] + v2w[r * 4 + 1] * f[1] + v2w[r * 4 + 2] * f[2]) / n;
+    for (int r = 0; r < 3; r++)
+      w[r] = -(g_cam_v2w[r * 4] * f[0] + g_cam_v2w[r * 4 + 1] * f[1] + g_cam_v2w[r * 4 + 2] * f[2]) / n;
     double wn = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
     if (!(wn > 0.5 && wn < 2)) continue;
     for (int r = 0; r < 3; r++) g_sun_world[r] = float(w[r] / wn);
@@ -1677,7 +1687,11 @@ std::string scene_verb(const std::string& sub, const std::string& arg) {
     g_dump_ps = arg.find(':') != std::string::npos ? strtoull(arg.c_str() + arg.find(':') + 1, nullptr, 16) : 0;
     g_dump = arg.empty() ? 20 : atoi(arg.c_str());
   }
-  else if (sub == "casters") g_shadow_casters = arg != "0";
+  else if (sub == "casters") {
+    if (arg == "0") g_shadow_casters = CasterGrouping::Off;
+    else if (arg == "atlas") g_shadow_casters = CasterGrouping::AtlasTile;
+    else g_shadow_casters = CasterGrouping::Projection;
+  }
   else if (sub == "dyn") g_dyn_on = atoi(arg.c_str());
   else if (sub == "reset") {
     g_st = Stats{};

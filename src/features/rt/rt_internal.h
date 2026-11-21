@@ -68,6 +68,7 @@ struct DrawRec {
   ID3D12Resource* rt0 = nullptr;  // G-buffer: render targets 0 (device depth) and 1 (normals)
   ID3D12Resource* rt1 = nullptr;
   uint64_t ps = 0;       // pixel shader hash
+  uint64_t shadow_tile = 0;  // bound depth view and atlas viewport for a shadow draw
   // Alpha-tested draws (DF_ALPHA; shaders/alpha.hlsli, rays.hlsl cs_gather): how the draw's own
   // shaders compute the alpha sample's UVs, and which texture it samples. uv_mode 0 = not
   // resolved (the geometry stays opaque for rays); alpha_idx < 0 likewise.

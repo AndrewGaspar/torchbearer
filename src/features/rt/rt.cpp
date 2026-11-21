@@ -553,7 +553,7 @@ std::string verb(const std::vector<std::string>& a, bool& ok) {
   ok = false;
   return json_str("usage: rt status | dxr [test] | census N [TAG] | shaders H,H|all [disasm] | gpu on|off|reset|status | "
                   "grab NAME PASS[:phase] [TAG] | flag ssao|hbao [game|1|0] | "
-                  "scene on|off|status|validate [MASK] [img]|budget N|casters 0|1|reset");
+                  "scene on|off|status|validate [MASK] [img]|budget N|casters 0|1|atlas|reset");
 }
 
 }  // namespace

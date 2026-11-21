@@ -170,6 +170,8 @@ struct ListSt {
   D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
   D3D12_INDEX_BUFFER_VIEW ib = {};
   int topo = 0;
+  uint64_t viewport = 0;
+  SIZE_T depth_view = 0;
   ID3D12Resource* rt[2] = {};
   std::vector<DrawRec> draws;
   std::vector<std::pair<ID3D12Resource*, unsigned>> trans;  // transitions, record order
@@ -1201,6 +1203,7 @@ using DrawI_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT,
 using DrawII_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
 using Dispatch_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
 using Topo_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_PRIMITIVE_TOPOLOGY);
+using Viewports_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
 using SetPso_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
 using Barrier_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 using RootAddr_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
@@ -1233,6 +1236,7 @@ DrawI_t o_drawI;
 DrawII_t o_drawII;
 Dispatch_t o_dispatch;
 Topo_t o_topo;
+Viewports_t o_viewports;
 SetPso_t o_setPso;
 Barrier_t o_barrier;
 RootAddr_t o_gCbv, o_gSrv, o_gUav, o_cCbv, o_cSrv, o_cUav;
@@ -1315,6 +1319,8 @@ void scene_draw(ID3D12GraphicsCommandList* l, UINT ic, UINT n, UINT si, INT bv) 
   d.l2v = p->l2v;
   d.cb = cb;
   d.ps = p->ps;
+  if (p->cls == DC_SHADOW && s->viewport && s->depth_view)
+    d.shadow_tile = (s->viewport ^ s->depth_view) * 1099511628211ull;
   // The alpha path (DrawRec): the UV stream this draw's alpha sample reads, and its texture's
   // descriptor in the heap bound on this list. Anything unresolved leaves uv_mode / alpha_idx
   // unset and the instance opaque for rays.
@@ -1383,6 +1389,7 @@ HRESULT STDMETHODCALLTYPE hk_reset(ID3D12GraphicsCommandList* l, ID3D12CommandAl
     s->draws.clear();
     s->trans.clear();
     s->pso = p ? g_psoinfo.find(p) : nullptr;
+    s->viewport = s->depth_view = 0;
     s->rt[0] = s->rt[1] = nullptr;
     memset(s->tab, 0, sizeof s->tab);  // Reset clears the root arguments and bound heaps
     s->heap_cpu0 = s->heap_gpu0 = 0;
@@ -1426,6 +1433,11 @@ void STDMETHODCALLTYPE hk_setPso(ID3D12GraphicsCommandList* l, ID3D12PipelineSta
     std::lock_guard lk(g_mu);
     ev("P %p %u", (void*)l, pso_id(p));
   }
+}
+
+void STDMETHODCALLTYPE hk_viewports(ID3D12GraphicsCommandList* l, UINT n, const D3D12_VIEWPORT* v) {
+  o_viewports(l, n, v);
+  if (g_scene.load(std::memory_order_relaxed)) list_st(l)->viewport = n == 1 && v ? fnv(v, sizeof *v) : 0;
 }
 
 void STDMETHODCALLTYPE hk_topo(ID3D12GraphicsCommandList* l, D3D12_PRIMITIVE_TOPOLOGY t) {
@@ -1668,6 +1680,7 @@ void STDMETHODCALLTYPE hk_om(ID3D12GraphicsCommandList* l, UINT n, const D3D12_C
   t_cur = l;
   if (g_scene.load(std::memory_order_relaxed)) {
     ListSt* s = list_st(l);
+    s->depth_view = ds ? ds->ptr : 0;
     s->rt[0] = s->rt[1] = nullptr;
     if (n == 3 && h) {  // the G-buffer's three targets: remember depth (0) and normals (1)
       std::lock_guard lk(g_mu);
@@ -1904,6 +1917,7 @@ bool capture_lists() {
     fails += !hook_slot(l, 16, (void*)hk_copyTex, (void**)&o_copyTex, "cl CopyTextureRegion");
     fails += !hook_slot(l, 17, (void*)hk_copyRes, (void**)&o_copyRes, "cl CopyResource");
     fails += !hook_slot(l, 20, (void*)hk_topo, (void**)&o_topo, "cl IASetPrimitiveTopology");
+    fails += !hook_slot(l, 21, (void*)hk_viewports, (void**)&o_viewports, "cl RSSetViewports");
     fails += !hook_slot(l, 25, (void*)hk_setPso, (void**)&o_setPso, "cl SetPipelineState");
     fails += !hook_slot(l, 26, (void*)hk_barrier, (void**)&o_barrier, "cl ResourceBarrier");
     fails += !hook_slot(l, 28, (void*)hk_setHeaps, (void**)&o_setHeaps, "cl SetDescriptorHeaps");

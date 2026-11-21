@@ -86,7 +86,9 @@ under `docs/screenshots/`, and `master` was pushed there (initial public tip `f5
   capture was taken.
 - Flashlight cost inside the deferred-light pass not isolated (no marker); atlas still renders
   (other `g_sShadowMapTex` consumers — keep).
-- Sun/moon: unchanged prototype (now benefits from alpha path in principle; not re-validated).
+- Sun/moon: the camera-basis correction and experimental atlas grouping were tested in
+  awr-rt r81–r83. Off-screen bridge placement remains open.
+  [Measurements](docs/raytracing.md#direction-and-off-screen-caster-placement)
 - LOD-aware alpha sampling (SampleLevel 0 today) is the known distant-foliage error source.
 - RTGI / realistic night lighting: untouched, per the roadmap note in your memory.
 
