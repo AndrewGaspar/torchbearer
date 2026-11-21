@@ -224,8 +224,9 @@ materially affects a pictured feature, its defaults, its visual quality, or the 
 - Ray-traced sun/moon shadows remain a developer prototype; their off-screen casters are not
   placed reliably enough for a user option.
 - First-person mode is a prototype layered over the third-person simulation and animation.
-- The stereo second-eye flashlight spot with experimental shadow reuse needs a quiet,
-  flashlight-armed test scene for full isolation; see the ray-tracing notes.
+- Experimental stereo shadow reuse can drop the flashlight spot in the right eye with game
+  shadows. The RT flashlight preserved it at the level 15 wall where this occurs.
+  [Full-SBS comparison](docs/raytracing.md#full-sbs-at-the-transformer-yard-wall)
 
 ## License and trademarks
 

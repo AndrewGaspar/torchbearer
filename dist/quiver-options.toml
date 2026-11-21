@@ -796,7 +796,7 @@ apply = "live"
 [option."stereo.skip_shadows"]
 type = "bool"
 label = "Share shadow maps between eyes"
-help = "Experimental: the second eye reuses the first eye's shadow maps (about 10 % faster), but loses the flashlight's lit spot. One-frame eye rendering only."
+help = "The second eye reuses the first eye’s shadow maps (about 10% faster in testing). With game shadows, the flashlight spot can disappear in the right eye. Experimental. One-frame eye rendering only."
 default = false
 level = "advanced"
 apply = "live"

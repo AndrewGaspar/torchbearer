@@ -660,6 +660,28 @@ Use the lab verbs `fp give weapons` and `fp give flashlight`, hold pad LT, and c
 `flashlight_off_by_us`, and capture each state with a one-second settle. For the game-shader
 control set `dev.rt_spot_on = 0` live, then repeat with `stereo.skip_shadows = 0`.
 
+### Full SBS at the transformer-yard wall
+
+In `awr-wide` r16, the RT flashlight restored the right-eye spot where the game shader
+lost it in r15. The third-person camera faced the corrugated wall on level 15, at player
+position (1414.365, 45.784, 2237.568), yaw 178.8°. The settings were full SBS, 1920×1080
+per eye, and `flashlight_shadows = rt`. Switching `dev.rt_spot_on` live selected the game or
+RT shader without moving the camera. The figures are mean grayscale (0–255) in the same
+90×195 rectangle per eye, with top-left at (1030, 680).
+
+| Shader | Reuse on eye 2 | Left / right brightness |
+|---|---|---|
+| Game | Off | 95 / 101 |
+| Game | On, two repeats | 93 / 13 and 92 / 14 |
+| RT | On, three captures | 89 / 95, 94 / 82 and 94 / 94 |
+| RT | Off | 99 / 95 |
+
+One additional game/reuse capture coincided with a bird hit that moved Alan's arm and darkened
+both eyes. It was excluded from the comparison. Shadow reuse stays opt-in because the game
+shader still exhibits the loss at this wall.
+
+![Left- and right-eye wall crops. From top to bottom, game shadows with reuse off, game shadows with reuse on, and RT shadows with reuse on.](img/stereo-flashlight-wall.jpg)
+
 ## Reproducing
 
 RTAO, validation and the prototypes (sections 8-11; helper scripts of the sessions were

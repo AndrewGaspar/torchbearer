@@ -76,8 +76,9 @@ under `docs/screenshots/`, and `master` was pushed there (initial public tip `f5
   are floodlight/encounter-dominated and Alan has no flashlight in the apartment dream, so
   treat those captures as consistent-with, not isolated proof. Codex later isolated the spot in
   both eyes on level 03's dark rock face (r80, confirmed aiming and shadow reuse). The game
-  shader also passed there. A direct RT comparison at the original level 15 full-SBS failure
-  location remains open. See [the measurements](docs/raytracing.md#aimed-flashlight-in-stereo-on-a-dark-rock-face).
+  shader also passed there. At the original level 15 wall, full SBS reproduced the game
+  shader's right-eye failure and RT restored the spot (awr-wide r16).
+  See [the measurements](docs/raytracing.md#full-sbs-at-the-transformer-yard-wall).
   Note `awr-rt` now has `pads=1` in its manifest.
 - Ferry temporal improvement: measured (r78 bench A/B): temporal noise 18.68 ± 0.40 with
   instance motion vs 22.17 ± 1.42 without. Done; no further ferry work queued.

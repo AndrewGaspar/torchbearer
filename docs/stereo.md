@@ -1043,7 +1043,8 @@ view-dependent.
     position, reuse on / off / on, right-eye crops show the spot only with reuse off (live
     captures, run r15). So the per-light shadow render also prepares lighting state the second
     eye needs (a cookie or per-render light constants; not identified). Until that is found the
-    reuse stays opt-in; the probe reuse stays on.
+    reuse stays opt-in; the probe reuse stays on. In 0.6.9 the RT flashlight preserved the spot
+    at the same wall with reuse enabled (awr-wide r16). [Comparison and measurements](raytracing.md#full-sbs-at-the-transformer-yard-wall)
 
 ### Convergence as image shift (full SBS)
 
